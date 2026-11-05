@@ -6,6 +6,7 @@ use clap::Parser;
 use unituner::api::{self, AppState};
 use unituner::config::Config;
 use unituner::services::ServiceTable;
+use unituner::webui;
 
 /// Tuner sharing and abstraction server (mirakurun-compatible subset).
 #[derive(Debug, Parser)]
@@ -80,7 +81,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Binds the configured address and serves the API until SIGINT/SIGTERM.
+/// Binds the configured address and serves the mirakurun-compatible API plus
+/// the management UI (SPEC §9, §10) until SIGINT/SIGTERM.
 async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
     // Services are discovered by a scan (SPEC §8); until one runs the table is
     // empty, so `/api/services` is `[]` and service streams 404.
@@ -98,7 +100,7 @@ async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
         .map_err(|error| format!("failed to bind {addr}: {error}"))?;
     tracing::info!(%addr, "listening");
 
-    let app = api::router(state);
+    let app = webui::app(state);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

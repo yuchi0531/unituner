@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unituner</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>unituner</h1>
+  <span class="version" id="version"></span>
+  <nav class="tabs" id="tabs">
+    <button data-tab="status" class="active">Status</button>
+    <button data-tab="services">Services</button>
+    <button data-tab="channels">Channels</button>
+    <button data-tab="tuners">Tuners</button>
+    <button data-tab="pipelines">Pipelines</button>
+    <button data-tab="server">Server</button>
+  </nav>
+  <button id="restart" class="danger">Restart</button>
+</header>
+
+<main>
+  <section id="tab-status" class="tab active">
+    <h2>Status <small id="status-meta"></small></h2>
+    <div class="counts" id="counts"></div>
+    <h3>Tuners</h3>
+    <div id="status-tuners" class="cards"></div>
+    <h3>Sessions</h3>
+    <div id="status-sessions" class="cards"></div>
+  </section>
+
+  <section id="tab-services" class="tab">
+    <h2>Services</h2>
+    <p class="hint">Services discovered by a scan. The table is empty until one runs.</p>
+    <div class="scroll"><table id="services-table">
+      <thead><tr><th>ID</th><th>SID</th><th>NID</th><th>Name</th><th>Type</th><th>Channel</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section id="tab-channels" class="tab">
+    <h2>Channels <small>channels.yml</small></h2>
+    <p class="hint">Edits are validated with the startup rules and written with a <code>.bak</code> backup. Press <strong>Restart</strong> to apply them.</p>
+    <div class="scroll"><table id="channels-table">
+      <thead><tr><th>Name</th><th>Type</th><th>Channel</th><th>Disabled</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <button data-add="channel">Add channel</button>
+    <button data-save="channels" class="primary">Save channels</button>
+  </section>
+
+  <section id="tab-tuners" class="tab">
+    <h2>Tuners <small>tuners.yml</small></h2>
+    <p class="hint"><code>types</code> is a comma-separated list. <code>{channel}</code> and <code>{type}</code> are placeholders.</p>
+    <div id="tuners-list" class="cards"></div>
+    <button data-add="tuner">Add tuner</button>
+    <button data-save="tuners" class="primary">Save tuners</button>
+  </section>
+
+  <section id="tab-pipelines" class="tab">
+    <h2>Pipelines <small>pipelines.yml</small></h2>
+    <p class="hint">Each pipeline is an ordered list of stdin→stdout commands. Type bindings map a channel type to a pipeline.</p>
+    <div id="pipelines-list" class="cards"></div>
+    <button data-add="pipeline">Add pipeline</button>
+    <h3>Type bindings</h3>
+    <div class="scroll"><table id="bindings-table">
+      <thead><tr><th>Type</th><th>Pipeline</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <button data-add="binding">Add binding</button>
+    <button data-save="pipelines" class="primary">Save pipelines</button>
+  </section>
+
+  <section id="tab-server" class="tab">
+    <h2>Server <small>server.yml</small></h2>
+    <p class="hint">Read-only by design: a wrong <code>allowed_cidrs</code> would lock you out of this page.</p>
+    <dl id="server-config" class="kv"></dl>
+  </section>
+</main>
+
+<footer>
+  <span id="message" class="message"></span>
+  <span class="note">No authentication — access is limited by <code>allowed_cidrs</code> only. Deploy on a trusted LAN.</span>
+</footer>
+
+<script src="/assets/app.js"></script>
+</body>
+</html>
