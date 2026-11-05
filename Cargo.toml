@@ -10,16 +10,22 @@ license = "MIT"
 [dependencies]
 # STD-B10 SI tables and STD-B24 text decoding (used from phase 2 onward).
 arib = { version = "0.3", default-features = false, features = ["ts", "text"] }
+# Bytes handed to stream subscribers (public in `session::Subscription`).
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ipnet = "2"
+# `setsid` / `killpg` for process-group control (SPEC §4, §6.2). Added directly
+# instead of taking `nix`, which only wraps these two calls here.
+libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 # serde_yaml is deprecated/unmaintained; serde_yaml_ng is the maintained fork.
 serde_yaml_ng = "0.10"
 thiserror = "2"
+# Async runtime: tuner/pipeline processes, fan-out and timers (SPEC §4, §6, §7).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "signal", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-bytes = "1"
 tempfile = "3"

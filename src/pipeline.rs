@@ -1,5 +1,1047 @@
-//! Pipeline process spawning (SPEC §4).
+//! External command pipelines (SPEC §3.5, §4, §6.2).
 //!
-//! TODO(phase 3): spawn argv-split commands chained stdin->stdout, each in its
-//! own process group (`setsid`), and terminate with SIGTERM, a grace period,
-//! then SIGKILL to the whole group.
+//! A [`PipelineSpec`] is an ordered list of command strings from
+//! `pipelines.yml`. [`spawn_pipeline`] turns each string into argv *without a
+//! shell*, spawns the stages chained `stdout -> stdin`, and returns a handle
+//! whose stdin (first stage) and stdout (last stage) are the only connections
+//! to the outside world.
+//!
+//! Every child is placed in its own session and process group with `setsid`
+//! (through `pre_exec`), so [`PipelineHandle::kill_all`] can signal the whole
+//! group — including grandchildren a shell or helper may have started — with
+//! `SIGTERM`, wait up to a grace period for the group to exit, and fall back to
+//! `SIGKILL`. Waiting is done by polling the children, never with a fixed
+//! sleep when they exit early (SPEC §6.2).
+//!
+//! # Placeholders (SPEC §3.5)
+//!
+//! `{channel}` and `{type}` are substituted before argv splitting. Any other
+//! `{...}` sequence is left **literally** in place instead of being blanked:
+//! a typo such as `{chanel}` reaches the command unchanged and fails visibly,
+//! rather than silently invoking the tuner without its channel argument.
+//! Substitution is textual, so a value must not be able to break out of the
+//! argv token it is written into; the values are therefore validated against
+//! the same charset the config layer enforces
+//! ([`crate::config::validate_channel_value`] /
+//! [`crate::config::validate_type_name`]) and contain neither whitespace nor
+//! quotes.
+//!
+//! # Why argv splitting, not a shell
+//!
+//! SPEC §3.5 requires direct `exec` with argv splitting. [`shell_split`]
+//! implements the subset of POSIX shell word splitting that a command line
+//! needs: whitespace separates words, single quotes keep everything literal,
+//! double quotes allow `\` escapes, and a backslash outside single quotes
+//! escapes the next character. There is no variable expansion, command
+//! substitution, globbing or redirection.
+
+use std::io;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+use crate::config::{validate_channel_value, validate_type_name, Config};
+
+/// Grace between `SIGTERM` and `SIGKILL` (SPEC §6.2).
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// How often a process group is polled while waiting for it to exit.
+const EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// Stages of one `pipelines.yml` entry, in stdin-to-stdout order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PipelineSpec {
+    pub commands: Vec<String>,
+}
+
+impl PipelineSpec {
+    /// Builds a spec from the raw command strings of `pipelines.yml`.
+    pub fn new(commands: Vec<String>) -> Self {
+        Self { commands }
+    }
+
+    /// Whether the pipeline has no stage (the tuner stream is delivered as-is).
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    /// Resolves the pipeline bound to `type_name` in `pipelines.yml`.
+    ///
+    /// A type without a binding (or one whose binding names a missing pipeline,
+    /// which startup validation rejects) yields an empty spec, so the tuner
+    /// stream is delivered as-is (SPEC §3.4).
+    pub fn for_type(config: &Config, type_name: &str) -> Self {
+        let Some(binding) = config.pipelines.types.get(type_name) else {
+            return Self::default();
+        };
+        match config.pipelines.pipelines.get(&binding.pipeline) {
+            Some(commands) => Self::new(commands.clone()),
+            None => {
+                tracing::warn!(
+                    type_name,
+                    pipeline = %binding.pipeline,
+                    "pipeline binding references a missing pipeline; delivering raw TS"
+                );
+                Self::default()
+            }
+        }
+    }
+}
+
+/// The `{channel}` and `{type}` values used for placeholder substitution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandVars {
+    /// The channel value (`27`, `BS13_1`, `C17`, ...).
+    pub channel: String,
+    /// The channel type (`GR`, `BS`, ...). Spelled without the `type` keyword.
+    pub type_name: String,
+}
+
+impl CommandVars {
+    /// Builds the substitution variables for one session.
+    pub fn new(channel: impl Into<String>, type_name: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            type_name: type_name.into(),
+        }
+    }
+}
+
+/// Context for [`spawn_pipeline`].
+#[derive(Clone, Debug)]
+pub struct PipelineCtx {
+    /// Placeholder values for every stage.
+    pub vars: CommandVars,
+    /// Log label, typically the tuner name and channel.
+    pub label: String,
+}
+
+impl PipelineCtx {
+    /// Builds a context for `label` with the given substitution variables.
+    pub fn new(vars: CommandVars, label: impl Into<String>) -> Self {
+        Self {
+            vars,
+            label: label.into(),
+        }
+    }
+}
+
+/// A pipeline failure.
+#[derive(Debug, thiserror::Error)]
+pub enum PipelineError {
+    /// The command line produced no argv (only whitespace, or `''`).
+    #[error("empty command: {command:?}")]
+    NoArgv { command: String },
+    /// A `{channel}` or `{type}` value failed charset validation.
+    #[error("invalid {field} value {value:?}: {reason}")]
+    InvalidValue {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
+    /// `spawn` failed for one stage.
+    #[error("failed to spawn stage {stage} ({command:?}): {source}")]
+    Spawn {
+        stage: usize,
+        command: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Splits a command line into argv using the shell word-splitting rules from
+/// SPEC §3.5: whitespace separation, `'...'`, `"..."` and `\` escapes, with no
+/// expansion of any kind.
+///
+/// Unbalanced quotes are accepted: the rest of the line is kept in the current
+/// word, which lets a malformed command fail at `spawn` with the real argv
+/// instead of being silently rewritten here.
+///
+/// ```
+/// # use unituner::pipeline::shell_split;
+/// assert_eq!(shell_split("cat /tmp/a"), ["cat", "/tmp/a"]);
+/// assert_eq!(shell_split("sh -c 'cat a; sleep 1'"), ["sh", "-c", "cat a; sleep 1"]);
+/// assert_eq!(shell_split(r"a\ b c\ d"), ["a b", "c d"]);
+/// ```
+pub fn shell_split(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut has_token = false;
+
+    for c in input.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            has_token = true;
+            continue;
+        }
+        // A backslash is literal inside single quotes.
+        if c == '\\' && !in_single {
+            escaped = true;
+            has_token = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            has_token = true;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            has_token = true;
+            continue;
+        }
+        if c.is_whitespace() && !in_single && !in_double {
+            if has_token {
+                args.push(std::mem::take(&mut current));
+                has_token = false;
+            }
+            continue;
+        }
+        current.push(c);
+        has_token = true;
+    }
+    // A trailing isolated backslash is a literal backslash.
+    if escaped {
+        current.push('\\');
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+/// Replaces `{channel}` and `{type}` in `command`, leaving every other
+/// `{...}` sequence untouched (see the module documentation).
+pub fn substitute(command: &str, vars: &CommandVars) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut rest = command;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find('}') {
+            Some(close) => {
+                let key = &after[..close];
+                match key {
+                    "channel" => out.push_str(&vars.channel),
+                    "type" => out.push_str(&vars.type_name),
+                    // Unknown placeholders stay literal on purpose.
+                    _ => {
+                        out.push('{');
+                        out.push_str(key);
+                        out.push('}');
+                    }
+                }
+                rest = &after[close + 1..];
+            }
+            None => {
+                // No closing brace: keep the remainder verbatim.
+                out.push_str(&rest[open..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One spawned command chain.
+///
+/// Dropping the handle does **not** kill the children (`kill_on_drop(false)`):
+/// the owner (a session) decides when to stop the tree. Use
+/// [`stop`](Self::stop) / [`kill_all`](Self::kill_all).
+pub struct PipelineHandle {
+    label: String,
+    children: Mutex<Vec<Child>>,
+    pids: Vec<u32>,
+    /// stdin of the first stage, when the chain was spawned with
+    /// `stdin_piped`.
+    stdin: Option<ChildStdin>,
+    /// stdout of the last stage.
+    stdout: Option<ChildStdout>,
+}
+
+impl PipelineHandle {
+    /// Handles a chain with no stage: no children, no pipes.
+    pub fn passthrough(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            children: Mutex::new(Vec::new()),
+            pids: Vec::new(),
+            stdin: None,
+            stdout: None,
+        }
+    }
+
+    /// The log label of this chain.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Takes the stdin of the first stage, if the chain has one.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.stdin.take()
+    }
+
+    /// Takes the stdout of the last stage, if the chain has one.
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+
+    /// PIDs of the spawned stages, in pipeline order.
+    pub fn pids(&self) -> &[u32] {
+        &self.pids
+    }
+
+    /// PID of the first stage.
+    pub fn pid(&self) -> Option<u32> {
+        self.pids.first().copied()
+    }
+
+    /// Whether at least one stage is still running.
+    pub fn is_alive(&self) -> bool {
+        let mut children = lock(&self.children);
+        children
+            .iter_mut()
+            .any(|child| matches!(child.try_wait(), Ok(None)))
+    }
+
+    /// Stops the chain with the SPEC §6.2 grace period.
+    pub async fn stop(&self) {
+        self.kill_all(KILL_GRACE).await;
+    }
+
+    /// Sends `SIGTERM` to every stage's process group, waits up to `grace` for
+    /// the whole group to exit, then `SIGKILL`s whatever is left.
+    ///
+    /// Waiting checks the group (`killpg(pgid, 0)`), not just our direct
+    /// children: a grandchild that outlives its parent but ignores `SIGTERM` is
+    /// still killed after the grace period. Returns as soon as the group is
+    /// gone, without sleeping out the rest of `grace`.
+    pub async fn kill_all(&self, grace: Duration) {
+        let pids = self.pids.clone();
+        if pids.is_empty() {
+            return;
+        }
+        for pid in &pids {
+            signal_group(*pid, libc::SIGTERM);
+        }
+
+        let deadline = Instant::now() + grace;
+        loop {
+            reap(&self.children);
+            if pids.iter().all(|pid| !group_exists(*pid)) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                for pid in &pids {
+                    signal_group(*pid, libc::SIGKILL);
+                }
+                // Bounded reap, so a stuck `wait` cannot hold the caller.
+                let reap_deadline = Instant::now() + grace;
+                while any_running(&self.children) && Instant::now() < reap_deadline {
+                    tokio::time::sleep(EXIT_POLL).await;
+                }
+                reap(&self.children);
+                return;
+            }
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+    }
+
+    /// Waits until every stage has exited and returns their exit statuses in
+    /// pipeline order.
+    pub async fn wait(&self) -> Vec<ExitStatus> {
+        loop {
+            let (done, statuses) = {
+                let mut children = lock(&self.children);
+                let mut statuses = Vec::with_capacity(children.len());
+                let mut done = true;
+                for child in children.iter_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => statuses.push(Some(status)),
+                        Ok(None) => {
+                            done = false;
+                            statuses.push(None);
+                        }
+                        Err(_) => statuses.push(None),
+                    }
+                }
+                (done, statuses)
+            };
+            if done {
+                return statuses.into_iter().flatten().collect();
+            }
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+    }
+}
+
+impl std::fmt::Debug for PipelineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineHandle")
+            .field("label", &self.label)
+            .field("pids", &self.pids)
+            .finish()
+    }
+}
+
+/// A single externally spawned tuner command.
+///
+/// stdout is piped for the data path; stdin is `/dev/null`; stderr is logged.
+/// The process is the leader of its own session/process group, like every
+/// pipeline stage.
+pub struct TunerProcess {
+    inner: PipelineHandle,
+}
+
+impl TunerProcess {
+    /// PID of the tuner process.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
+    /// PIDs of the tuner process (always one).
+    pub fn pids(&self) -> &[u32] {
+        self.inner.pids()
+    }
+
+    /// Takes the tuner's stdout.
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.inner.take_stdout()
+    }
+
+    /// Whether the tuner process is still running.
+    pub fn is_alive(&self) -> bool {
+        self.inner.is_alive()
+    }
+
+    /// Stops the tuner with the SPEC §6.2 grace period.
+    pub async fn stop(&self) {
+        self.inner.stop().await;
+    }
+
+    /// See [`PipelineHandle::kill_all`].
+    pub async fn kill_all(&self, grace: Duration) {
+        self.inner.kill_all(grace).await;
+    }
+
+    /// Waits for the tuner to exit.
+    pub async fn wait(&self) -> Option<ExitStatus> {
+        self.inner.wait().await.into_iter().next()
+    }
+}
+
+impl std::fmt::Debug for TunerProcess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunerProcess")
+            .field("pid", &self.pid())
+            .finish()
+    }
+}
+
+/// Spawns a tuner command from `tuners.yml`.
+///
+/// `{channel}` / `{type}` are substituted, the values are validated against the
+/// config charset, and the resulting argv is spawned directly (no shell) in its
+/// own process group.
+pub async fn spawn_tuner_command(
+    command: &str,
+    vars: &CommandVars,
+) -> Result<TunerProcess, PipelineError> {
+    validate_vars(vars)?;
+
+    let expanded = substitute(command, vars);
+    let argv = shell_split(&expanded);
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err(PipelineError::NoArgv {
+            command: command.to_string(),
+        });
+    }
+
+    let plan = [SpawnPlan {
+        command: command.to_string(),
+        argv,
+        stdin_piped: false,
+    }];
+    let mut inner = spawn_chain(&plan, "tuner").await?;
+    // A tuner never receives input.
+    inner.stdin = None;
+    Ok(TunerProcess { inner })
+}
+
+/// Spawns every stage of `commands` and chains `stdout -> stdin`.
+///
+/// The returned handle owns the first stage's stdin and the last stage's
+/// stdout. If any stage fails to spawn, the stages already started are killed
+/// before the error is returned.
+///
+/// An empty `commands` list yields a pass-through handle with no children
+/// (SPEC §3.4: a type without a pipeline binding delivers the raw TS).
+pub async fn spawn_pipeline(
+    commands: &[String],
+    ctx: &PipelineCtx,
+) -> Result<PipelineHandle, PipelineError> {
+    if commands.is_empty() {
+        return Ok(PipelineHandle::passthrough(ctx.label.clone()));
+    }
+    validate_vars(&ctx.vars)?;
+
+    let mut plan = Vec::with_capacity(commands.len());
+    for command in commands {
+        let expanded = substitute(command, &ctx.vars);
+        let argv = shell_split(&expanded);
+        if argv.is_empty() || argv[0].is_empty() {
+            return Err(PipelineError::NoArgv {
+                command: command.clone(),
+            });
+        }
+        plan.push(SpawnPlan {
+            command: command.clone(),
+            argv,
+            stdin_piped: true,
+        });
+    }
+
+    spawn_chain(&plan, &ctx.label).await
+}
+
+/// Validates the `{channel}` / `{type}` values used for substitution.
+///
+/// The config layer already validates every value it produces, but a public
+/// caller may hand us any string; refusing one here keeps the invariant local
+/// to the module that does the substitution (SPEC §3.5).
+fn validate_vars(vars: &CommandVars) -> Result<(), PipelineError> {
+    validate_channel_value(&vars.channel).map_err(|reason| PipelineError::InvalidValue {
+        field: "channel",
+        value: vars.channel.clone(),
+        reason,
+    })?;
+    validate_type_name(&vars.type_name).map_err(|reason| PipelineError::InvalidValue {
+        field: "type",
+        value: vars.type_name.clone(),
+        reason,
+    })?;
+    Ok(())
+}
+
+/// One stage to spawn.
+struct SpawnPlan {
+    command: String,
+    argv: Vec<String>,
+    /// Whether stdin is a pipe owned by the caller (`spawn_pipeline`) instead
+    /// of `/dev/null` (`spawn_tuner_command`).
+    stdin_piped: bool,
+}
+
+async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, PipelineError> {
+    let mut children: Vec<Child> = Vec::with_capacity(plan.len());
+    let mut pids = Vec::with_capacity(plan.len());
+    let mut previous_stdout: Option<ChildStdout> = None;
+    let mut first_stdin: Option<ChildStdin> = None;
+    let mut last_stdout: Option<ChildStdout> = None;
+
+    for (stage, stage_plan) in plan.iter().enumerate() {
+        let mut command = Command::new(&stage_plan.argv[0]);
+        command.args(&stage_plan.argv[1..]);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.kill_on_drop(false);
+
+        if stage == 0 {
+            command.stdin(if stage_plan.stdin_piped {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        } else {
+            match previous_stdout.take() {
+                Some(stdout) => {
+                    // Hand the pipe to the next stage as a blocking `Stdio`.
+                    let stdio: Stdio =
+                        stdout.try_into().map_err(|source| PipelineError::Spawn {
+                            stage,
+                            command: stage_plan.command.clone(),
+                            source,
+                        })?;
+                    command.stdin(stdio);
+                }
+                // Unreachable for a well-formed chain; `null` keeps the stage
+                // from inheriting our stdin.
+                None => {
+                    command.stdin(Stdio::null());
+                }
+            };
+        }
+
+        // New session and process group: the group survives the leader, which
+        // lets `kill_all` reach grandchildren (SPEC §4, §6.2).
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+
+        match command.spawn() {
+            Ok(mut child) => {
+                if let Some(pid) = child.id() {
+                    pids.push(pid);
+                }
+                let stderr = child.stderr.take();
+                let stdout = child.stdout.take();
+                if stage == 0 {
+                    first_stdin = child.stdin.take();
+                }
+                if let Some(stderr) = stderr {
+                    spawn_stderr_logger(stderr, label.to_string(), stage);
+                }
+                if stage + 1 == plan.len() {
+                    last_stdout = stdout;
+                } else {
+                    previous_stdout = stdout;
+                }
+                children.push(child);
+            }
+            Err(source) => {
+                let handle = PipelineHandle {
+                    label: label.to_string(),
+                    children: Mutex::new(children),
+                    pids,
+                    stdin: None,
+                    stdout: None,
+                };
+                // Best-effort cleanup of the stages that did start.
+                for pid in &handle.pids {
+                    signal_group(*pid, libc::SIGKILL);
+                }
+                let _ = handle.wait().await;
+                return Err(PipelineError::Spawn {
+                    stage,
+                    command: stage_plan.command.clone(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(PipelineHandle {
+        label: label.to_string(),
+        children: Mutex::new(children),
+        pids,
+        stdin: first_stdin,
+        stdout: last_stdout,
+    })
+}
+
+/// Reads a stage's stderr line by line.
+///
+/// Every line is prefixed with the session label and the stage index. Lines
+/// that look like an error are logged at `warn`; the rest at `debug`, so a
+/// chatty parser does not drown the log at the default level.
+fn spawn_stderr_logger(stderr: tokio::process::ChildStderr, label: String, stage: usize) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let lower = line.to_ascii_lowercase();
+                    if lower.contains("error") || lower.contains("fail") || lower.contains("fatal")
+                    {
+                        tracing::warn!(session = %label, stage, "stderr: {line}");
+                    } else {
+                        tracing::debug!(session = %label, stage, "stderr: {line}");
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(session = %label, stage, %error, "stderr read failed");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Sends `signal` to the process group led by `pid`, ignoring `ESRCH`.
+fn signal_group(pid: u32, signal: libc::c_int) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: `killpg` only takes a pgid and a signal number.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, signal);
+    }
+}
+
+/// Whether the process group led by `pid` still has a member.
+fn group_exists(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks for existence and permission.
+    let result = unsafe { libc::killpg(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn any_running(children: &Mutex<Vec<Child>>) -> bool {
+    let mut children = lock(children);
+    children
+        .iter_mut()
+        .any(|child| matches!(child.try_wait(), Ok(None)))
+}
+
+/// Reaps exited children without blocking.
+fn reap(children: &Mutex<Vec<Child>>) {
+    let mut children = lock(children);
+    for child in children.iter_mut() {
+        let _ = child.try_wait();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn ctx() -> PipelineCtx {
+        PipelineCtx::new(CommandVars::new("27", "GR"), "test")
+    }
+
+    fn packet(seed: u8) -> Vec<u8> {
+        let mut packet = vec![seed; 188];
+        packet[0] = 0x47;
+        packet
+    }
+
+    #[test]
+    fn shell_split_handles_quotes_and_escapes() {
+        assert_eq!(shell_split("cat /tmp/a"), ["cat", "/tmp/a"]);
+        assert_eq!(
+            shell_split("sh -c 'cat a; sleep 1'"),
+            ["sh", "-c", "cat a; sleep 1"]
+        );
+        assert_eq!(shell_split(r#"echo "a b" c"#), ["echo", "a b", "c"]);
+        assert_eq!(shell_split(r"echo a\ b"), ["echo", "a b"]);
+        assert_eq!(shell_split(r"echo 'a\b'"), ["echo", r"a\b"]);
+        assert_eq!(shell_split(r#""a\"b""#), [r#"a"b"#]);
+        assert_eq!(shell_split("  a   b  "), ["a", "b"]);
+        assert_eq!(shell_split(""), Vec::<String>::new());
+        assert_eq!(shell_split("   "), Vec::<String>::new());
+        // No variable expansion, no globbing.
+        assert_eq!(shell_split("echo $HOME *"), ["echo", "$HOME", "*"]);
+    }
+
+    #[test]
+    fn shell_split_keeps_unbalanced_quotes_in_the_word() {
+        assert_eq!(shell_split(r#"cat "a b"#), ["cat", "a b"]);
+        assert_eq!(shell_split(r"cat 'a b"), ["cat", "a b"]);
+    }
+
+    #[test]
+    fn placeholders_are_substituted_and_unknown_ones_stay_literal() {
+        let vars = CommandVars::new("BS13_1", "BS");
+        assert_eq!(
+            substitute("recpt1 {channel} {type}", &vars),
+            "recpt1 BS13_1 BS"
+        );
+        assert_eq!(
+            substitute("run -c {channel}/{type}", &vars),
+            "run -c BS13_1/BS"
+        );
+        assert_eq!(substitute("x {chanel} y", &vars), "x {chanel} y");
+        assert_eq!(substitute("x {unclosed", &vars), "x {unclosed");
+        assert_eq!(substitute("no placeholders", &vars), "no placeholders");
+        // Only exact `{channel}` / `{type}` keys are recognised; a nested brace
+        // is an unknown placeholder and stays literal.
+        assert_eq!(substitute("{{channel}}", &vars), "{{channel}}");
+    }
+
+    #[test]
+    fn for_type_resolves_the_binding_and_defaults_to_passthrough() {
+        use std::collections::HashMap;
+
+        use crate::config::ServerConfig;
+        use crate::config::{PipelineBinding, PipelinesConfig, TunerConfig};
+
+        let config = Config {
+            server: ServerConfig::default(),
+            tuners: vec![TunerConfig {
+                name: "t0".to_string(),
+                types: vec!["GR".to_string()],
+                command: "cat {channel}".to_string(),
+                disabled: false,
+            }],
+            channels: Vec::new(),
+            pipelines: PipelinesConfig {
+                pipelines: HashMap::from([(
+                    "soft".to_string(),
+                    vec!["cat".to_string(), "cat".to_string()],
+                )]),
+                types: HashMap::from([
+                    (
+                        "GR".to_string(),
+                        PipelineBinding {
+                            pipeline: "soft".to_string(),
+                        },
+                    ),
+                    (
+                        "BS".to_string(),
+                        PipelineBinding {
+                            pipeline: "missing".to_string(),
+                        },
+                    ),
+                ]),
+            },
+        };
+
+        assert_eq!(
+            PipelineSpec::for_type(&config, "GR").commands,
+            ["cat", "cat"]
+        );
+        // Unbound type and a dangling binding both deliver the raw TS.
+        assert!(PipelineSpec::for_type(&config, "CS").is_empty());
+        assert!(PipelineSpec::for_type(&config, "BS").is_empty());
+    }
+
+    #[test]
+    fn empty_command_is_rejected() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vars = CommandVars::new("27", "GR");
+        runtime.block_on(async {
+            assert!(matches!(
+                spawn_tuner_command("   ", &vars).await,
+                Err(PipelineError::NoArgv { .. })
+            ));
+            assert!(matches!(
+                spawn_pipeline(&["  ".to_string()], &ctx()).await,
+                Err(PipelineError::NoArgv { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn an_invalid_pipeline_variable_is_rejected_before_spawning() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let bad = PipelineCtx::new(CommandVars::new("27", "GR!"), "test");
+        runtime.block_on(async {
+            assert!(matches!(
+                spawn_pipeline(&["cat".to_string()], &bad).await,
+                Err(PipelineError::InvalidValue { field: "type", .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn invalid_channel_value_is_rejected_before_spawning() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vars = CommandVars::new("27; rm -rf /", "GR");
+        runtime.block_on(async {
+            assert!(matches!(
+                spawn_tuner_command("cat {channel}", &vars).await,
+                Err(PipelineError::InvalidValue {
+                    field: "channel",
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[tokio::test]
+    async fn cat_chain_round_trips_bytes() {
+        let mut pipeline = spawn_pipeline(
+            &["cat".to_string(), "cat".to_string(), "cat".to_string()],
+            &ctx(),
+        )
+        .await
+        .expect("spawn cat chain");
+        assert_eq!(pipeline.pids().len(), 3);
+        assert!(pipeline.is_alive());
+
+        let mut stdin = pipeline.take_stdin().expect("first stage stdin");
+        let mut stdout = pipeline.take_stdout().expect("last stage stdout");
+
+        let payload = packet(0x11);
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            stdin.write_all(&payload).await.expect("write");
+            stdin.shutdown().await.expect("close stdin");
+        });
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stdout.read(&mut buf))
+                .await
+                .expect("read timeout")
+                .expect("read");
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..read]);
+            if received.len() >= expected.len() {
+                break;
+            }
+        }
+        writer.await.expect("writer task");
+        assert_eq!(received, expected);
+
+        pipeline.stop().await;
+        assert!(!pipeline.is_alive());
+    }
+
+    #[tokio::test]
+    async fn kill_all_stops_a_sleeping_chain_quickly() {
+        let pipeline = spawn_pipeline(
+            &[r#"sh -c "sleep 60""#.to_string(), "cat".to_string()],
+            &ctx(),
+        )
+        .await
+        .expect("spawn sleep chain");
+        let pids = pipeline.pids().to_vec();
+        assert_eq!(pids.len(), 2);
+        assert!(pipeline.is_alive());
+
+        let started = Instant::now();
+        pipeline.kill_all(KILL_GRACE).await;
+        let elapsed = started.elapsed();
+
+        println!("kill_all(sleep chain) took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "kill_all took {elapsed:?}, expected well under the 2 s grace"
+        );
+        assert!(!pipeline.is_alive());
+        for pid in pids {
+            assert!(
+                !process_exists(pid),
+                "pid {pid} survived kill_all after {elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_all_escalates_to_sigkill_after_the_grace() {
+        // The shell ignores SIGTERM, so only SIGKILL can stop it. Wait for its
+        // `ready` line before signalling: a signal that arrives before the
+        // trap is installed would kill it with the default action.
+        let mut pipeline = spawn_pipeline(
+            &[r#"sh -c "trap '' TERM; echo ready; while :; do sleep 1; done""#.to_string()],
+            &ctx(),
+        )
+        .await
+        .expect("spawn TERM-ignoring chain");
+        let pid = pipeline.pid().expect("pid");
+        let mut stdout = pipeline.take_stdout().expect("stdout");
+        let mut ready = [0u8; 6];
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
+            .await
+            .expect("ready timeout")
+            .expect("read ready");
+        assert_eq!(&ready, b"ready\n");
+        assert!(pipeline.is_alive());
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        pipeline.kill_all(grace).await;
+        let elapsed = started.elapsed();
+
+        println!("kill_all(TERM-ignoring chain, grace 300 ms) took {elapsed:?}");
+        assert!(
+            elapsed >= grace,
+            "SIGKILL was sent before the grace period: {elapsed:?}"
+        );
+        assert!(
+            elapsed < grace + Duration::from_secs(2),
+            "kill_all did not escalate promptly: {elapsed:?}"
+        );
+        assert!(!process_exists(pid), "pid {pid} survived SIGKILL");
+        assert!(!pipeline.is_alive());
+    }
+
+    #[tokio::test]
+    async fn kill_all_returns_early_when_children_exit_on_their_own() {
+        let pipeline = spawn_pipeline(&["true".to_string()], &ctx())
+            .await
+            .expect("spawn true");
+        let started = Instant::now();
+        pipeline.kill_all(KILL_GRACE).await;
+        // No child is left, so no grace period is spent waiting.
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "kill_all waited unnecessarily: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_pipeline_is_a_passthrough() {
+        let mut pipeline = spawn_pipeline(&[], &ctx()).await.expect("spawn");
+        assert!(pipeline.pids().is_empty());
+        assert!(pipeline.take_stdin().is_none());
+        assert!(pipeline.take_stdout().is_none());
+        assert!(!pipeline.is_alive());
+        pipeline.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_tuner_command_pipes_stdout() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, packet(0x22)).expect("write fixture");
+
+        let command = format!("cat {}", path.display());
+        let mut tuner = spawn_tuner_command(&command, &CommandVars::new("27", "GR"))
+            .await
+            .expect("spawn tuner");
+        assert!(tuner.pid().is_some());
+        let mut stdout = tuner.take_stdout().expect("stdout");
+        let mut received = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stdout.read(&mut buf))
+                .await
+                .expect("read timeout")
+                .expect("read");
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..read]);
+        }
+        assert_eq!(received, packet(0x22));
+        tuner.stop().await;
+    }
+
+    /// `kill(pid, 0)`: true while the process (or a zombie) exists.
+    fn process_exists(pid: u32) -> bool {
+        // SAFETY: signal 0 only checks for existence and permission.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+}
