@@ -1,4 +1,873 @@
 //! axum routes for the mirakurun-compatible API subset (SPEC §9).
 //!
-//! TODO(phase 4): implement version/status/channels/services/tuners endpoints
-//! and TS streaming with HEAD support.
+//! # Endpoints
+//!
+//! | Route | Behaviour |
+//! |---|---|
+//! | `GET /api/version` | `{"current":…,"latest":…}`, both the unituner version |
+//! | `GET /api/status` | minimal mirakurun-shaped status (no EPG) |
+//! | `GET /api/channels` | every configured channel with its services embedded |
+//! | `GET /api/channels/{type}` | the same, filtered by channel type |
+//! | `GET /api/channels/{type}/{channel}` | one channel |
+//! | `GET /api/channels/{type}/{channel}/stream` | post-pipeline TS, unfiltered |
+//! | `GET /api/channels/{type}/{channel}/services/{id}/stream` | one service |
+//! | `GET /api/services` / `{id}` | the service table |
+//! | `GET /api/services/{id}/stream` | one service, `{id}` = item id or bare sid |
+//! | `GET /api/tuners` / `{index}` | tuner state and users |
+//! | `GET /api/programs` | always `[]` (no EPG, SPEC §1) |
+//! | `GET /api/programs/{id}` | 404 |
+//! | `PUT /api/config/channels/scan` | channel discovery (SPEC §8.1) |
+//! | `GET /api/config/channels/scan` | 404 (`async` is not implemented) |
+//!
+//! # Stream plumbing
+//!
+//! Every stream route acquires a [`Subscription`] from
+//! [`SessionManager`](crate::session::SessionManager) and turns its receiver
+//! into an HTTP body. `decode=0` asks the session layer to bypass the whole
+//! pipeline (SPEC §4.1); a service stream wraps the subscription in a
+//! per-subscriber [`ServiceFilter`] (SPEC §4, §5) so subscribers never
+//! interfere.
+//!
+//! `HEAD` is served by explicit handlers that return the stream headers and an
+//! empty body without acquiring a session, so a probe never tunes a device.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+
+use axum::body::Body;
+use axum::extract::{ConnectInfo, Path as UrlPath, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, put};
+use axum::{Json, Router};
+use bytes::Bytes;
+use ipnet::IpNet;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
+
+use crate::config::{validate_channel_value, validate_type_name, ChannelConfig, Config};
+use crate::scan::{self, ScanLock, ScanQuery};
+use crate::services::{ServiceRecord, ServiceTable};
+use crate::session::{
+    AcquireError, SessionManager, SessionTap, Subscription, TunerStatus, TunerUser,
+};
+use crate::tsfilter::ServiceFilter;
+
+/// `unituner/<version>`, sent as the `Server` header on every response (SPEC §2).
+const SERVER_ID: &str = concat!("unituner/", env!("CARGO_PKG_VERSION"));
+
+/// The unituner version reported by `/api/version` and `/api/status`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `X-Mirakurun-Tuner-User-ID`, the mirakurun wire identifier (SPEC §2).
+const TUNER_USER_ID: &str = "x-mirakurun-tuner-user-id";
+
+/// `VIDEO/MP2T` as sent by mirakurun; the case is preserved verbatim.
+const TS_CONTENT_TYPE: &str = "video/MP2T";
+
+/// Shared state of the HTTP layer.
+#[derive(Clone)]
+pub struct AppState {
+    /// Sessions, tuner state and the service table.
+    pub manager: SessionManager,
+    /// The configuration the server was started with.
+    pub config: Arc<Config>,
+    /// Directory `channels.yml` is written to by the scan API.
+    pub config_dir: PathBuf,
+    /// Guards against concurrent scans (SPEC §8.1).
+    pub scan_lock: ScanLock,
+    allowed: Arc<Vec<IpNet>>,
+}
+
+impl AppState {
+    /// Builds the HTTP state for `config`, using `services` as the initial
+    /// service table (empty until a scan fills it).
+    pub fn new(config: Arc<Config>, services: ServiceTable, config_dir: PathBuf) -> Self {
+        let allowed = config
+            .server
+            .allowed_cidrs
+            .iter()
+            .filter_map(|cidr| cidr.parse::<IpNet>().ok())
+            .collect();
+        Self {
+            manager: SessionManager::new(Arc::clone(&config), services),
+            config,
+            config_dir,
+            scan_lock: ScanLock::default(),
+            allowed: Arc::new(allowed),
+        }
+    }
+
+    /// Whether `ip` is inside `server.allowed_cidrs` (SPEC §3.1). An empty list
+    /// denies everything, which is the safe reading of "no allowed network".
+    ///
+    /// An IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`, which is what a dual-stack
+    /// listener reports) is matched as its IPv4 address, so the RFC1918
+    /// defaults keep working on a dual-stack socket.
+    fn allows(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            IpAddr::V4(_) => ip,
+        };
+        self.allowed.iter().any(|net| net.contains(&ip))
+    }
+}
+
+/// Builds the API router. The caller serves it with
+/// `into_make_service_with_connect_info::<SocketAddr>()` so the peer address is
+/// available for `allowed_cidrs` and `X-Mirakurun-Tuner-User-ID`.
+pub fn router(state: AppState) -> Router {
+    let routes = api_routes().fallback(not_found);
+    with_common_layers(&state, routes).with_state(state)
+}
+
+/// Applies the layers every unituner route needs, so another router (the webui
+/// one, SPEC §3.1 "webui も同じ") can share them:
+///
+/// * the `allowed_cidrs` peer guard (403 JSON);
+/// * the `Server: unituner/<version>` header and the debug request log.
+pub fn with_common_layers(state: &AppState, router: Router<AppState>) -> Router<AppState> {
+    router
+        .layer(middleware::from_fn_with_state(state.clone(), network_guard))
+        .layer(middleware::from_fn(server_identity))
+}
+
+/// The API routes, before the shared middleware is applied.
+fn api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/version", get(version))
+        .route("/api/status", get(status))
+        .route("/api/channels", get(channels))
+        .route("/api/channels/{channel_type}", get(channels_by_type))
+        .route(
+            "/api/channels/{channel_type}/{channel}",
+            get(channel_detail),
+        )
+        .route(
+            "/api/channels/{channel_type}/{channel}/stream",
+            get(channel_stream).head(stream_head),
+        )
+        .route(
+            "/api/channels/{channel_type}/{channel}/services/{service}/stream",
+            get(channel_service_stream).head(channel_service_head),
+        )
+        .route("/api/services", get(services_list))
+        .route("/api/services/{service}", get(service_detail))
+        .route(
+            "/api/services/{service}/stream",
+            get(service_stream).head(service_head),
+        )
+        .route("/api/tuners", get(tuners))
+        .route("/api/tuners/{index}", get(tuner))
+        .route("/api/programs", get(programs))
+        .route("/api/programs/{program}", get(program_not_found))
+        // `async` is not implemented (SPEC §8.1): a GET must be a 404, not a
+        // 405, because mirakurun clients poll this path.
+        .route(
+            "/api/config/channels/scan",
+            put(scan_channels).get(scan_not_found),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Metadata endpoints
+// ---------------------------------------------------------------------------
+
+async fn version() -> Json<Value> {
+    Json(json!({ "current": VERSION, "latest": VERSION }))
+}
+
+async fn status(State(state): State<AppState>) -> Json<Value> {
+    let tuners = state.manager.tuners_snapshot();
+    let sessions = state.manager.sessions_snapshot();
+    let tuners_json: Vec<Value> = tuners.iter().map(tuner_json).collect();
+    Json(json!({
+        "version": VERSION,
+        "process": {
+            "pid": std::process::id(),
+            "arch": std::env::consts::ARCH,
+            "platform": std::env::consts::OS,
+            "versions": { "unituner": VERSION },
+        },
+        // EPG is out of scope (SPEC §1); the fields stay for shape
+        // compatibility and are always empty.
+        "epg": {
+            "lastScanned": "",
+            "lastScanning": "",
+            "isScanning": false,
+            "errorCount": 0,
+        },
+        "streamCount": {
+            "total": sessions.len(),
+            "tv": sessions.len(),
+            "radio": 0,
+            "encoding": 0,
+        },
+        "streamInfos": [],
+        "tunerCount": tuners.len(),
+        "tuners": tuners_json,
+        "time": "",
+        "epgReady": true,
+        "scanReady": true,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Channels
+// ---------------------------------------------------------------------------
+
+/// Every channel from `channels.yml` (SPEC §9). `disabled: true` is accepted
+/// as configuration but does not hide the entry: mirakurun's channel list is
+/// the configured list, and SPEC §9 gives no filtering rule.
+async fn channels(State(state): State<AppState>) -> Json<Value> {
+    let services = state.manager.services();
+    Json(Value::Array(
+        state
+            .config
+            .channels
+            .iter()
+            .map(|channel| channel_json(services, channel))
+            .collect(),
+    ))
+}
+
+async fn channels_by_type(
+    State(state): State<AppState>,
+    UrlPath(channel_type): UrlPath<String>,
+) -> Response {
+    if let Err(reason) = validate_type_name(&channel_type) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    let services = state.manager.services();
+    let list: Vec<Value> = state
+        .config
+        .channels
+        .iter()
+        .filter(|channel| channel.channel_type == channel_type)
+        .map(|channel| channel_json(services, channel))
+        .collect();
+    Json(Value::Array(list)).into_response()
+}
+
+async fn channel_detail(
+    State(state): State<AppState>,
+    UrlPath((channel_type, channel)): UrlPath<(String, String)>,
+) -> Response {
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    match find_channel(&state.config, &channel_type, &channel) {
+        Some(entry) => Json(channel_json(state.manager.services(), entry)).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "Channel Not Found"),
+    }
+}
+
+/// The channel's JSON, with its services embedded as a short list (SPEC §9).
+fn channel_json(services: &ServiceTable, channel: &ChannelConfig) -> Value {
+    let embedded: Vec<Value> = services
+        .list()
+        .into_iter()
+        .filter(|record| {
+            record
+                .channel
+                .as_ref()
+                .is_some_and(|(t, c)| t == &channel.channel_type && c == &channel.channel)
+        })
+        .map(|record| {
+            json!({
+                "id": record.item_id().0,
+                "serviceId": record.service_id,
+                "networkId": record.network_id,
+                "name": record.name,
+                "type": record.service_type,
+            })
+        })
+        .collect();
+    json!({
+        "type": channel.channel_type,
+        "channel": channel.channel,
+        "name": channel.name,
+        "services": embedded,
+    })
+}
+
+/// The configured entry for `(channel_type, channel)`.
+fn find_channel<'a>(
+    config: &'a Config,
+    channel_type: &str,
+    channel: &str,
+) -> Option<&'a ChannelConfig> {
+    config
+        .channels
+        .iter()
+        .find(|entry| entry.channel_type == channel_type && entry.channel == channel)
+}
+
+// ---------------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------------
+
+async fn services_list(State(state): State<AppState>) -> Json<Value> {
+    Json(Value::Array(
+        state
+            .manager
+            .services()
+            .list()
+            .iter()
+            .map(service_json)
+            .collect(),
+    ))
+}
+
+async fn service_detail(
+    State(state): State<AppState>,
+    UrlPath(service): UrlPath<String>,
+) -> Response {
+    match state.manager.services().resolve(&service) {
+        Ok(record) => Json(service_json(&record)).into_response(),
+        Err(error) => {
+            tracing::debug!(%error, id = %service, "service not found");
+            error_response(StatusCode::NOT_FOUND, "Service Not Found")
+        }
+    }
+}
+
+/// The full mirakurun-shaped service item (SPEC §9).
+fn service_json(record: &ServiceRecord) -> Value {
+    json!({
+        "id": record.item_id().0,
+        "serviceId": record.service_id,
+        "networkId": record.network_id,
+        "tsid": record.tsid,
+        "name": record.name,
+        "type": record.service_type,
+        "logoId": 0,
+        "hasLogoData": record.has_logo_data,
+        // mirakurun always carries the field; 0 means "unknown".
+        "remoteControlKeyId": record.remote_control_key_id.unwrap_or(0),
+        "channel": record
+            .channel
+            .as_ref()
+            .map(|(channel_type, channel)| json!({ "type": channel_type, "channel": channel }))
+            .unwrap_or(Value::Null),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tuners
+// ---------------------------------------------------------------------------
+
+async fn tuners(State(state): State<AppState>) -> Json<Value> {
+    Json(Value::Array(
+        state
+            .manager
+            .tuners_snapshot()
+            .iter()
+            .map(tuner_json)
+            .collect(),
+    ))
+}
+
+async fn tuner(State(state): State<AppState>, UrlPath(index): UrlPath<String>) -> Response {
+    let Ok(index) = index.parse::<usize>() else {
+        return error_response(StatusCode::NOT_FOUND, "Tuner Not Found");
+    };
+    match state
+        .manager
+        .tuners_snapshot()
+        .into_iter()
+        .find(|tuner| tuner.index == index)
+    {
+        Some(tuner) => Json(tuner_json(&tuner)).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "Tuner Not Found"),
+    }
+}
+
+fn tuner_json(tuner: &TunerStatus) -> Value {
+    json!({
+        "index": tuner.index,
+        "name": tuner.name,
+        "types": tuner.types,
+        "isAvailable": tuner.is_available,
+        "isFree": tuner.is_free,
+        "isUsing": tuner.is_using,
+        "isFault": tuner.is_fault,
+        "users": tuner
+            .users
+            .iter()
+            .map(|user| {
+                json!({
+                    "date": user
+                        .started_at
+                        .duration_since(UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis() as u64)
+                        .unwrap_or(0),
+                    "id": user.id,
+                    "priority": user.priority,
+                    "provider": user.provider,
+                    "agent": user.agent,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Programs (not implemented)
+// ---------------------------------------------------------------------------
+
+async fn programs() -> Json<Value> {
+    Json(Value::Array(Vec::new()))
+}
+
+async fn program_not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "Program Not Found")
+}
+
+// ---------------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------------
+
+/// Request metadata taken from the headers (SPEC §6.1, §6.3).
+struct StreamRequest {
+    priority: i32,
+    pin: Option<String>,
+    provider: Option<String>,
+    agent: Option<String>,
+    user_id: String,
+}
+
+impl StreamRequest {
+    fn new(headers: &HeaderMap, peer: SocketAddr) -> Result<Self, String> {
+        let priority = match last_header(headers, "x-mirakurun-priority") {
+            Some(raw) => raw
+                .parse::<i32>()
+                // The header name is deliberately not echoed: SPEC §2 keeps
+                // "Mirakurun" out of response bodies.
+                .map_err(|_| {
+                    format!("invalid priority header value {raw:?}: expected an integer")
+                })?,
+            None => 0,
+        };
+        // `X-Mirakc-Tuner` wins over its `X-Mirakurun-Tuner` alias when both
+        // carry a value; within one name the last non-empty value wins
+        // (SPEC §6.3).
+        let pin = last_header(headers, "x-mirakc-tuner")
+            .or_else(|| last_header(headers, "x-mirakurun-tuner"));
+        Ok(Self {
+            priority,
+            pin,
+            provider: last_header(headers, "x-mirakurun-tuner-user-provider"),
+            agent: last_header(headers, "x-mirakurun-tuner-user-agent"),
+            user_id: peer.to_string(),
+        })
+    }
+
+    fn user(&self) -> TunerUser {
+        let mut user = TunerUser::new(self.user_id.clone(), self.priority);
+        if let Some(provider) = &self.provider {
+            user = user.with_provider(provider.clone());
+        }
+        if let Some(agent) = &self.agent {
+            user = user.with_agent(agent.clone());
+        }
+        user
+    }
+}
+
+/// The last non-empty value of a possibly repeated header, trimmed.
+fn last_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get_all(name).iter().rev().find_map(|value| {
+        value
+            .to_str()
+            .ok()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+async fn channel_stream(
+    State(state): State<AppState>,
+    UrlPath((channel_type, channel)): UrlPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    let request = match StreamRequest::new(&headers, peer) {
+        Ok(request) => request,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
+    };
+    let decode = is_decode_zero(&params);
+    let subscription = state
+        .manager
+        .acquire_full(
+            &channel_type,
+            &channel,
+            request.user(),
+            request.pin.clone(),
+            SessionTap::Raw,
+            decode,
+        )
+        .await;
+    match subscription {
+        Ok(subscription) => stream_response(subscription, None, &request.user_id),
+        Err(error) => acquire_failure(&error),
+    }
+}
+
+async fn channel_service_stream(
+    State(state): State<AppState>,
+    UrlPath((channel_type, channel, service)): UrlPath<(String, String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    // Service resolution (404) comes before tuner and URL validation (400),
+    // SPEC §6.3.
+    let record = match state.manager.services().resolve(&service) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::debug!(%error, id = %service, "service not found");
+            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+        }
+    };
+    if let Some((record_type, record_channel)) = &record.channel {
+        if record_type != &channel_type || record_channel != &channel {
+            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+        }
+    }
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    stream_service(
+        &state,
+        &record,
+        &headers,
+        peer,
+        &params,
+        Some((channel_type, channel)),
+    )
+    .await
+}
+
+async fn service_stream(
+    State(state): State<AppState>,
+    UrlPath(service): UrlPath<String>,
+    Query(params): Query<HashMap<String, String>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let record = match state.manager.services().resolve(&service) {
+        Ok(record) => record,
+        Err(error) => {
+            tracing::debug!(%error, id = %service, "service not found");
+            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+        }
+    };
+    let Some((channel_type, channel)) = record.channel.clone() else {
+        // Without a channel binding there is no way to tune to this service.
+        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+    };
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    stream_service(&state, &record, &headers, peer, &params, None).await
+}
+
+/// Shared body of the two service-stream endpoints.
+async fn stream_service(
+    state: &AppState,
+    record: &ServiceRecord,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    params: &HashMap<String, String>,
+    channel_from_path: Option<(String, String)>,
+) -> Response {
+    let request = match StreamRequest::new(headers, peer) {
+        Ok(request) => request,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
+    };
+    // The channel comes from the service table; the `/api/channels/...` form
+    // falls back to its own path segments when the table has no binding yet.
+    let Some((channel_type, channel)) = record.channel.clone().or(channel_from_path) else {
+        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+    };
+    let decode = is_decode_zero(params);
+    let subscription = state
+        .manager
+        .acquire_full(
+            &channel_type,
+            &channel,
+            request.user(),
+            request.pin.clone(),
+            SessionTap::Filtered {
+                service_id: Some(record.service_id),
+            },
+            decode,
+        )
+        .await;
+    match subscription {
+        Ok(subscription) => stream_response(
+            subscription,
+            Some(ServiceFilter::new(record.service_id)),
+            &request.user_id,
+        ),
+        Err(error) => acquire_failure(&error),
+    }
+}
+
+/// HEAD for the channel stream: the same headers, an empty body, and no
+/// session is acquired (a probe must not tune a device). The path is validated
+/// like the GET, so a malformed channel still yields the same 400.
+async fn stream_head(
+    UrlPath((channel_type, channel)): UrlPath<(String, String)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    empty_stream_head(peer)
+}
+
+/// HEAD for `/api/services/{id}/stream`: resolves the service first, so an
+/// unknown id is a 404 like the GET.
+async fn service_head(
+    State(state): State<AppState>,
+    UrlPath(service): UrlPath<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match state.manager.services().resolve(&service) {
+        Ok(_) => empty_stream_head(peer),
+        Err(_) => error_response(StatusCode::NOT_FOUND, "Service Not Found"),
+    }
+}
+
+/// HEAD for `/api/channels/{type}/{channel}/services/{id}/stream`.
+async fn channel_service_head(
+    State(state): State<AppState>,
+    UrlPath((_, _, service)): UrlPath<(String, String, String)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    match state.manager.services().resolve(&service) {
+        Ok(_) => empty_stream_head(peer),
+        Err(_) => error_response(StatusCode::NOT_FOUND, "Service Not Found"),
+    }
+}
+
+fn empty_stream_head(peer: SocketAddr) -> Response {
+    let mut response = Response::new(Body::empty());
+    fill_stream_headers(response.headers_mut(), &peer.to_string());
+    response
+}
+
+/// The 200 response of a stream route, with the SPEC §9 headers.
+fn stream_response(
+    subscription: Subscription,
+    filter: Option<ServiceFilter>,
+    user_id: &str,
+) -> Response {
+    let body = subscription_body(subscription, filter);
+    let mut response = Response::new(body);
+    fill_stream_headers(response.headers_mut(), user_id);
+    response
+}
+
+fn fill_stream_headers(headers: &mut HeaderMap, user_id: &str) {
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(TS_CONTENT_TYPE),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::HeaderName::from_static(TUNER_USER_ID),
+        HeaderValue::from_str(user_id).unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+}
+
+/// Turns a subscription into a body, optionally through a per-subscriber
+/// [`ServiceFilter`] (SPEC §4, §5).
+fn subscription_body(subscription: Subscription, filter: Option<ServiceFilter>) -> Body {
+    let Subscription { rx, .. } = subscription;
+    match filter {
+        None => {
+            let stream = ReceiverStream::new(rx).map(Ok::<Bytes, Infallible>);
+            Body::from_stream(stream)
+        }
+        Some(mut filter) => {
+            // One bounded hop so a slow client applies backpressure to its own
+            // subscriber only (SPEC §7). Dropping the body drops `out_rx`,
+            // which ends this task and releases the subscription.
+            let (tx, out_rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+            tokio::spawn(async move {
+                let mut rx = rx;
+                while let Some(chunk) = rx.recv().await {
+                    let filtered = filter.push(&chunk);
+                    if filtered.is_empty() {
+                        continue;
+                    }
+                    if tx.send(Ok(Bytes::from(filtered))).await.is_err() {
+                        break;
+                    }
+                }
+                tracing::debug!(
+                    service_id = filter.service_id(),
+                    packets_in = filter.packets_in,
+                    packets_out = filter.packets_out,
+                    "service stream ended"
+                );
+            });
+            Body::from_stream(ReceiverStream::new(out_rx))
+        }
+    }
+}
+
+/// `decode=0` bypasses the whole pipeline (SPEC §4.1).
+fn is_decode_zero(params: &HashMap<String, String>) -> bool {
+    params
+        .get("decode")
+        .is_some_and(|value| value.trim() == "0")
+}
+
+/// Maps an [`AcquireError`] to the SPEC §6 response.
+fn acquire_failure(error: &AcquireError) -> Response {
+    let status = match error {
+        AcquireError::UnknownTuner(_) | AcquireError::UnsupportedType(_) => StatusCode::BAD_REQUEST,
+        AcquireError::NoTuner
+        | AcquireError::Unavailable
+        | AcquireError::Busy
+        | AcquireError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        tracing::warn!(%error, "stream request rejected");
+        error_response(status, "Tuner Resource Unavailable")
+    } else {
+        tracing::debug!(%error, "stream request rejected");
+        error_response(status, error.to_string())
+    }
+}
+
+/// Validates a `{type}`/`{channel}` pair taken from the URL (SPEC §3.5).
+fn validate_path(channel_type: &str, channel: &str) -> Result<(), String> {
+    validate_type_name(channel_type)?;
+    validate_channel_value(channel)
+}
+
+// ---------------------------------------------------------------------------
+// Channel scan (SPEC §8.1)
+// ---------------------------------------------------------------------------
+
+async fn scan_channels(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let query = match ScanQuery::from_params(&params) {
+        Ok(query) => query,
+        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
+    };
+    let scan_lease = match state.scan_lock.acquire() {
+        Some(lease) => lease,
+        None => return error_response(StatusCode::CONFLICT, "Already Scanning"),
+    };
+
+    let (tx, rx) = mpsc::channel::<String>(64);
+    let manager = state.manager.clone();
+    let config = Arc::clone(&state.config);
+    let config_dir = state.config_dir.clone();
+    tokio::spawn(async move {
+        tracing::info!(
+            type_name = %query.type_name,
+            dry_run = query.dry_run,
+            "channel scan started"
+        );
+        let result = scan::run_scan(&manager, &config, &config_dir, &query, tx.clone()).await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "channel scan failed");
+            let _ = tx.send(format!("error: {error}\n")).await;
+        }
+        // Releasing the lease is what makes the next scan possible.
+        drop(scan_lease);
+    });
+
+    let stream = ReceiverStream::new(rx).map(|line| Ok::<Bytes, Infallible>(Bytes::from(line)));
+    let mut response = Response::new(Body::from_stream(stream));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
+}
+
+async fn scan_not_found() -> Response {
+    // SPEC §8.1: `async` scan polling is not implemented.
+    error_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+// ---------------------------------------------------------------------------
+// Middleware and error helpers
+// ---------------------------------------------------------------------------
+
+/// Sets `Server: unituner/<version>` on every response and logs the request
+/// line at debug level (SPEC §2, §9).
+async fn server_identity(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::SERVER, HeaderValue::from_static(SERVER_ID));
+    tracing::debug!(%method, %path, status = response.status().as_u16(), "request");
+    response
+}
+
+/// Rejects peers outside `server.allowed_cidrs` with a 403 JSON body
+/// (SPEC §3.1). Requests without peer information (in-process tests) pass.
+async fn network_guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    if let Some(ip) = peer.map(|peer| peer.ip()) {
+        if !state.allows(ip) {
+            tracing::warn!(%ip, path = %request.uri().path(), "peer outside allowed_cidrs");
+            return error_response(StatusCode::FORBIDDEN, "Forbidden");
+        }
+    }
+    next.run(request).await
+}
+
+async fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+/// The SPEC §9 error body: `{"code":…,"reason":…,"errors":[]}`.
+fn error_response(status: StatusCode, reason: impl Into<String>) -> Response {
+    let body = json!({
+        "code": status.as_u16(),
+        "reason": reason.into(),
+        "errors": [],
+    });
+    (status, Json(body)).into_response()
+}
+
+/// Used by `main` to translate `server.addr` (`:40772`) into a bind address.
+pub fn bind_address(addr: &str) -> Result<SocketAddr, String> {
+    let trimmed = addr.trim();
+    let candidate = if trimmed.starts_with(':') {
+        format!("0.0.0.0{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    candidate
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("{addr:?} is not a valid socket address"))
+}
