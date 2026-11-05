@@ -664,9 +664,11 @@ async fn head_of_an_unknown_service_is_404() {
 #[tokio::test]
 async fn decode_zero_bypasses_the_whole_pipeline() {
     let ts = [packet_bytes(0x44), packet_bytes(0x55), packet_bytes(0x66)].concat();
-    // The pipeline appends a marker, so "pipeline ran" and "pipeline bypassed"
-    // are distinguishable even though both stream 188-byte packets.
-    let pipelines = "pipelines:\n  pass:\n    - \"sh -c 'cat; printf PIPE'\"\ntypes:\n  GR: { pipeline: pass }\n";
+    // The pipeline appends a marker *packet*, so "pipeline ran" and "pipeline
+    // bypassed" are distinguishable even though both stream 188-byte packets.
+    // The marker must be a whole packet: a subscriber's byte stream is only ever
+    // whole TS packets, so the pump discards an incomplete trailing packet.
+    let pipelines = "pipelines:\n  pass:\n    - \"sh -c 'cat; printf %0188d 0 | tr 0 P'\"\ntypes:\n  GR: { pipeline: pass }\n";
     let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), pipelines);
     let path = fixture.write_ts("stream.ts", &ts);
     // A finite tuner command: the pipeline marker then arrives at EOF, which
@@ -684,10 +686,11 @@ async fn decode_zero_bypasses_the_whole_pipeline() {
         request(Method::GET, "/api/channels/GR/27/stream"),
     )
     .await;
-    // The pipeline stage appends its marker, so the body is the fixture plus
-    // "PIPE".
+    // The pipeline stage appends its marker packet, so the body is the fixture
+    // plus one 188-byte packet of `P`.
     let with_pipeline = read_all(response.into_body()).await;
-    assert_eq!(with_pipeline, [ts.clone(), b"PIPE".to_vec()].concat());
+    let marker = vec![b'P'; TS_PACKET_SIZE];
+    assert_eq!(with_pipeline, [ts.clone(), marker].concat());
 
     // `decode=0` must never spawn the pipeline stages: the bytes come straight
     // from the (normalized) tuner output.

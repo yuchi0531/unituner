@@ -88,19 +88,29 @@
 //! # Fan-out and backpressure
 //!
 //! One task per session reads the last stage's stdout and broadcasts
-//! [`Bytes`] chunks (at most `server.chunk_size_bytes` each). Every subscriber
-//! owns a bounded mpsc and a pump task from broadcast to mpsc. The pump uses
-//! `try_send`: a full queue or a `Lagged` broadcast drops **that subscriber
-//! only**, and the broadcast is never blocked by a slow client (SPEC §7).
+//! [`Bytes`] chunks. A chunk is always a **whole number of TS packets**: the
+//! configured `server.chunk_size_bytes` is rounded down to a packet multiple
+//! (65536 → 65424 = 188 × 348, never below 188), and a packet cut by a read
+//! boundary is carried into the next chunk. A subscriber's byte stream therefore
+//! starts with `0x47` and every chunk boundary is a packet boundary, for the
+//! first subscriber and for a late one replaying the window alike. An
+//! incomplete trailing packet at EOF is discarded rather than delivered.
+//!
+//! Every subscriber owns a bounded mpsc and a pump task from broadcast to mpsc.
+//! The pump uses `try_send`: a full queue or a `Lagged` broadcast drops **that
+//! subscriber only**, and the broadcast is never blocked by a slow client
+//! (SPEC §7).
 //!
 //! # Replay window
 //!
 //! Until the *first* subscriber attaches, every chunk is kept for replay, up to
-//! one subscriber queue's worth of bytes. A fast source can therefore emit the
-//! head of the stream (typically PAT/PMT) before the promoter attaches without
-//! losing it. After the first attach the window shrinks to the last
-//! [`PRELUDE_CHUNKS`] chunks, which is the original "cover the readiness gap"
-//! size.
+//! one subscriber queue's worth of bytes (rounded down to whole packets). A fast
+//! source can therefore emit the head of the stream (typically PAT/PMT) before
+//! the promoter attaches without losing it. After the first attach the window
+//! shrinks to the last [`PRELUDE_CHUNKS`] chunks, which is the original "cover
+//! the readiness gap" size. Because the window holds whole chunks and every
+//! chunk is packet-aligned, a late subscriber always starts on a packet
+//! boundary.
 //!
 //! # Idle release
 //!
@@ -125,16 +135,16 @@ use crate::pipeline::{
     TunerProcess,
 };
 use crate::services::ServiceTable;
-use crate::tsframe::TsNormalizer;
+use crate::tsframe::{TsNormalizer, TS_PACKET_SIZE};
 
 /// Number of recent chunks replayed to a newly joined subscriber **after the
 /// first subscriber attached**.
 ///
 /// The broadcast only delivers chunks sent after `subscribe()`, so without a
 /// replay a chunk broadcast a moment before `attach` would be lost. Two chunks
-/// (128 KiB with the defaults) is enough to cover that gap while keeping the
-/// replay bounded and small for a late joiner. Until the first subscriber
-/// attaches, the window is larger: see [`ReplayState`].
+/// (≈128 KiB with the defaults, 65424 bytes each) is enough to cover that gap
+/// while keeping the replay bounded and small for a late joiner. Until the first
+/// subscriber attaches, the window is larger: see [`Replay`].
 pub const PRELUDE_CHUNKS: usize = 2;
 
 /// Capacity of a session's broadcast ring, in chunks.
@@ -142,8 +152,8 @@ pub const PRELUDE_CHUNKS: usize = 2;
 /// SPEC §7 requires the broadcast capacity to be part of the memory budget.
 /// A session holds at most this many chunks here **in addition to**
 /// `server.subscriber_buffer_chunks` chunks per subscriber: with the defaults
-/// (64 KiB chunks) that is ≈1 MiB of broadcast buffer plus ≈64 MiB per
-/// subscriber. A subscriber whose pump falls this many chunks behind is
+/// (≈64 KiB packet-aligned chunks) that is ≈1 MiB of broadcast buffer plus
+/// ≈64 MiB per subscriber. A subscriber whose pump falls this many chunks behind is
 /// dropped; in practice the pump never waits on the client, so this only
 /// happens if the runtime itself is starved.
 pub const BROADCAST_CAPACITY_CHUNKS: usize = 16;
@@ -275,7 +285,8 @@ pub enum SessionTap {
 /// Dropping the subscription closes the mpsc receiver, which ends the
 /// subscriber pump and, when it was the last one, arms the idle timer.
 pub struct Subscription {
-    /// Chunks of post-pipeline TS, at most `server.chunk_size_bytes` each.
+    /// Chunks of post-pipeline TS: whole 188-byte packets, at most
+    /// `server.chunk_size_bytes` rounded down to a packet multiple each.
     pub rx: mpsc::Receiver<Bytes>,
     /// Stable id of the shared session.
     pub session_id: u64,
@@ -484,7 +495,8 @@ struct Session {
     /// broadcast, never twice. See [`Replay`].
     replay: Mutex<Replay>,
     /// Byte bound for [`Replay`] while no subscriber has attached:
-    /// `chunk_size_bytes * subscriber_buffer_chunks`.
+    /// `chunk_size_bytes * subscriber_buffer_chunks`, rounded down to whole
+    /// packets.
     replay_byte_cap: AtomicUsize,
     next_subscriber_id: AtomicU64,
     /// Invalidates a pending idle timer; bumped on every new subscriber.
@@ -662,13 +674,20 @@ impl Inner {
     }
 
     /// Byte bound for a session's pre-attach replay window: one subscriber
-    /// queue's worth (`chunk_size_bytes * subscriber_buffer_chunks`).
+    /// queue's worth (`chunk_size_bytes * subscriber_buffer_chunks`), rounded
+    /// down to whole TS packets.
+    ///
+    /// The replay window holds only whole chunks, and every chunk is
+    /// packet-aligned, so a late subscriber starts on a packet boundary. The
+    /// round-down keeps the cap from cutting a packet in the window itself.
     fn replay_byte_cap(&self) -> usize {
-        self.config
+        let bytes = self
+            .config
             .server
             .chunk_size_bytes
             .max(1)
-            .saturating_mul(self.config.server.subscriber_buffer_chunks.max(1))
+            .saturating_mul(self.config.server.subscriber_buffer_chunks.max(1));
+        (bytes / TS_PACKET_SIZE * TS_PACKET_SIZE).max(TS_PACKET_SIZE)
     }
 
     /// Finds the session for `(type, channel)`, whatever its tuner or decode
@@ -2026,7 +2045,14 @@ fn spawn_pump(
         } else {
             None
         };
+        // SPEC §7's chunk size, rounded down so a chunk is always a whole
+        // number of packets: a subscriber's byte stream must start on a packet
+        // boundary, and a chunk that cut a packet would break that for every
+        // late joiner replaying it.
+        let chunk_size = packet_aligned_chunk_size(chunk_size);
         let mut buf = vec![0u8; chunk_size];
+        // Bytes of a packet cut by a read boundary, kept for the next read.
+        let mut pending: Vec<u8> = Vec::new();
         let mut reason = None;
         let mut had_data = false;
 
@@ -2035,26 +2061,18 @@ fn spawn_pump(
                 Ok(0) => break,
                 Ok(read) => {
                     let chunk = match normalizer.as_mut() {
-                        Some(normalizer) => {
-                            let out = normalizer.push(&buf[..read]);
-                            if out.is_empty() {
-                                None
-                            } else {
-                                Some(Bytes::from(out))
-                            }
-                        }
-                        None => Some(Bytes::copy_from_slice(&buf[..read])),
+                        Some(normalizer) => normalizer.push(&buf[..read]),
+                        None => buf[..read].to_vec(),
                     };
-                    if let Some(chunk) = chunk {
-                        for piece in split_chunks(chunk, chunk_size) {
-                            had_data = true;
-                            if session.emit(&sender, piece) {
-                                if let Some(tx) = readiness.take() {
-                                    let _ = tx.send(None);
-                                }
-                            }
-                        }
-                    }
+                    pending.extend_from_slice(&chunk);
+                    flush_packets(
+                        &session,
+                        &sender,
+                        &mut readiness,
+                        &mut had_data,
+                        &mut pending,
+                        chunk_size,
+                    );
                 }
                 Err(error) => {
                     reason = Some(format!("read failed: {error}"));
@@ -2065,14 +2083,26 @@ fn spawn_pump(
 
         if let Some(mut normalizer) = normalizer {
             let tail = normalizer.finish();
-            for piece in split_chunks(Bytes::from(tail), chunk_size) {
-                had_data = true;
-                if session.emit(&sender, piece) {
-                    if let Some(tx) = readiness.take() {
-                        let _ = tx.send(None);
-                    }
-                }
-            }
+            pending.extend_from_slice(&tail);
+            flush_packets(
+                &session,
+                &sender,
+                &mut readiness,
+                &mut had_data,
+                &mut pending,
+                chunk_size,
+            );
+        }
+        if !pending.is_empty() {
+            // An incomplete trailing packet cannot be delivered: a subscriber
+            // must never receive a partial packet.
+            tracing::debug!(
+                session_id = session.id,
+                session = %label,
+                discarded = pending.len(),
+                "discarding an incomplete trailing packet"
+            );
+            pending.clear();
         }
 
         if let Some(tx) = readiness.take() {
@@ -2099,23 +2129,60 @@ fn spawn_pump(
     });
 }
 
-/// Splits `data` into `size`-byte slices, yielding nothing for empty input.
+/// Rounds a configured chunk size down to whole TS packets, never below one.
 ///
-/// The `TsNormalizer` can emit more than one read's worth (it needs two packets
-/// to detect 188 vs 204), so the pump re-chunks to keep the SPEC §7 promise
-/// that a subscriber chunk is at most `server.chunk_size_bytes`.
-fn split_chunks(data: Bytes, size: usize) -> impl Iterator<Item = Bytes> {
-    let size = size.max(1);
+/// `65536` becomes `65424` (`188 * 348`): the remainder would otherwise cut a
+/// packet, and a chunk that does not start on a packet boundary would make a
+/// subscriber that replays it see `bytes[0] != 0x47`.
+fn packet_aligned_chunk_size(size: usize) -> usize {
+    (size / TS_PACKET_SIZE * TS_PACKET_SIZE).max(TS_PACKET_SIZE)
+}
+
+/// Emits every whole packet in `pending` as packet-aligned chunks of at most
+/// `chunk_size` bytes, keeping an incomplete trailing packet for the next call.
+#[allow(clippy::too_many_arguments)]
+fn flush_packets(
+    session: &Session,
+    sender: &broadcast::Sender<Bytes>,
+    readiness: &mut Option<oneshot::Sender<Option<String>>>,
+    had_data: &mut bool,
+    pending: &mut Vec<u8>,
+    chunk_size: usize,
+) {
+    let whole = pending.len() / TS_PACKET_SIZE * TS_PACKET_SIZE;
+    if whole == 0 {
+        return;
+    }
     let mut offset = 0;
-    std::iter::from_fn(move || {
-        if offset >= data.len() {
-            return None;
-        }
-        let end = (offset + size).min(data.len());
-        let piece = data.slice(offset..end);
+    while offset < whole {
+        let end = (offset + chunk_size).min(whole);
+        emit_piece(
+            session,
+            sender,
+            readiness,
+            had_data,
+            Bytes::copy_from_slice(&pending[offset..end]),
+        );
         offset = end;
-        Some(piece)
-    })
+    }
+    pending.drain(..whole);
+}
+
+/// Broadcasts one packet-aligned piece and, on the very first one, opens the
+/// readiness gate.
+fn emit_piece(
+    session: &Session,
+    sender: &broadcast::Sender<Bytes>,
+    readiness: &mut Option<oneshot::Sender<Option<String>>>,
+    had_data: &mut bool,
+    piece: Bytes,
+) {
+    *had_data = true;
+    if session.emit(sender, piece) {
+        if let Some(tx) = readiness.take() {
+            let _ = tx.send(None);
+        }
+    }
 }
 
 impl Inner {
@@ -2414,6 +2481,171 @@ mod tests {
             started_at: SystemTime::now(),
             tap: SessionTap::Raw,
         }
+    }
+
+    /// Receives chunks until `want` bytes arrived or the stream ended, returning
+    /// each chunk separately so alignment can be checked per chunk.
+    async fn read_chunks(
+        rx: &mut mpsc::Receiver<Bytes>,
+        want: usize,
+        timeout: Duration,
+    ) -> Vec<Bytes> {
+        let mut chunks = Vec::new();
+        let mut total = 0usize;
+        let deadline = tokio::time::Instant::now() + timeout;
+        while total < want {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    total += chunk.len();
+                    chunks.push(chunk);
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        chunks
+    }
+
+    fn assert_packet_aligned(chunks: &[Bytes], chunk_size: usize) {
+        assert!(!chunks.is_empty(), "no chunk was received");
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.len() % PACKET,
+                0,
+                "chunk {index} is not a whole number of packets: {} bytes",
+                chunk.len()
+            );
+            assert_eq!(
+                chunk[0], 0x47,
+                "chunk {index} does not start with a sync byte"
+            );
+            assert!(
+                chunk.len() <= chunk_size,
+                "chunk {index} exceeds chunk_size_bytes: {} > {chunk_size}",
+                chunk.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn emitted_chunks_are_packet_aligned_with_a_64k_chunk_size() {
+        let dir = TempDir::new().expect("tempdir");
+        // More than one 65424-byte chunk's worth of packets.
+        let packets: Vec<Vec<u8>> = (0..900).map(|index| packet(index as u8)).collect();
+        let path = fixture(&dir, "stream.bin", &packets);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            65_536,
+            8,
+        );
+
+        let mut subscription = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        let want = 3 * PACKET;
+        let chunks = read_chunks(&mut subscription.rx, want, Duration::from_secs(10)).await;
+
+        assert_packet_aligned(&chunks, 65_424);
+        // A read returns whatever the pipe holds, so a chunk length is not the
+        // configured maximum; it must still be a whole number of packets.
+        assert!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>() >= want);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_late_subscriber_starts_on_a_packet_boundary() {
+        let dir = TempDir::new().expect("tempdir");
+        let packets: Vec<Vec<u8>> = (0..900).map(|index| packet(index as u8)).collect();
+        let path = fixture(&dir, "stream.bin", &packets);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            65_536,
+            8,
+        );
+
+        // The first subscriber takes several chunks, so the session has emitted
+        // plenty of data before the second one joins.
+        let mut first = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("first acquire");
+        let first_chunks = read_chunks(&mut first.rx, 3 * PACKET, Duration::from_secs(10)).await;
+        assert_packet_aligned(&first_chunks, 65_424);
+
+        let mut second = manager
+            .acquire("GR", "27", user("b", 0), None, true)
+            .await
+            .expect("second acquire");
+        let second_chunks = read_chunks(&mut second.rx, PACKET, Duration::from_secs(10)).await;
+        assert_packet_aligned(&second_chunks, 65_424);
+
+        // A third joiner, later still.
+        let mut third = manager
+            .acquire("GR", "27", user("c", 0), None, true)
+            .await
+            .expect("third acquire");
+        let third_chunks = read_chunks(&mut third.rx, PACKET, Duration::from_secs(10)).await;
+        assert_packet_aligned(&third_chunks, 65_424);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscribers_joining_at_different_times_see_the_same_aligned_stream() {
+        let dir = TempDir::new().expect("tempdir");
+        // Enough packets that the second subscriber joins mid-stream.
+        let packets: Vec<Vec<u8>> = (0..600).map(|index| packet(index as u8)).collect();
+        let path = fixture(&dir, "stream.bin", &packets);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            32_768,
+            8,
+        );
+
+        let mut early = manager
+            .acquire("GR", "27", user("early", 0), None, true)
+            .await
+            .expect("early acquire");
+        let early_chunks = read_chunks(&mut early.rx, 2 * PACKET, Duration::from_secs(10)).await;
+        assert_packet_aligned(&early_chunks, 32_768);
+
+        let mut late = manager
+            .acquire("GR", "27", user("late", 0), None, true)
+            .await
+            .expect("late acquire");
+        let late_chunks = read_chunks(&mut late.rx, 2 * PACKET, Duration::from_secs(10)).await;
+        assert_packet_aligned(&late_chunks, 32_768);
+
+        // Every byte either subscriber sees is a whole packet: the union of the
+        // chunks is exactly the fixture's head.
+        let early_bytes: Vec<u8> = early_chunks
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect();
+        let late_bytes: Vec<u8> = late_chunks
+            .iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect();
+        assert_eq!(early_bytes.len() % PACKET, 0);
+        assert_eq!(late_bytes.len() % PACKET, 0);
+        assert_eq!(early_bytes, packets.concat()[..early_bytes.len()].to_vec());
+
+        manager.shutdown().await;
     }
 
     #[tokio::test]
