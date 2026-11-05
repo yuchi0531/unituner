@@ -488,10 +488,12 @@ pub async fn spawn_pipeline(
     commands: &[String],
     ctx: &PipelineCtx,
 ) -> Result<PipelineHandle, PipelineError> {
+    // Validate even for an empty chain: the values belong to the session, and a
+    // bad one must fail consistently whether or not a pipeline is bound.
+    validate_vars(&ctx.vars)?;
     if commands.is_empty() {
         return Ok(PipelineHandle::passthrough(ctx.label.clone()));
     }
-    validate_vars(&ctx.vars)?;
 
     let mut plan = Vec::with_capacity(commands.len());
     for command in commands {
