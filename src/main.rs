@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use unituner::api::{self, AppState};
 use unituner::config::Config;
+use unituner::scan;
 use unituner::services::ServiceTable;
 use unituner::webui;
 
@@ -84,8 +86,9 @@ fn main() -> ExitCode {
 /// Binds the configured address and serves the mirakurun-compatible API plus
 /// the management UI (SPEC §9, §10) until SIGINT/SIGTERM.
 async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
-    // Services are discovered by a scan (SPEC §8); until one runs the table is
-    // empty, so `/api/services` is `[]` and service streams 404.
+    // Services are discovered by the startup scan below (SPEC §8); until it
+    // finds them the table is empty, so `/api/services` is `[]` and service
+    // streams 404.
     let state = AppState::new(Arc::clone(&config), ServiceTable::new(), config_dir.clone());
     let manager = state.manager.clone();
 
@@ -100,18 +103,50 @@ async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
         .map_err(|error| format!("failed to bind {addr}: {error}"))?;
     tracing::info!(%addr, "listening");
 
+    // SPEC §8: the startup service scan runs in the background so the API is
+    // reachable while it tunes. It is spawned *after* the listener is bound and
+    // before the server starts accepting, and is stopped through this watch on
+    // shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut scan_task = tokio::spawn(scan::startup_scan(
+        manager.clone(),
+        Arc::clone(&config),
+        shutdown_rx,
+    ));
+
     let app = webui::app(state);
-    axum::serve(
+    let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         signals.wait().await;
+        // Stop the scan first: the tuner cleanup below must not race a scan
+        // that is still acquiring, and the scan task must not outlive it.
+        let _ = shutdown_tx.send(true);
         manager.shutdown().await;
         tracing::info!("all tuner sessions stopped");
     })
-    .await
-    .map_err(|error| format!("server error: {error}"))
+    .await;
+
+    // The scan task exits on the watch, but a scan interrupted mid-tune can
+    // take one readiness poll: bound the wait instead of leaking the task. A
+    // server error means the graceful-shutdown path never ran, so stop the
+    // scan immediately instead of waiting.
+    if result.is_err() {
+        scan_task.abort();
+    } else {
+        match tokio::time::timeout(Duration::from_secs(5), &mut scan_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "startup scan task failed"),
+            Err(_) => {
+                tracing::warn!("startup scan did not stop within 5s");
+                scan_task.abort();
+            }
+        }
+    }
+
+    result.map_err(|error| format!("server error: {error}"))
 }
 
 /// SIGINT/SIGTERM handlers, installed synchronously so no signal can be missed

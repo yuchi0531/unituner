@@ -15,6 +15,15 @@
 //! skipped and the scan continues (SPEC §8.1). Each per-channel session is
 //! released before the next channel is tuned.
 //!
+//! # Startup scan
+//!
+//! The same per-channel helper ([`scan_channel`]) also drives the SPEC §8
+//! startup service scan ([`startup_scan`]): every enabled `channels.yml` entry
+//! is tuned once, the found services are upserted into the shared
+//! [`ServiceTable`], and channels whose tuner was busy or absent are retried in
+//! the background with exponential backoff. The task stops on a shutdown
+//! signal and never preempts a user ([`SCAN_PRIORITY`]).
+//!
 //! # Writing `channels.yml`
 //!
 //! Only appended entries are written: entries of other types (and of the same
@@ -32,7 +41,7 @@
 //! A completed scan prints `**RESTART REQUIRED** to apply changes.`: the
 //! running server keeps its in-memory configuration (SPEC §8.1 / §10).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +49,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::config::{Config, ConfigError};
@@ -50,6 +59,13 @@ use crate::si::{SiEvent, SiParser};
 
 /// Default per-channel scan budget (SPEC §8: "既定 timeout 10s/ch").
 pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// First retry delay for a startup-scan channel whose tuner was busy
+/// (SPEC §8: "相手がbusyならskip＋次回retry").
+pub const STARTUP_RETRY_INITIAL: Duration = Duration::from_secs(30);
+
+/// Upper bound of the startup-scan retry backoff.
+pub const STARTUP_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// Service types kept in `channels.yml` and the service table (SPEC §8.1):
 /// digital TV, digital audio, temporary video, engineering, promotion, 4K and
@@ -256,13 +272,101 @@ pub struct ChannelEntry {
 
 /// A service found on one scanned channel.
 #[derive(Clone, Debug)]
-struct FoundService {
+pub(crate) struct FoundService {
     service_id: u16,
     network_id: u16,
     tsid: u16,
     service_type: u8,
     name: String,
     remote_control_key_id: Option<u8>,
+    pmt_pid: Option<u16>,
+}
+
+/// Folds the SI events of one tuned channel into the services found on it.
+///
+/// The network id comes from the parser ([`SiParser::network_id`], which only
+/// accepts a NIT *actual*, table id `0x40`), then from any NIT-actual seen in
+/// this channel's stream, and only then from the SDT's
+/// `original_network_id`. A NIT *other* (`0x41`) describes a *different*
+/// transport stream and never contributes a network id or a remote-control key
+/// id (SPEC §8).
+#[derive(Debug, Default)]
+struct ChannelSink {
+    /// The parser's `network_id`, i.e. the NIT-actual's network id.
+    parser_network_id: Option<u16>,
+    /// `network_id` of a NIT *actual* seen on this channel.
+    nit_network_id: Option<u16>,
+    /// Remote-control key id from the NIT *actual*.
+    remote_control_key_id: Option<u8>,
+    /// `service_id -> PMT PID` from the PAT.
+    pmt_pids: HashMap<u16, u16>,
+    /// Services in SDT order, one entry per service id.
+    found: Vec<FoundService>,
+}
+
+impl ChannelSink {
+    /// The best network id known for this channel, if any.
+    fn network_id(&self) -> Option<u16> {
+        self.parser_network_id.or(self.nit_network_id)
+    }
+
+    /// Applies one parsed table.
+    fn push(&mut self, event: &SiEvent, parser_network_id: Option<u16>) {
+        if let Some(network_id) = parser_network_id {
+            self.parser_network_id = Some(network_id);
+        }
+        match event {
+            SiEvent::Nit(nit) => {
+                // Only the NIT *actual* describes the multiplex being received.
+                if nit.is_actual {
+                    self.nit_network_id = Some(nit.network_id);
+                    self.remote_control_key_id =
+                        nit.remote_control_key_id.or(self.remote_control_key_id);
+                }
+            }
+            SiEvent::Pat(pat) => {
+                for &(service_id, pmt_pid) in &pat.programs {
+                    self.pmt_pids.insert(service_id, pmt_pid);
+                }
+                for service in &mut self.found {
+                    if service.tsid == 0 {
+                        service.tsid = pat.transport_stream_id;
+                    }
+                }
+            }
+            SiEvent::Sdt(sdt) => {
+                let network_id = self.network_id().unwrap_or(sdt.original_network_id);
+                for (service_id, service_type, name) in &sdt.services {
+                    if self
+                        .found
+                        .iter()
+                        .any(|service| service.service_id == *service_id)
+                    {
+                        continue;
+                    }
+                    self.found.push(FoundService {
+                        service_id: *service_id,
+                        network_id,
+                        tsid: sdt.transport_stream_id,
+                        service_type: *service_type,
+                        name: name.clone(),
+                        remote_control_key_id: None,
+                        pmt_pid: None,
+                    });
+                }
+            }
+            SiEvent::Pmt(_) => {}
+        }
+    }
+
+    /// Copies the NIT remote-control key id and the PAT PMT PIDs onto every
+    /// service found so far.
+    fn finish(&mut self) {
+        for service in &mut self.found {
+            service.remote_control_key_id = self.remote_control_key_id;
+            service.pmt_pid = self.pmt_pids.get(&service.service_id).copied();
+        }
+    }
 }
 
 /// Runs a scan to completion, streaming progress text to `tx`.
@@ -328,7 +432,7 @@ pub async fn run_scan(
             }
         }
 
-        match scan_channel(manager, query, &candidate.channel).await {
+        match scan_channel(manager, &query.type_name, &candidate.channel, query.timeout).await {
             ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
             ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
             ChannelOutcome::Services(services) => {
@@ -353,7 +457,13 @@ pub async fn run_scan(
                     ))
                     .await;
                 if !query.dry_run {
-                    update_service_table(manager.services(), query, &entries, &services);
+                    update_service_table(
+                        manager.services(),
+                        &query.type_name,
+                        query.mode,
+                        &entries,
+                        &services,
+                    );
                 }
                 found_entries.extend(entries);
             }
@@ -438,21 +548,28 @@ fn candidates(query: &ScanQuery) -> Vec<Candidate> {
 }
 
 /// Why a channel produced no entries.
-enum ChannelOutcome {
-    /// Every tuner was busy; SPEC §8 skips the channel and retries later.
+#[derive(Debug)]
+pub(crate) enum ChannelOutcome {
+    /// Every tuner was busy, or no configured tuner supports the type:
+    /// SPEC §8 skips the channel and retries it later.
     Busy,
-    /// No output, or output without SI, within the per-channel budget.
+    /// No output, or output without SI, within the per-channel budget (also
+    /// what a tuner that failed to start is reported as).
     NoSignal,
     /// SDT services seen on the channel.
     Services(Vec<FoundService>),
 }
 
-/// Tunes one channel, collects SI for at most `query.timeout`, and releases
-/// the scan session before returning.
-async fn scan_channel(
+/// Tunes one channel, collects SI for at most `timeout`, and releases the scan
+/// session before returning (SPEC §8).
+///
+/// Shared by the SPEC §8 startup scan and the SPEC §8.1 scan API so both parse
+/// SI the same way.
+pub(crate) async fn scan_channel(
     manager: &SessionManager,
-    query: &ScanQuery,
+    type_name: &str,
     channel: &str,
+    timeout: Duration,
 ) -> ChannelOutcome {
     // SPEC §8: scan is a plain subscriber on the shared broadcast. Joining a
     // session a user already holds is therefore correct, and it must not be
@@ -460,22 +577,15 @@ async fn scan_channel(
     let preexisting = manager
         .sessions_snapshot()
         .iter()
-        .any(|session| session.type_name == query.type_name && session.channel == channel);
+        .any(|session| session.type_name == type_name && session.channel == channel);
 
     let user = TunerUser::new("scan", SCAN_PRIORITY);
     // One budget per channel covers tuning *and* reading, so a wedged frontend
     // cannot stretch a scan past `timeout` per channel (SPEC §8: 10s/ch).
-    let deadline = Instant::now() + query.timeout;
+    let deadline = Instant::now() + timeout;
     let acquired = tokio::time::timeout_at(
         deadline,
-        manager.acquire_full(
-            &query.type_name,
-            channel,
-            user,
-            None,
-            SessionTap::Raw,
-            false,
-        ),
+        manager.acquire_full(type_name, channel, user, None, SessionTap::Raw, false),
     )
     .await;
 
@@ -487,7 +597,12 @@ async fn scan_channel(
         Ok(Err(error)) => {
             tracing::debug!(channel, %error, "scan could not acquire a tuner");
             return match error {
-                crate::session::AcquireError::Busy | crate::session::AcquireError::Unavailable => {
+                // SPEC §8: "相手がbusyならskip＋次回retry". A busy tuner and a
+                // channel type with no tuner at all are both remembered for
+                // the next pass. A tuner whose command failed to start is
+                // `Unavailable`: retrying it forever would only spin, so it is
+                // reported like no signal.
+                crate::session::AcquireError::Busy | crate::session::AcquireError::NoTuner => {
                     ChannelOutcome::Busy
                 }
                 _ => ChannelOutcome::NoSignal,
@@ -497,61 +612,24 @@ async fn scan_channel(
     };
 
     let mut parser = SiParser::new();
-    let mut found: Vec<FoundService> = Vec::new();
-    let mut network_id: Option<u16> = None;
-    let mut remote_control_key_id: Option<u8> = None;
+    let mut sink = ChannelSink::default();
     loop {
         let chunk = tokio::time::timeout_at(deadline, subscription.rx.recv()).await;
         match chunk {
             Ok(Some(chunk)) => {
                 for event in parser.push_packets(&chunk) {
-                    match event {
-                        SiEvent::Nit(nit) => {
-                            network_id = Some(nit.network_id);
-                            remote_control_key_id =
-                                nit.remote_control_key_id.or(remote_control_key_id);
+                    sink.push(&event, parser.network_id());
+                    // SDT supplies the names; once it has arrived there is no
+                    // reason to keep the tuner for the rest of the budget. A
+                    // PAT seen before it also supplied the PMT PIDs; if it did
+                    // not, the record simply has no PMT PID yet.
+                    if matches!(event, SiEvent::Sdt(_)) && !sink.found.is_empty() {
+                        sink.finish();
+                        drop(subscription);
+                        if !preexisting {
+                            manager.release_session(type_name, channel).await;
                         }
-                        SiEvent::Pat(pat) => {
-                            for service in &mut found {
-                                if service.tsid == 0 {
-                                    service.tsid = pat.transport_stream_id;
-                                }
-                            }
-                        }
-                        SiEvent::Sdt(sdt) => {
-                            let nid = network_id
-                                .or_else(|| parser.network_id())
-                                .unwrap_or(sdt.original_network_id);
-                            let mut added = false;
-                            for (service_id, service_type, name) in sdt.services {
-                                if found.iter().any(|s| s.service_id == service_id) {
-                                    continue;
-                                }
-                                found.push(FoundService {
-                                    service_id,
-                                    network_id: nid,
-                                    tsid: sdt.transport_stream_id,
-                                    service_type,
-                                    name,
-                                    remote_control_key_id: None,
-                                });
-                                added = true;
-                            }
-                            // SDT is what supplies names; once it has arrived
-                            // there is no reason to keep the tuner for the
-                            // rest of the budget.
-                            if added || !found.is_empty() {
-                                for service in &mut found {
-                                    service.remote_control_key_id = remote_control_key_id;
-                                }
-                                drop(subscription);
-                                if !preexisting {
-                                    manager.release_session(&query.type_name, channel).await;
-                                }
-                                return ChannelOutcome::Services(found);
-                            }
-                        }
-                        SiEvent::Pmt(_) => {}
+                        return ChannelOutcome::Services(sink.found);
                     }
                 }
             }
@@ -564,23 +642,21 @@ async fn scan_channel(
     tracing::debug!(
         channel,
         stats = ?parser.stats(),
-        found = found.len(),
+        found = sink.found.len(),
         "scan channel finished without completing a service list"
     );
-    for service in &mut found {
-        service.remote_control_key_id = remote_control_key_id;
-    }
+    sink.finish();
 
     // Release the scan session before the next channel is tuned (SPEC §8.1).
     drop(subscription);
     if !preexisting {
-        manager.release_session(&query.type_name, channel).await;
+        manager.release_session(type_name, channel).await;
     }
 
-    if found.is_empty() {
+    if sink.found.is_empty() {
         ChannelOutcome::NoSignal
     } else {
-        ChannelOutcome::Services(found)
+        ChannelOutcome::Services(sink.found)
     }
 }
 
@@ -710,14 +786,15 @@ fn merge(
 /// reflected by `/api/services`).
 fn update_service_table(
     services: &ServiceTable,
-    query: &ScanQuery,
+    type_name: &str,
+    mode: ScanMode,
     entries: &[ChannelEntry],
     found: &[FoundService],
 ) {
     for (index, service) in found.iter().enumerate() {
         // In `Service` mode `entries_for` emits one entry per service, in the
         // same order; in `Channel` mode every service shares the one entry.
-        let channel = match query.mode {
+        let channel = match mode {
             ScanMode::Service => entries.get(index),
             ScanMode::Channel => entries.first(),
         }
@@ -730,8 +807,9 @@ fn update_service_table(
             service.name.clone(),
         );
         record.remote_control_key_id = service.remote_control_key_id;
+        record.pmt_pid = service.pmt_pid;
         if let Some(channel) = channel {
-            record.channel = Some((query.type_name.clone(), channel));
+            record.channel = Some((type_name.to_string(), channel));
         }
         services.upsert(record);
     }
@@ -750,6 +828,211 @@ fn read_channels(config_dir: &Path) -> Result<Vec<ChannelEntry>, String> {
     }
     serde_yaml_ng::from_str(&text)
         .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Startup service scan (SPEC §8)
+// ---------------------------------------------------------------------------
+
+/// One `channels.yml` entry the startup scan tunes.
+#[derive(Clone, Debug)]
+struct StartupChannel {
+    type_name: String,
+    channel: String,
+}
+
+impl StartupChannel {
+    fn of(entry: &crate::config::ChannelConfig) -> Self {
+        Self {
+            type_name: entry.channel_type.clone(),
+            channel: entry.channel.clone(),
+        }
+    }
+}
+
+/// The enabled `channels.yml` entries, in configuration order.
+fn startup_channels(config: &Config) -> Vec<StartupChannel> {
+    config
+        .channels
+        .iter()
+        .filter(|entry| !entry.disabled)
+        .map(StartupChannel::of)
+        .collect()
+}
+
+/// How long the startup scan waits before its next retry pass.
+///
+/// `pass` is the number of completed passes after the first one: 0 → 30 s,
+/// 1 → 60 s, then 120 s, 240 s and finally [`STARTUP_RETRY_MAX`] forever.
+fn retry_delay(pass: usize) -> Duration {
+    let factor = 1u32 << pass.min(4);
+    STARTUP_RETRY_INITIAL
+        .saturating_mul(factor)
+        .min(STARTUP_RETRY_MAX)
+}
+
+/// Summary of one startup-scan pass, logged when it ends (SPEC §8).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PassSummary {
+    /// Channels the pass attempted.
+    attempted: usize,
+    /// Channels that produced a service list.
+    ok: usize,
+    /// Channels skipped because no tuner was usable.
+    skipped: usize,
+    /// Services upserted into the table.
+    found: usize,
+}
+
+/// Scans every enabled `channels.yml` entry once and retries the skipped ones
+/// with exponential backoff until `shutdown` fires (SPEC §8).
+///
+/// * Each channel runs through [`scan_channel`] at [`SCAN_PRIORITY`], so a user
+///   request always wins and a busy tuner is skipped rather than preempted.
+/// * The per-channel budget is [`CHANNEL_TIMEOUT`], covering acquire + SI read.
+/// * Channels that failed for lack of a tuner ([`ChannelOutcome::Busy`], i.e.
+///   busy or no supporting tuner) are retried; a no-signal channel is not.
+/// * Entries are only ever upserted, never cleared, so a failed channel keeps
+///   whatever the previous pass (or an HTTP scan) put in the table.
+///
+/// The task owns no processes: [`scan_channel`] releases each session before
+/// returning, and the shutdown signal is observed before every channel.
+pub async fn startup_scan(
+    manager: SessionManager,
+    config: Arc<Config>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut pending = startup_channels(&config);
+    if pending.is_empty() {
+        tracing::info!("startup scan: no enabled channels");
+        return;
+    }
+    tracing::info!(
+        channels = pending.len(),
+        "startup scan started (priority {SCAN_PRIORITY})"
+    );
+
+    let mut pass = 0usize;
+    loop {
+        if *shutdown.borrow() {
+            tracing::info!(pass, "startup scan stopped");
+            return;
+        }
+        let (summary, retry) = scan_pass(&manager, &pending, &mut shutdown).await;
+        tracing::info!(
+            pass,
+            attempted = summary.attempted,
+            ok = summary.ok,
+            skipped = summary.skipped,
+            found = summary.found,
+            "startup scan pass finished"
+        );
+
+        // A pass interrupted by shutdown must not sleep: return right away so
+        // the task never outlives the server.
+        if *shutdown.borrow() {
+            tracing::info!(pass, "startup scan stopped");
+            return;
+        }
+        if retry.is_empty() {
+            tracing::info!("startup scan complete");
+            return;
+        }
+
+        pending = retry;
+        pass += 1;
+        let delay = retry_delay(pass - 1);
+        tracing::debug!(
+            retry = pending.len(),
+            delay_secs = delay.as_secs(),
+            "startup scan backing off"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            changed = shutdown.changed() => {
+                // A closed watch (the sender was dropped) is a shutdown too.
+                if changed.is_err() || *shutdown.borrow() {
+                    tracing::info!(pass, "startup scan stopped");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Scans `pending` sequentially, returning the pass summary and the channels
+/// that should be retried (only those whose tuner was unavailable).
+async fn scan_pass(
+    manager: &SessionManager,
+    pending: &[StartupChannel],
+    shutdown: &mut watch::Receiver<bool>,
+) -> (PassSummary, Vec<StartupChannel>) {
+    let mut summary = PassSummary::default();
+    let mut retry = Vec::new();
+    for channel in pending {
+        if *shutdown.borrow() {
+            break;
+        }
+        summary.attempted += 1;
+        // Not cancelled on the shutdown signal: dropping an `acquire` future
+        // mid-flight could leave a reservation behind. `SessionManager::shutdown`
+        // (called by the server) ends an in-flight tune within its readiness
+        // poll, so the channel returns promptly anyway.
+        let outcome = scan_channel(
+            manager,
+            &channel.type_name,
+            &channel.channel,
+            CHANNEL_TIMEOUT,
+        )
+        .await;
+        match outcome {
+            ChannelOutcome::Busy => {
+                summary.skipped += 1;
+                retry.push(channel.clone());
+                tracing::debug!(
+                    type_name = %channel.type_name,
+                    channel = %channel.channel,
+                    "startup scan skipped the channel: no tuner available"
+                );
+            }
+            ChannelOutcome::NoSignal => {
+                summary.skipped += 1;
+                tracing::debug!(
+                    type_name = %channel.type_name,
+                    channel = %channel.channel,
+                    "startup scan skipped the channel: no signal"
+                );
+            }
+            ChannelOutcome::Services(services) => {
+                summary.ok += 1;
+                summary.found += upsert_startup_services(manager.services(), channel, &services);
+            }
+        }
+    }
+    (summary, retry)
+}
+
+/// Upserts the services of one channel, returning how many records were
+/// written.
+fn upsert_startup_services(
+    table: &ServiceTable,
+    channel: &StartupChannel,
+    services: &[FoundService],
+) -> usize {
+    for service in services {
+        let mut record = ServiceRecord::new(
+            service.network_id,
+            service.tsid,
+            service.service_id,
+            service.service_type,
+            service.name.clone(),
+        );
+        record.remote_control_key_id = service.remote_control_key_id;
+        record.pmt_pid = service.pmt_pid;
+        record.channel = Some((channel.type_name.clone(), channel.channel.clone()));
+        table.upsert(record);
+    }
+    services.len()
 }
 
 /// Validates the merged channel list with the startup rules and writes it
@@ -1023,6 +1306,7 @@ mod tests {
                 service_type: 0x01,
                 name: "One".to_string(),
                 remote_control_key_id: None,
+                pmt_pid: None,
             },
             FoundService {
                 service_id: 102,
@@ -1031,6 +1315,7 @@ mod tests {
                 service_type: 0x01,
                 name: "Two".to_string(),
                 remote_control_key_id: None,
+                pmt_pid: None,
             },
         ];
         let candidate = Candidate {
@@ -1053,5 +1338,78 @@ mod tests {
         drop(lease);
         assert!(!lock.is_running());
         assert!(lock.acquire().is_some());
+    }
+
+    fn nit(network_id: u16, is_actual: bool, key_id: Option<u8>) -> SiEvent {
+        SiEvent::Nit(crate::si::NitInfo {
+            network_id,
+            remote_control_key_id: key_id,
+            is_actual,
+            transport_stream_ids: Vec::new(),
+            version_number: 0,
+            current_next: true,
+            section_number: 0,
+            last_section_number: 0,
+        })
+    }
+
+    fn sdt(original_network_id: u16, tsid: u16, service_id: u16) -> SiEvent {
+        SiEvent::Sdt(crate::si::SdtInfo {
+            original_network_id,
+            transport_stream_id: tsid,
+            services: vec![(service_id, 0x01, "Service".to_string())],
+            version_number: 0,
+            current_next: true,
+            section_number: 0,
+            last_section_number: 0,
+        })
+    }
+
+    #[test]
+    fn a_nit_other_never_changes_the_derived_network_id() {
+        let mut sink = ChannelSink::default();
+        // NIT-actual of this multiplex: network 1, remote key 7.
+        sink.push(&nit(1, true, Some(7)), None);
+        // A NIT-other describes another transport stream: neither its network
+        // id nor its remote-control key may be adopted.
+        sink.push(&nit(2, false, Some(9)), None);
+        sink.push(&sdt(3, 0x7FE0, 0x0408), None);
+        sink.finish();
+
+        assert_eq!(sink.found.len(), 1);
+        assert_eq!(sink.found[0].network_id, 1);
+        assert_eq!(sink.found[0].remote_control_key_id, Some(7));
+        assert_eq!(sink.found[0].tsid, 0x7FE0);
+    }
+
+    #[test]
+    fn a_lone_nit_other_leaves_the_sdt_network_id_in_place() {
+        let mut sink = ChannelSink::default();
+        sink.push(&nit(2, false, Some(9)), None);
+        sink.push(&sdt(3, 0x7FE0, 0x0408), None);
+        sink.finish();
+
+        assert_eq!(sink.found[0].network_id, 3);
+        assert_eq!(sink.found[0].remote_control_key_id, None);
+    }
+
+    #[test]
+    fn the_parser_network_id_wins_over_the_sdt_and_the_sink() {
+        let mut sink = ChannelSink::default();
+        sink.push(&nit(1, true, None), None);
+        // The parser applies the TSID-matching rule; its answer is preferred.
+        sink.push(&sdt(3, 0x7FE0, 0x0408), Some(42));
+        sink.finish();
+        assert_eq!(sink.found[0].network_id, 42);
+    }
+
+    #[test]
+    fn the_startup_retry_backoff_doubles_and_caps() {
+        assert_eq!(retry_delay(0), Duration::from_secs(30));
+        assert_eq!(retry_delay(1), Duration::from_secs(60));
+        assert_eq!(retry_delay(2), Duration::from_secs(120));
+        assert_eq!(retry_delay(3), Duration::from_secs(240));
+        assert_eq!(retry_delay(4), STARTUP_RETRY_MAX);
+        assert_eq!(retry_delay(50), STARTUP_RETRY_MAX);
     }
 }
