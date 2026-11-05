@@ -37,7 +37,8 @@ fn main() -> ExitCode {
     let config = match Config::load(&args.config_dir) {
         Ok(config) => config,
         Err(error) => {
-            tracing::error!("{error}");
+            // Print unconditionally so the failure is visible even when the log
+            // filter is set to `off`.
             eprintln!("unituner: {error}");
             return ExitCode::FAILURE;
         }

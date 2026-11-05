@@ -83,6 +83,26 @@ fn invalid_config_exits_nonzero_with_the_offending_file_and_item() {
 }
 
 #[test]
+fn invalid_config_is_reported_even_with_logging_disabled() {
+    let dir = config_dir(
+        r#"
+- name: NHK General
+  type: "GR!"
+  channel: "27"
+"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_unituner"))
+        .arg("--config-dir")
+        .arg(dir.path())
+        .env("UNITUNER_LOG", "off")
+        .output()
+        .expect("run unituner");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("channels.yml"), "stderr: {stderr}");
+}
+
+#[test]
 fn missing_config_dir_exits_nonzero() {
     let dir = TempDir::new().expect("tempdir");
     let output = run(&dir);
