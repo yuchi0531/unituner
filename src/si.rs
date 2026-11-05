@@ -635,6 +635,34 @@ fn parse_header(packet: &[u8]) -> Option<PacketHeader> {
     })
 }
 
+/// Runs `f` for every whole 188-byte packet in `data`, carrying a packet cut by
+/// a call boundary in `leftover` to the next call.
+///
+/// `leftover` holds fewer than [`TS_PACKET_SIZE`] bytes: the tail of the packet
+/// the previous `data` ended in. Both [`SectionAssembler::push_packets`] and
+/// [`SiParser::push_packets`] use this so a chunk that is not a multiple of 188
+/// bytes loses nothing.
+fn for_each_packet(data: &[u8], leftover: &mut Vec<u8>, mut f: impl FnMut(&[u8])) {
+    let mut offset = 0;
+    if !leftover.is_empty() {
+        let take = (TS_PACKET_SIZE - leftover.len()).min(data.len());
+        leftover.extend_from_slice(&data[..take]);
+        offset = take;
+        if leftover.len() < TS_PACKET_SIZE {
+            return;
+        }
+        let mut packet = std::mem::take(leftover);
+        f(&packet);
+        packet.clear();
+        *leftover = packet;
+    }
+    let whole = (data.len() - offset) / TS_PACKET_SIZE * TS_PACKET_SIZE;
+    for packet in data[offset..offset + whole].chunks_exact(TS_PACKET_SIZE) {
+        f(packet);
+    }
+    leftover.extend_from_slice(&data[offset + whole..]);
+}
+
 /// Turns TS packets into complete PSI/SI sections.
 ///
 /// Per PID it tracks the section being assembled, the expected length from the
@@ -671,6 +699,10 @@ pub struct SectionAssembler {
     tables: Option<HashSet<u8>>,
     /// Packets skipped because their PID was not in [`interest`](Self::interest).
     non_si_packets: u64,
+    /// Bytes of a packet cut in half by a [`push_packets`](Self::push_packets)
+    /// call boundary. A tuner read is not a multiple of 188 bytes, so without
+    /// this the tail of every non-aligned chunk would be discarded.
+    leftover: Vec<u8>,
 }
 
 impl SectionAssembler {
@@ -794,12 +826,24 @@ impl SectionAssembler {
     /// Appends a run of 188-byte packets (for example the output of
     /// [`crate::tsframe::TsNormalizer`]) and returns every completed section.
     ///
-    /// A trailing partial packet is ignored.
+    /// The input is treated as a byte stream, not as whole packets: bytes of a
+    /// packet that is cut by the end of `packets` are kept and completed by the
+    /// next call, exactly like [`crate::tsframe::TsNormalizer`] buffers its
+    /// input. A tuner read is not a multiple of 188 bytes (`chunk_size_bytes`
+    /// defaults to 65536, and `65536 % 188 == 112`), so cutting at the call
+    /// boundary instead would silently drop the tail of every chunk and with it
+    /// most SI sections.
+    ///
+    /// [`push_packet`](Self::push_packet) takes whole packets and does not
+    /// participate in this buffering; do not mix the two on one assembler.
     pub fn push_packets(&mut self, packets: &[u8]) -> Vec<AssembledSection> {
-        packets
-            .chunks_exact(TS_PACKET_SIZE)
-            .flat_map(|packet| self.push_packet(packet))
-            .collect()
+        let mut sections = Vec::new();
+        let mut leftover = std::mem::take(&mut self.leftover);
+        for_each_packet(packets, &mut leftover, |packet| {
+            sections.extend(self.push_packet(packet));
+        });
+        self.leftover = leftover;
+        sections
     }
 
     /// Number of partial sections dropped on continuity or pointer errors.
@@ -821,6 +865,7 @@ impl SectionAssembler {
     /// and restart at zero.
     pub fn reset(&mut self) {
         self.pids.clear();
+        self.leftover.clear();
     }
 }
 
@@ -895,6 +940,11 @@ pub struct SiParser {
     /// `transport_stream_id`s of the multiplex the `network_id` came from,
     /// learned from the NIT-actual's transport-stream loop.
     network_tsids: HashSet<u16>,
+    /// Bytes of a packet cut in half by a [`push_packets`](Self::push_packets)
+    /// call boundary; see [`SectionAssembler::push_packets`]. Kept here as well
+    /// because this type parses packet by packet (a PAT must name its PMT PIDs
+    /// before the PMTs in the same read are assembled).
+    leftover: Vec<u8>,
 }
 
 impl Default for SiParser {
@@ -913,6 +963,7 @@ impl SiParser {
             stats: SiStats::default(),
             network_id: None,
             network_tsids: HashSet::new(),
+            leftover: Vec::new(),
         }
     }
 
@@ -940,12 +991,17 @@ impl SiParser {
     /// a PAT in the run names its PMT PIDs, and those PMTs usually follow it
     /// within the same read from the tuner. Batching the assembly would see the
     /// PMT before the PAT had been parsed and skip it until the next PAT.
-    /// A trailing partial packet is ignored.
+    ///
+    /// The run is a byte stream, not a whole number of packets: bytes of the
+    /// packet that `packets` cuts in half are kept for the next call, so a chunk
+    /// whose length is not a multiple of 188 loses nothing.
     pub fn push_packets(&mut self, packets: &[u8]) -> Vec<SiEvent> {
         let mut events = Vec::new();
-        for packet in packets.chunks_exact(TS_PACKET_SIZE) {
+        let mut leftover = std::mem::take(&mut self.leftover);
+        for_each_packet(packets, &mut leftover, |packet| {
             events.extend(self.push_packet(packet));
-        }
+        });
+        self.leftover = leftover;
         events
     }
 
@@ -980,6 +1036,7 @@ impl SiParser {
     /// `ignored_sections` go back to zero.
     pub fn reset(&mut self) {
         self.assembler.reset();
+        self.leftover.clear();
         self.network_id = None;
         self.network_tsids.clear();
     }
@@ -1950,6 +2007,99 @@ mod tests {
         let actual = at_once.push_packets(&packets);
         assert_eq!(actual, expected);
         assert_eq!(actual.len(), 2);
+    }
+
+    /// A full multiplex (PAT, PMT, SDT, NIT) repeated a few times, so the
+    /// chunk-boundary behaviour is checked on sections that both fit one packet
+    /// and span several.
+    fn multiplex() -> Vec<u8> {
+        let mut stream = Vec::new();
+        for round in 0..3u8 {
+            stream.extend(section_packets(PAT_PID, &pat_section(), round * 3));
+            stream.extend(section_packets(NIT_PID, &nit_section(), round * 3));
+            stream.extend(section_packets(SDT_PID, &sdt_section(), round * 3));
+            // The PMT PID is only known after the PAT, which is why it follows.
+            stream.extend(section_packets(0x01F0, &pmt_section(), round * 3));
+            stream.extend(packet(0x1FFF, false, round, &[0xFF; 184]));
+        }
+        stream
+    }
+
+    /// Runs `stream` through a fresh parser in `chunk`-byte reads.
+    fn parse_in_chunks(stream: &[u8], chunk: usize) -> (Vec<SiEvent>, SiStats) {
+        let mut parser = SiParser::new();
+        let mut events = Vec::new();
+        for piece in stream.chunks(chunk) {
+            events.extend(parser.push_packets(piece));
+        }
+        (events, parser.stats())
+    }
+
+    #[test]
+    fn chunk_boundaries_do_not_change_the_parse_result() {
+        // A tuner read is not a multiple of 188 bytes: 65536 % 188 == 112, and a
+        // pipe read has no alignment at all. Every one of these chunk sizes must
+        // yield exactly the same sections, in the same order.
+        let stream = multiplex();
+        assert_eq!(stream.len() % TS_PACKET_SIZE, 0);
+
+        let (baseline_events, baseline_stats) = parse_in_chunks(&stream, TS_PACKET_SIZE);
+        assert!(
+            baseline_events.len() >= 12,
+            "the fixture must produce several sections, got {}",
+            baseline_events.len()
+        );
+        assert_eq!(baseline_events.len() as u64, baseline_stats.sections);
+        assert_eq!(baseline_stats.invalid_sections, 0);
+
+        for chunk in [1usize, 3, 188, 4096, 32_768, 65_536, 65_612] {
+            let (events, stats) = parse_in_chunks(&stream, chunk);
+            assert_eq!(
+                events, baseline_events,
+                "chunk size {chunk} produced different SI events"
+            );
+            assert_eq!(
+                stats.sections, baseline_stats.sections,
+                "chunk size {chunk} produced a different section count"
+            );
+            assert_eq!(stats.invalid_sections, 0, "chunk size {chunk}");
+            assert_eq!(stats.packets, baseline_stats.packets, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn a_packet_cut_by_a_chunk_boundary_is_carried_over() {
+        let packets = section_packets(PAT_PID, &pat_section(), 0);
+        assert_eq!(packets.len(), TS_PACKET_SIZE);
+        // Feed one byte short of the packet, then the rest.
+        let mut assembler = SectionAssembler::new();
+        assert!(assembler
+            .push_packets(&packets[..TS_PACKET_SIZE - 1])
+            .is_empty());
+        let sections = assembler.push_packets(&packets[TS_PACKET_SIZE - 1..]);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].bytes, pat_section());
+
+        // The same through the parser, with the split inside the section body.
+        let mut parser = SiParser::new();
+        let split = 17;
+        assert!(parser.push_packets(&packets[..split]).is_empty());
+        let events = parser.push_packets(&packets[split..]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SiEvent::Pat(_)));
+    }
+
+    #[test]
+    fn reset_drops_a_carried_over_packet() {
+        let packets = section_packets(PAT_PID, &pat_section(), 0);
+        let mut parser = SiParser::new();
+        assert!(parser.push_packets(&packets[..100]).is_empty());
+        parser.reset();
+        // After a reset the tail of the old packet must not be glued to new
+        // input, so the input alone never forms a section.
+        let events = parser.push_packets(&packets[100..]);
+        assert!(events.is_empty());
+        assert_eq!(parser.stats().sections, 0);
     }
 }
 
