@@ -48,10 +48,19 @@
 //! # Raw vs filtered
 //!
 //! Every session broadcasts the **post-pipeline** TS (SPEC §4). [`SessionTap`]
-//! is the per-subscriber seam for phase 5: [`SessionTap::Raw`] is the channel
-//! stream, [`SessionTap::Filtered`] the service stream where a per-subscriber
-//! `TSFilter` is inserted. Until phase 5 both deliver the same bytes; the hook
-//! exists so `api.rs` and `scan.rs` do not have to change again.
+//! is the per-subscriber seam: [`SessionTap::Raw`] is the channel stream,
+//! [`SessionTap::Filtered`] the service stream where the caller inserts one
+//! [`ServiceFilter`](crate::tsfilter::ServiceFilter) per subscriber. The
+//! filter itself lives in the HTTP layer because it is per-subscriber state;
+//! the session only tags the tap.
+//!
+//! # `decode=0`
+//!
+//! [`SessionManager::acquire_full`] takes a `bypass_pipeline` flag. It is part
+//! of the session key, because a normal and a `decode=0` session for the same
+//! `(type, channel)` produce different bytes from the same tuner command: with
+//! the flag only the tuner runs and its normalized stdout is broadcast
+//! directly (SPEC §4.1: the whole pipeline is bypassed, not just a decoder).
 //!
 //! # Fan-out and backpressure
 //!
@@ -195,18 +204,20 @@ pub enum AcquireError {
 
 /// What a subscriber receives from the shared post-pipeline broadcast.
 ///
-/// This is the phase 5 seam (SPEC §4): [`Raw`](Self::Raw) is the channel
-/// stream, [`Filtered`](Self::Filtered) the service stream where a
-/// per-subscriber `TSFilter` is instantiated. Until the filter is implemented
-/// both variants deliver the post-pipeline TS unchanged.
+/// [`Raw`](Self::Raw) is the channel stream, [`Filtered`](Self::Filtered) the
+/// service stream where the HTTP layer inserts one
+/// [`ServiceFilter`](crate::tsfilter::ServiceFilter) per subscriber. Both
+/// variants deliver the post-pipeline TS: the session only records the caller's
+/// intent, the filtering itself is per-subscriber state and lives in
+/// [`crate::api`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionTap {
     /// Channel stream: post-pipeline TS, delivered as-is.
     Raw,
-    /// Service stream: post-pipeline TS; one `TSFilter` per subscriber later.
+    /// Service stream: post-pipeline TS, filtered per subscriber.
     ///
-    /// `service_id` is the requested service (phase 5 builds the filter from
-    /// it). It is `None` when the caller only knows `raw = false`.
+    /// `service_id` is the requested service. It is `None` when the caller only
+    /// knows `raw = false`.
     Filtered { service_id: Option<u16> },
 }
 
@@ -250,7 +261,7 @@ struct SubscriberEntry {
     id: u64,
     user: TunerUser,
     started_at: SystemTime,
-    /// Phase 5's per-subscriber TSFilter is selected from this.
+    /// The tap the subscriber joined with, kept for diagnostics.
     #[allow(dead_code)]
     tap: SessionTap,
 }
@@ -340,11 +351,16 @@ pub struct SessionStatus {
 }
 
 /// Internal session identity. The tuner is fixed at spawn time (SPEC §6.2).
+///
+/// `bypass_pipeline` is part of the key because `decode=0` (SPEC §4.1) bypasses
+/// the whole pipeline while a normal request runs it: the two produce different
+/// bytes from the same tuner command, so they cannot share one process tree.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionKey {
     tuner: String,
     type_name: String,
     channel: String,
+    bypass_pipeline: bool,
 }
 
 /// The tuner process plus the pipeline stages it feeds.
@@ -529,11 +545,13 @@ impl Inner {
         state: &'a State,
         type_name: &str,
         channel: &str,
+        bypass_pipeline: bool,
     ) -> Option<&'a Arc<Session>> {
-        state
-            .sessions
-            .values()
-            .find(|session| session.key.type_name == type_name && session.key.channel == channel)
+        state.sessions.values().find(|session| {
+            session.key.type_name == type_name
+                && session.key.channel == channel
+                && session.key.bypass_pipeline == bypass_pipeline
+        })
     }
 
     fn tuner_occupied(&self, state: &State, tuner: &str) -> bool {
@@ -559,8 +577,8 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    /// Creates a manager for `config`. `services` is stored for phase 5/7
-    /// (service streams and scanning read the same table).
+    /// Creates a manager for `config`. `services` is the shared service table
+    /// that service streams and scanning read.
     pub fn new(config: Arc<Config>, services: ServiceTable) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -589,8 +607,7 @@ impl SessionManager {
     ///
     /// `pin` is the tuner name from `X-Mirakc-Tuner` / `X-Mirakurun-Tuner`
     /// (empty values are ignored, SPEC §6.3). `raw` selects the channel stream
-    /// (`true`) or the service stream (`false`); both currently deliver the
-    /// post-pipeline TS, see [`SessionTap`].
+    /// (`true`) or the service stream (`false`); see [`SessionTap`].
     pub async fn acquire(
         &self,
         type_name: &str,
@@ -604,14 +621,14 @@ impl SessionManager {
         } else {
             SessionTap::Filtered { service_id: None }
         };
-        self.acquire_with_tap(type_name, channel, user, pin, tap)
+        self.acquire_full(type_name, channel, user, pin, tap, false)
             .await
     }
 
     /// Like [`acquire`](Self::acquire) with an explicit [`SessionTap`].
     ///
-    /// This is the entry point phase 5 uses for service streams, which also
-    /// know the requested `service_id`.
+    /// This is the entry point for service streams, which also know the
+    /// requested `service_id`.
     pub async fn acquire_with_tap(
         &self,
         type_name: &str,
@@ -619,6 +636,25 @@ impl SessionManager {
         user: TunerUser,
         pin: Option<String>,
         tap: SessionTap,
+    ) -> Result<Subscription, AcquireError> {
+        self.acquire_full(type_name, channel, user, pin, tap, false)
+            .await
+    }
+
+    /// Full acquisition entry point: tap plus `decode=0` support.
+    ///
+    /// `bypass_pipeline` skips every pipeline stage for this session (SPEC
+    /// §4.1: `decode=0` bypasses the whole pipeline, not just the decoder). The
+    /// session is keyed separately from a normal one, because the same tuner
+    /// command yields different bytes with and without the pipeline.
+    pub async fn acquire_full(
+        &self,
+        type_name: &str,
+        channel: &str,
+        user: TunerUser,
+        pin: Option<String>,
+        tap: SessionTap,
+        bypass_pipeline: bool,
     ) -> Result<Subscription, AcquireError> {
         let inner = Arc::clone(&self.inner);
         let pin = pin.and_then(|name| {
@@ -662,6 +698,7 @@ impl SessionManager {
                     &user,
                     pin.as_deref(),
                     &failed,
+                    bypass_pipeline,
                 )
             };
 
@@ -787,6 +824,60 @@ impl SessionManager {
             .collect()
     }
 
+    /// Stops the pipeline session for `(type_name, channel)` when no other
+    /// subscriber is attached, returning whether it did.
+    ///
+    /// This is the channel scan's "release the scan session before the next
+    /// channel" step (SPEC §8.1). Dropping a [`Subscription`] closes its mpsc
+    /// receiver, which the subscriber pump observes asynchronously, so this
+    /// waits briefly for the count to reach zero. A session another client is
+    /// still watching (including a `decode=0` one, which lives under a
+    /// different key) is never stopped.
+    pub async fn release_session(&self, type_name: &str, channel: &str) -> bool {
+        let lookup =
+            |state: &State| Inner::session_for_channel(state, type_name, channel, false).cloned();
+        for _ in 0..20 {
+            let Some(session) = lookup(&lock(&self.inner.state)) else {
+                return false;
+            };
+            if session.phase() != SessionPhase::Ready {
+                return false;
+            }
+            let users = session.users_len();
+            // More than our own (already dropped) subscriber: a client is
+            // watching, so the session must live on.
+            if users > 1 {
+                return false;
+            }
+            if users == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let session = {
+            let mut state = lock(&self.inner.state);
+            let Some(session) = lookup(&state) else {
+                return false;
+            };
+            if !session.users_is_empty() || session.phase() != SessionPhase::Ready {
+                return false;
+            }
+            state.sessions.remove(&session.key);
+            session.set_phase(SessionPhase::Stopping);
+            session
+        };
+        tracing::debug!(
+            session_id = session.id,
+            type_name,
+            channel,
+            "releasing idle session"
+        );
+        session.close_broadcast();
+        session.stop_process().await;
+        true
+    }
+
     /// Stops every session and waits for all process trees to exit.
     ///
     /// The registry is cleared first, so no new request can join, and every
@@ -886,6 +977,7 @@ fn can_grab(requester: i32, victim_max: i32) -> bool {
 }
 
 /// Picks a tuner and atomically reserves it, or explains why it cannot.
+#[allow(clippy::too_many_arguments)]
 fn select(
     inner: &Arc<Inner>,
     state: &mut State,
@@ -894,6 +986,7 @@ fn select(
     user: &TunerUser,
     pin: Option<&str>,
     failed: &HashSet<String>,
+    bypass_pipeline: bool,
 ) -> Selection {
     // A pinned tuner must exist and support the type (SPEC §6.3).
     if let Some(name) = pin {
@@ -914,7 +1007,7 @@ fn select(
     }
 
     // 1. Join an existing session for this (type, channel), if it suits.
-    if let Some(existing) = Inner::session_for_channel(state, type_name, channel) {
+    if let Some(existing) = Inner::session_for_channel(state, type_name, channel, bypass_pipeline) {
         let existing = Arc::clone(existing);
         // The channel already streams on another tuner. Joining it would
         // silently ignore the pin, and starting a second session for the same
@@ -955,7 +1048,15 @@ fn select(
         .filter(|tuner| !failed.contains(&tuner.name))
         .find(|tuner| !inner.tuner_occupied(state, &tuner.name));
     if let Some(tuner) = free {
-        return reserve(state, inner, &tuner.name, type_name, channel, None);
+        return reserve(
+            state,
+            inner,
+            &tuner.name,
+            type_name,
+            channel,
+            None,
+            bypass_pipeline,
+        );
     }
 
     // 3. The weakest session that may be preempted (SPEC §6.1/§6.2).
@@ -989,7 +1090,15 @@ fn select(
         victim.takeover_pending.store(true, Ordering::SeqCst);
         victim.wake();
         let tuner = victim.key.tuner.clone();
-        return reserve(state, inner, &tuner, type_name, channel, Some(victim));
+        return reserve(
+            state,
+            inner,
+            &tuner,
+            type_name,
+            channel,
+            Some(victim),
+            bypass_pipeline,
+        );
     }
 
     // 4. Nothing available.
@@ -1004,6 +1113,7 @@ fn reserve(
     type_name: &str,
     channel: &str,
     victim: Option<Arc<Session>>,
+    bypass_pipeline: bool,
 ) -> Selection {
     let session = Arc::new(Session::new(
         inner.session_id(),
@@ -1011,6 +1121,7 @@ fn reserve(
             tuner: tuner.to_string(),
             type_name: type_name.to_string(),
             channel: channel.to_string(),
+            bypass_pipeline,
         },
     ));
     state
@@ -1412,6 +1523,9 @@ async fn start_process_tree(
         .ok_or_else(|| format!("tuner {:?} disappeared from the config", session.key.tuner))?
         .clone();
     let vars = CommandVars::new(&session.key.channel, &session.key.type_name);
+    // SPEC §4.1: `decode=0` bypasses every pipeline stage, so only the tuner
+    // command runs and its (normalized) output is broadcast directly.
+    let bypass_pipeline = session.key.bypass_pipeline;
 
     let mut tuner = spawn_tuner_command(&tuner_config.command, &vars)
         .await
@@ -1423,7 +1537,11 @@ async fn start_process_tree(
     );
 
     // SPEC §3.4: types without a pipeline binding deliver the raw TS.
-    let spec = PipelineSpec::for_type(&inner.config, &session.key.type_name);
+    let spec = if bypass_pipeline {
+        PipelineSpec::new(Vec::new())
+    } else {
+        PipelineSpec::for_type(&inner.config, &session.key.type_name)
+    };
     let chunk_size = inner.config.server.chunk_size_bytes.max(1);
 
     let mut pipeline = if spec.is_empty() {
@@ -2323,6 +2441,7 @@ mod tests {
                 tuner: "t0".to_string(),
                 type_name: "GR".to_string(),
                 channel: "27".to_string(),
+                bypass_pipeline: false,
             },
         ));
         session.set_phase(SessionPhase::Ready);
