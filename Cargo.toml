@@ -1,0 +1,25 @@
+[package]
+name = "unituner"
+version = "0.1.0"
+edition = "2021"
+# arib 0.3 is edition 2024, which requires Rust 1.85.
+rust-version = "1.85"
+description = "Tuner sharing and abstraction server with a minimal mirakurun-compatible API"
+license = "MIT"
+
+[dependencies]
+# STD-B10 SI tables and STD-B24 text decoding (used from phase 2 onward).
+arib = { version = "0.3", default-features = false, features = ["ts", "text"] }
+clap = { version = "4", features = ["derive"] }
+ipnet = "2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+# serde_yaml is deprecated/unmaintained; serde_yaml_ng is the maintained fork.
+serde_yaml_ng = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+bytes = "1"
+tempfile = "3"
