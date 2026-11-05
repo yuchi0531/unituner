@@ -22,12 +22,19 @@
 //! At the start of the stream the packet size is decided from sync votes
 //! (following the softcas-rs approach): the number of consecutive `0x47`
 //! bytes at the 188, 204 and 192 strides is counted, up to eight votes each.
-//! A decision needs two votes (two aligned packets), or a forced decision at
-//! [`TsNormalizer::finish`]. Ties are broken in the order 188, then 204, then
-//! 192, so a single 204-byte packet — indistinguishable from a 188-byte one by
-//! sync votes — is read as 188. A 204-framed source therefore needs at least
-//! two packets of data before `finish` for correct detection; in a live stream
-//! that is a few milliseconds.
+//! A decision needs two votes (two aligned packets) *and* a strict lead over
+//! the other candidates, or a forced decision at [`TsNormalizer::finish`].
+//!
+//! A 188-versus-204 tie is not decided on the spot. It is a normal state early
+//! in a 204 stream: a byte at offset 188 is that packet's Reed-Solomon parity
+//! tail, and parity may well be `0x47`, which makes the 188 stride score one
+//! vote too. Voting therefore keeps accumulating until one candidate leads;
+//! only at end of stream ([`TsNormalizer::finish`]), when the vote window is
+//! exhausted, is the 188-first tie-break used. A single 204-byte packet is
+//! indistinguishable from a 188-byte one by sync votes and is read as 188 at
+//! EOF (correct bytes, wrong framing), so a caller that flushes mid-stream
+//! should use [`TsNormalizer::finish_and_reset`] rather than leaving that
+//! framing locked in.
 
 /// Size of a normalized TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -166,11 +173,17 @@ impl TsNormalizer {
         out
     }
 
-    /// Flushes the stream: decides the framing from whatever is buffered,
-    /// returns the remaining complete packets and discards an incomplete tail.
+    /// Flushes the stream at end of input: decides the framing from whatever
+    /// is buffered, returns the remaining complete packets and discards an
+    /// incomplete tail.
     ///
-    /// The normalizer stays usable afterwards (the detected framing is kept),
-    /// which allows a caller to treat `finish` as a flush rather than a close.
+    /// This is an **EOF-only** operation. The detected framing is kept
+    /// afterwards (see [`finish_and_reset`](Self::finish_and_reset)) and an
+    /// undecided stream is forced to a framing here — a single 204-byte packet,
+    /// for example, is indistinguishable from a 188-byte one and is read as
+    /// 188. A caller flushing mid-stream must therefore use
+    /// [`finish_and_reset`](Self::finish_and_reset), or it would lock that
+    /// guess in permanently.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if self.framing.is_none() {
@@ -184,6 +197,20 @@ impl TsNormalizer {
         out
     }
 
+    /// Like [`finish`](Self::finish), but forgets the framing afterwards, so
+    /// the next [`push`](Self::push) detects it again from fresh bytes.
+    ///
+    /// Use this when flushing a stream that may resume (a reconnect, a
+    /// re-tuning tuner) and the framing of the resumed stream is not known to
+    /// be the same. Counters are preserved: only the framing guess and the
+    /// buffered bytes are dropped.
+    pub fn finish_and_reset(&mut self) -> Vec<u8> {
+        let out = self.finish();
+        self.framing = None;
+        self.buf.clear();
+        out
+    }
+
     /// Forgets all state, including the detected framing and the counters.
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -192,8 +219,8 @@ impl TsNormalizer {
     /// Decides the framing from the buffered bytes.
     ///
     /// Leaves the framing undecided when more data is needed (`force == false`)
-    /// and too few votes are available. Leading junk is dropped and counted on
-    /// every path.
+    /// and the votes do not yet point clearly at one candidate. Leading junk is
+    /// dropped and counted on every path.
     fn detect(&mut self, force: bool) {
         let mut start = 0usize;
         loop {
@@ -211,16 +238,39 @@ impl TsNormalizer {
             let votes_192 = count_syncs(window, TS_PACKET_SIZE_192, 0);
             let votes = votes_188.max(votes_204).max(votes_192);
 
-            if !force && votes < MIN_DECIDING_VOTES {
-                if window.len() < DETECT_GIVE_UP_BYTES {
-                    // Too little data to tell 188 from 204 yet.
+            if !force {
+                if votes < MIN_DECIDING_VOTES {
+                    if window.len() < DETECT_GIVE_UP_BYTES {
+                        // Too little data to tell 188 from 204 yet.
+                        self.discard_prefix(start);
+                        return;
+                    }
+                    // Two full 204-byte packets and no confirming sync byte:
+                    // this 0x47 is junk, not a packet start. Step over it.
+                    start += 1;
+                    continue;
+                }
+
+                // A 188/204 tie is *not* a decision. In a 204 stream the byte
+                // at offset 188 is Reed-Solomon parity and is `0x47` about once
+                // in 256 packets, so a short 204 stream can score as many 188
+                // votes as 204 votes, and deciding there would be permanent.
+                //
+                // Keep accumulating until exactly one candidate leads. Give up
+                // waiting once the whole vote window has been seen (a tie that
+                // survives eight aligned packets is not going to break) or once
+                // a whole window's worth of bytes is buffered (the chains can
+                // both stop early, after two votes each); `finish` breaks any
+                // remaining tie at EOF.
+                let leaders = u8::from(votes_188 == votes)
+                    + u8::from(votes_204 == votes)
+                    + u8::from(votes_192 == votes);
+                let window_exhausted =
+                    votes >= MAX_SYNC_VOTES || window.len() >= MAX_SYNC_VOTES * TS_PACKET_SIZE_204;
+                if leaders > 1 && !window_exhausted {
                     self.discard_prefix(start);
                     return;
                 }
-                // Two full 204-byte packets and no confirming sync byte: this
-                // 0x47 is junk, not a packet start. Step over it.
-                start += 1;
-                continue;
             }
 
             // Tie-break order is 188, then 204, then 192.
@@ -533,6 +583,76 @@ mod tests {
 
         assert_eq!(out, stream(&[first, second]));
         assert_eq!(normalizer.packets_out, 2);
+    }
+
+    #[test]
+    fn a_204_tie_broken_by_a_parity_byte_is_still_detected_as_204() {
+        // A real 204 stream whose first packet's parity tail starts with 0x47:
+        // the 188 stride then scores a second "sync" and a naive implementation
+        // decides 188 permanently. Feeding the stream in 188-byte chunks makes
+        // the tie appear exactly when about two packets are buffered.
+        let packets = [packet(0x01), packet(0x02), packet(0x03), packet(0x04)];
+        let mut input: Vec<u8> = packets
+            .iter()
+            .map(|p| {
+                let mut framed = p.clone();
+                framed.extend_from_slice(&[0x47, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5]);
+                framed.extend_from_slice(&[0xA5; 8]);
+                framed
+            })
+            .collect::<Vec<Vec<u8>>>()
+            .concat();
+        // Sanity: the byte at the 188 stride of the first packet is 0x47.
+        assert_eq!(input[TS_PACKET_SIZE], SYNC_BYTE);
+        // Keep the later tails from accidentally extending the false 188 chain.
+        for index in 2..packets.len() {
+            let offset = index * TS_PACKET_SIZE_204 + TS_PACKET_SIZE;
+            input[offset] = 0xA5;
+        }
+
+        let mut normalizer = TsNormalizer::new();
+        let mut out = Vec::new();
+        for chunk in input.chunks(TS_PACKET_SIZE) {
+            out.extend(normalizer.push(chunk));
+        }
+        out.extend(normalizer.finish());
+
+        assert_eq!(normalizer.framing(), Some(Framing::Ts204));
+        assert_eq!(out, stream(&packets));
+        assert_eq!(normalizer.packets_out, packets.len() as u64);
+        assert_eq!(normalizer.bytes_discarded, 0);
+        assert_eq!(normalizer.sync_errors, 0);
+    }
+
+    #[test]
+    fn a_single_204_packet_plus_finish_reads_as_188_but_finish_and_reset_recovers() {
+        let only = packet(0x01);
+        let framed = with_parity(&only);
+
+        // EOF right after one packet: indistinguishable by votes, so the
+        // 188-first tie-break applies. The 188-byte payload still comes out.
+        let mut normalizer = TsNormalizer::new();
+        let mut out = normalizer.push(&framed);
+        out.extend(normalizer.finish());
+        assert_eq!(normalizer.framing(), Some(Framing::Ts188));
+        assert_eq!(out, only);
+        // The 16-byte tail cannot complete a 188-byte packet and is dropped.
+        assert_eq!(normalizer.bytes_discarded, 16);
+
+        // A mid-stream flush that resets the framing recovers 204 as soon as a
+        // second packet proves it.
+        let mut normalizer = TsNormalizer::new();
+        let mut out = normalizer.push(&framed);
+        out.extend(normalizer.finish_and_reset());
+        assert_eq!(normalizer.framing(), None);
+        let mut second = Vec::new();
+        for _ in 0..2 {
+            second.extend_from_slice(&with_parity(&only));
+        }
+        out.extend(normalizer.push(&second));
+        out.extend(normalizer.finish());
+        assert_eq!(normalizer.framing(), Some(Framing::Ts204));
+        assert_eq!(out, [only.clone(), only.clone(), only].concat());
     }
 
     #[test]

@@ -14,13 +14,32 @@
 //! SDT and NIT. [`parse_section`] rejects any other table id, and
 //! [`SiParser`] ignores such sections without treating them as errors.
 //!
+//! # Filters and counters
+//!
+//! [`SiParser`] only assembles PIDs `0x0000` (PAT), `0x0010` (NIT), `0x0011`
+//! (SDT) and the PMT PIDs a PAT named, and only the six supported table ids.
+//! A PES payload or an EIT section therefore never even starts a parse, which
+//! keeps [`SiStats::invalid_sections`] a real corruption metric instead of a
+//! count of "every section I did not want". Those packets are counted in
+//! [`SiStats::non_si_packets`]; [`SectionAssembler::new`] and
+//! [`SiParser::with_full_assembly`] keep the unfiltered behaviour for tests.
+//!
+//! # Applicability
+//!
+//! Sections with `current_next_indicator == 0` describe a table that is not
+//! yet in force. They are parsed (so their version and section numbers are
+//! available) but not returned: a scan that applied them would fill the
+//! service table with next-version entries. They are counted in
+//! [`SiStats::ignored_sections`], not as corruption.
+//!
 //! # CRC32
 //!
 //! [`crc32_mpeg2`] is public because SPEC §5 requires the same checksum when
 //! rewriting a PAT for a service stream (phase 5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use arib::text::{Decoder, DrcsMapping};
 use arib::ts::descriptor::Descriptor;
 use arib::ts::table::{ProgramAssociation, Table};
 
@@ -82,18 +101,70 @@ pub fn crc32_mpeg2(bytes: &[u8]) -> u32 {
 
 /// Decodes ARIB STD-B24 8-bit text into a `String`.
 ///
-/// Wraps `arib::text::decode` so callers never have to care about the
-/// dependency. Invalid glyphs decode to the Unicode replacement character and
-/// undecodable escapes are skipped; the surrounding whitespace and NUL padding
+/// Wraps the `arib` crate's [`Decoder`] so callers never have to care about the
+/// dependency. DRCS glyphs (which have no Unicode code point of their own) are
+/// decoded with the decoder's [`DrcsMapping::Replacement`] mapping, i.e. as
+/// U+FFFD, and any private-use code point that still comes out is replaced with
+/// U+FFFD too; clients of the API cannot render a private-use glyph, and the
+/// default mapping would otherwise invent U+EC00.. code points per stream.
+/// Undecodable escapes are skipped; the surrounding whitespace and NUL padding
 /// that service names often carry is trimmed.
 ///
 /// A panic inside the dependency is caught and turned into an empty string, so
-/// a corrupt service name can never take down a scan.
+/// a corrupt service name can never take down a scan. The panic hook is muted
+/// for the duration of the call: catching a panic from a piece of untrusted
+/// input is routine here, and the default hook would print a backtrace to
+/// stderr for every corrupt name.
 pub fn decode_arib_text(bytes: &[u8]) -> String {
-    let decoded = std::panic::catch_unwind(|| arib::text::decode(bytes)).unwrap_or_default();
+    let decoded = catch_without_hook(|| {
+        let mut decoder = Decoder::with_drcs_mapping(DrcsMapping::Replacement);
+        decoder.decode(bytes)
+    })
+    .unwrap_or_default();
     decoded
+        .chars()
+        .map(|c| {
+            if ('\u{E000}'..='\u{F8FF}').contains(&c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_owned()
+}
+
+/// Serialises the panic-hook swap below: the hook is process-global.
+static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The type of the process-global panic hook, as `std::panic` stores it.
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// Runs `f`, catching a panic and returning `None` instead, without letting the
+/// default panic hook print anything.
+///
+/// The hook is process-global, so the swap is serialised with a mutex and the
+/// previous hook is restored before returning.
+fn catch_without_hook<T>(f: impl FnOnce() -> T) -> Option<T> {
+    /// Restores the previous panic hook when dropped.
+    struct HookGuard(Option<PanicHook>);
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                std::panic::set_hook(previous);
+            }
+        }
+    }
+
+    let _serialised = PANIC_HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = HookGuard(Some(std::panic::take_hook()));
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
+    drop(guard);
+    result
 }
 
 /// Programme information read from a PAT section.
@@ -105,12 +176,29 @@ pub struct PatInfo {
     ///
     /// A PAT itself carries only a network *PID* (the program-number-zero
     /// entry), never a network id, so [`parse_pat`] leaves this `None`.
-    /// [`SiParser`] fills it in from the most recently parsed NIT, which is
-    /// why the type is optional.
+    /// [`SiParser`] fills it in from the most recently parsed NIT-actual
+    /// section, and only when that NIT describes this PAT's transport stream
+    /// (its transport-stream loop names `transport_stream_id`); see
+    /// [`SiParser::parse_assembled`]. A NIT-actual for another multiplex is
+    /// never stamped onto a PAT, so the field is `None` rather than wrong.
     pub network_id: Option<u16>,
+    /// PID of the NIT, from the PAT's program-number-zero entry.
+    ///
+    /// This is the authoritative NIT PID; [`NIT_PID`] is only the usual value.
+    /// `None` when the section has no network-PID entry.
+    pub network_pid: Option<u16>,
     /// `(program_number, PMT PID)` for every real programme. The
-    /// network-PID entry (`program_number == 0`) is not listed.
+    /// network-PID entry (`program_number == 0`) is not listed; see
+    /// [`network_pid`](Self::network_pid).
     pub programs: Vec<(u16, u16)>,
+    /// Table `version_number` (0-31).
+    pub version_number: u8,
+    /// `current_next_indicator`: `false` means the table is not yet applicable.
+    pub current_next: bool,
+    /// `section_number` of this section.
+    pub section_number: u8,
+    /// `last_section_number` of the table this section belongs to.
+    pub last_section_number: u8,
 }
 
 /// Stream information read from a PMT section.
@@ -122,6 +210,14 @@ pub struct PmtInfo {
     pub pcr_pid: u16,
     /// `(stream_type, elementary_pid)` for every elementary stream.
     pub streams: Vec<(u8, u16)>,
+    /// Table `version_number` (0-31).
+    pub version_number: u8,
+    /// `current_next_indicator`: `false` means the table is not yet applicable.
+    pub current_next: bool,
+    /// `section_number` of this section.
+    pub section_number: u8,
+    /// `last_section_number` of the table this section belongs to.
+    pub last_section_number: u8,
 }
 
 /// Service information read from an SDT section.
@@ -134,6 +230,14 @@ pub struct SdtInfo {
     /// `(service_id, service_type, name)` for every service in the section.
     /// The name is already ARIB-decoded.
     pub services: Vec<(u16, u8, String)>,
+    /// Table `version_number` (0-31).
+    pub version_number: u8,
+    /// `current_next_indicator`: `false` means the table is not yet applicable.
+    pub current_next: bool,
+    /// `section_number` of this section.
+    pub section_number: u8,
+    /// `last_section_number` of the table this section belongs to.
+    pub last_section_number: u8,
 }
 
 /// Network information read from a NIT section.
@@ -144,6 +248,27 @@ pub struct NitInfo {
     /// Remote-control key ("channel number on the remote") for the transport
     /// stream, from the TS information descriptor (tag `0xCD`).
     pub remote_control_key_id: Option<u8>,
+    /// Whether this is the NIT *actual* (`0x40`, describes the multiplex being
+    /// received) rather than the NIT *other* (`0x41`, describes another
+    /// transport stream).
+    ///
+    /// Only NIT-actual may set [`SiParser::network_id`]; NIT-other is still
+    /// parsed and reported but never mutates the session's network id.
+    pub is_actual: bool,
+    /// `transport_stream_id`s listed in this NIT's transport-stream loop.
+    ///
+    /// A NIT-actual's loop names the multiplex it describes; [`SiParser`] uses
+    /// it to decide whether a PAT belongs to the same transport stream before
+    /// stamping a network id onto it.
+    pub transport_stream_ids: Vec<u16>,
+    /// Table `version_number` (0-31).
+    pub version_number: u8,
+    /// `current_next_indicator`: `false` means the table is not yet applicable.
+    pub current_next: bool,
+    /// `section_number` of this section.
+    pub section_number: u8,
+    /// `last_section_number` of the table this section belongs to.
+    pub last_section_number: u8,
 }
 
 /// A parsed SI table.
@@ -205,21 +330,28 @@ pub fn parse_pat(section: &[u8]) -> Result<PatInfo, SiError> {
     let Table::Pat(pat) = read_table(section)? else {
         return Err(SiError::Parse("not a PAT".to_owned()));
     };
-    let programs = pat
-        .programs
-        .into_iter()
-        .filter_map(|association| match association {
+    let mut network_pid = None;
+    let mut programs = Vec::new();
+    for association in pat.programs {
+        match association {
+            ProgramAssociation::Network {
+                network_pid: pid, ..
+            } => network_pid = Some(pid),
             ProgramAssociation::ProgramMap {
                 program_number,
                 program_map_pid,
-            } if program_number != 0 => Some((program_number, program_map_pid)),
-            _ => None,
-        })
-        .collect();
+            } => programs.push((program_number, program_map_pid)),
+        }
+    }
     Ok(PatInfo {
         transport_stream_id: pat.transport_stream_id,
         network_id: None,
+        network_pid,
         programs,
+        version_number: pat.version_number,
+        current_next: pat.current_next_indicator,
+        section_number: pat.section_number,
+        last_section_number: pat.last_section_number,
     })
 }
 
@@ -239,6 +371,10 @@ pub fn parse_pmt(section: &[u8]) -> Result<PmtInfo, SiError> {
         program_number: pmt.program_number,
         pcr_pid: pmt.pcr_pid,
         streams,
+        version_number: pmt.version_number,
+        current_next: pmt.current_next_indicator,
+        section_number: pmt.section_number,
+        last_section_number: pmt.last_section_number,
     })
 }
 
@@ -268,6 +404,10 @@ pub fn parse_sdt(section: &[u8]) -> Result<SdtInfo, SiError> {
         original_network_id: sdt.original_network_id,
         transport_stream_id: sdt.transport_stream_id,
         services,
+        version_number: sdt.version_number,
+        current_next: sdt.current_next_indicator,
+        section_number: sdt.section_number,
+        last_section_number: sdt.last_section_number,
     })
 }
 
@@ -282,8 +422,12 @@ pub fn parse_sdt(section: &[u8]) -> Result<SdtInfo, SiError> {
 ///
 /// The descriptor is looked for among the network descriptors first and then
 /// among the transport-stream descriptors; the first one found wins.
+///
+/// The table id distinguishes NIT-actual (`0x40`) from NIT-other (`0x41`);
+/// [`NitInfo::is_actual`] records which one this is.
 pub fn parse_nit(section: &[u8]) -> Result<NitInfo, SiError> {
     expect_table_id(section, &[TABLE_ID_NIT_ACTUAL, TABLE_ID_NIT_OTHER])?;
+    let table_id = section[0];
     let Table::Nit(nit) = read_table(section)? else {
         return Err(SiError::Parse("not a NIT".to_owned()));
     };
@@ -292,9 +436,20 @@ pub fn parse_nit(section: &[u8]) -> Result<NitInfo, SiError> {
         .iter()
         .chain(nit.transport_streams.iter().flat_map(|ts| &ts.descriptors))
         .find_map(remote_control_key_id_of);
+    let transport_stream_ids = nit
+        .transport_streams
+        .iter()
+        .map(|ts| ts.transport_stream_id)
+        .collect();
     Ok(NitInfo {
         network_id: nit.network_id,
         remote_control_key_id,
+        is_actual: table_id == TABLE_ID_NIT_ACTUAL,
+        transport_stream_ids,
+        version_number: nit.version_number,
+        current_next: nit.current_next_indicator,
+        section_number: nit.section_number,
+        last_section_number: nit.last_section_number,
     })
 }
 
@@ -346,6 +501,10 @@ struct PidState {
     expected: Option<usize>,
     /// Continuity counter of the last payload-bearing packet.
     last_cc: Option<u8>,
+    /// Bytes of an unwanted section still to skip before assembly resumes.
+    skip: usize,
+    /// Sections skipped because their table id was not in the allowlist.
+    skipped: u64,
     /// Partial sections abandoned on this PID.
     dropped: u64,
 }
@@ -358,10 +517,27 @@ impl PidState {
             self.expected = None;
             self.dropped += 1;
         }
+        self.skip = 0;
     }
 
     /// Appends payload bytes and moves every completed section into `out`.
-    fn extend_and_collect(&mut self, payload: &[u8], out: &mut Vec<Vec<u8>>) {
+    ///
+    /// When `tables` is set, a section whose table id is not in it is skipped
+    /// byte-exactly as soon as its header has arrived, so its body is never
+    /// buffered or copied.
+    fn extend_and_collect(
+        &mut self,
+        payload: &[u8],
+        tables: Option<&HashSet<u8>>,
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        // Finish skipping an unwanted section left over from an earlier packet.
+        let skipped = self.skip.min(payload.len());
+        self.skip -= skipped;
+        let payload = &payload[skipped..];
+        if payload.is_empty() {
+            return;
+        }
         self.buf.extend_from_slice(payload);
         loop {
             if self.buf.is_empty() {
@@ -373,6 +549,33 @@ impl PidState {
                 self.buf.clear();
                 self.expected = None;
                 return;
+            }
+            if let Some(tables) = tables {
+                if !tables.contains(&self.buf[0]) {
+                    if self.buf.len() < 3 {
+                        return;
+                    }
+                    let total =
+                        3 + (usize::from(self.buf[1] & 0x0F) << 8 | usize::from(self.buf[2]));
+                    if total > MAX_SECTION_LEN {
+                        self.drop_partial();
+                        return;
+                    }
+                    if self.buf.len() < total {
+                        // The section spans packets: remember how many of its
+                        // bytes still have to be skipped, without keeping any
+                        // of them.
+                        self.skip = total - self.buf.len();
+                        self.buf.clear();
+                        self.expected = None;
+                        self.skipped += 1;
+                        return;
+                    }
+                    self.buf.drain(..total);
+                    self.expected = None;
+                    self.skipped += 1;
+                    continue;
+                }
             }
             if self.expected.is_none() {
                 if self.buf.len() < 3 {
@@ -441,15 +644,81 @@ fn parse_header(packet: &[u8]) -> Option<PacketHeader> {
 ///
 /// Packets with the transport error indicator set, without a payload, or
 /// without a sync byte are skipped.
+///
+/// # Filters
+///
+/// A bare assembler assembles every PID and every table. [`with_interest`] and
+/// [`with_tables`] narrow that down:
+///
+/// * an interest set skips packets on other PIDs before any state or buffer is
+///   touched; they are counted in [`non_si_packets`](Self::non_si_packets).
+/// * a table allowlist is checked as soon as a section's table id is known, so
+///   a section of an unwanted table is never copied.
+///
+/// [`SiParser`] sets both, so PES, EIT and other non-PSI payloads cost nothing
+/// and cannot pollute the parser's error counters. Full assembly stays
+/// available with [`SectionAssembler::new`] and
+/// [`SiParser::with_full_assembly`].
+///
+/// [`with_interest`]: Self::with_interest
+/// [`with_tables`]: Self::with_tables
 #[derive(Debug, Default)]
 pub struct SectionAssembler {
     pids: HashMap<u16, PidState>,
+    /// PIDs to assemble, or `None` for every PID.
+    interest: Option<HashSet<u16>>,
+    /// Table ids to assemble, or `None` for every table.
+    tables: Option<HashSet<u8>>,
+    /// Packets skipped because their PID was not in [`interest`](Self::interest).
+    non_si_packets: u64,
 }
 
 impl SectionAssembler {
-    /// Creates an assembler with no state.
+    /// Creates an assembler with no state and no filters: every PID and every
+    /// table is assembled.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an assembler that only assembles the given PIDs.
+    ///
+    /// Packets on other PIDs are counted in
+    /// [`non_si_packets`](Self::non_si_packets) and otherwise ignored.
+    /// [`add_interest`](Self::add_interest) extends the set later (a PAT names
+    /// its PMT PIDs only after it has been parsed).
+    pub fn with_interest<I: IntoIterator<Item = u16>>(pids: I) -> Self {
+        Self {
+            interest: Some(pids.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
+    /// Restricts assembly to the given table ids.
+    ///
+    /// A section of another table is dropped as soon as its table id byte is
+    /// seen, before its body is copied.
+    pub fn with_tables<I: IntoIterator<Item = u8>>(mut self, tables: I) -> Self {
+        self.tables = Some(tables.into_iter().collect());
+        self
+    }
+
+    /// Adds one PID to the interest set. Does nothing without a filter.
+    pub fn add_interest(&mut self, pid: u16) {
+        if let Some(interest) = &mut self.interest {
+            interest.insert(pid);
+        }
+    }
+
+    /// Whether `pid` is assembled.
+    pub fn is_interested(&self, pid: u16) -> bool {
+        self.interest
+            .as_ref()
+            .is_none_or(|interest| interest.contains(&pid))
+    }
+
+    /// Packets skipped because their PID was not in the interest set.
+    pub fn non_si_packets(&self) -> u64 {
+        self.non_si_packets
     }
 
     /// Appends one 188-byte packet and returns every section it completed.
@@ -460,6 +729,10 @@ impl SectionAssembler {
         if header.transport_error {
             return Vec::new();
         }
+        if !self.is_interested(header.pid) {
+            self.non_si_packets += 1;
+            return Vec::new();
+        }
         let Some(offset) = header.payload_offset else {
             return Vec::new();
         };
@@ -468,6 +741,7 @@ impl SectionAssembler {
             return Vec::new();
         }
 
+        let tables = self.tables.as_ref();
         let state = self.pids.entry(header.pid).or_default();
         if let Some(last) = state.last_cc {
             if header.continuity_counter == last {
@@ -482,6 +756,8 @@ impl SectionAssembler {
 
         let mut sections: Vec<Vec<u8>> = Vec::new();
         if header.payload_unit_start {
+            // A new section starts here, so any pending skip is obsolete.
+            state.skip = 0;
             let pointer = usize::from(payload[0]);
             let start = 1 + pointer;
             if start > payload.len() {
@@ -494,16 +770,16 @@ impl SectionAssembler {
                 // is abandoned. Bytes before the pointer belong to it and may
                 // be enough to finish it.
                 if pointer > 0 {
-                    state.extend_and_collect(&payload[1..start], &mut sections);
+                    state.extend_and_collect(&payload[1..start], tables, &mut sections);
                 }
                 state.drop_partial();
             }
             if start < payload.len() {
-                state.extend_and_collect(&payload[start..], &mut sections);
+                state.extend_and_collect(&payload[start..], tables, &mut sections);
             }
-        } else if !state.buf.is_empty() {
+        } else if !state.buf.is_empty() || state.skip > 0 {
             // A continuation only makes sense once a section has started.
-            state.extend_and_collect(payload, &mut sections);
+            state.extend_and_collect(payload, tables, &mut sections);
         }
 
         sections
@@ -531,7 +807,18 @@ impl SectionAssembler {
         self.pids.values().map(|state| state.dropped).sum()
     }
 
+    /// Sections skipped because their table id was outside the allowlist.
+    pub fn ignored_sections(&self) -> u64 {
+        self.pids.values().map(|state| state.skipped).sum()
+    }
+
     /// Forgets every partially assembled section and the continuity state.
+    ///
+    /// The counters stay: [`non_si_packets`](Self::non_si_packets) is cumulative
+    /// over the assembler's lifetime, while
+    /// [`dropped_sections`](Self::dropped_sections) and
+    /// [`ignored_sections`](Self::ignored_sections) describe the current state
+    /// and restart at zero.
     pub fn reset(&mut self) {
         self.pids.clear();
     }
@@ -545,12 +832,48 @@ pub struct SiStats {
     /// Complete sections emitted by the assembler.
     pub sections: u64,
     /// Sections that failed validation or parsing.
+    ///
+    /// With the default interest filter this only counts real SI corruption:
+    /// packets of other PIDs and sections of other tables never reach the
+    /// validator. See [`non_si_packets`](Self::non_si_packets).
     pub invalid_sections: u64,
-    /// Sections ignored because their table id is not one of the four handled.
+    /// Packet-level ignorance: packets skipped because their PID is neither
+    /// PAT, NIT, SDT nor a PMT PID learned from the PAT (PES, EIT, null, ...).
+    ///
+    /// Before this split every one of those PUSI packets started a bogus
+    /// section and inflated `invalid_sections`, which made the metric useless.
+    pub non_si_packets: u64,
+    /// Sections skipped because their table id is not one of the six handled
+    /// (PAT, PMT, SDT actual/other, NIT actual/other).
     pub ignored_sections: u64,
 }
 
+/// The PIDs [`SiParser`] assembles by default; PMT PIDs are added as PATs
+/// arrive.
+const DEFAULT_INTEREST: [u16; 3] = [PAT_PID, NIT_PID, SDT_PID];
+
+/// The table ids [`SiParser`] parses.
+const SUPPORTED_TABLES: [u8; 6] = [
+    TABLE_ID_PAT,
+    TABLE_ID_PMT,
+    TABLE_ID_NIT_ACTUAL,
+    TABLE_ID_NIT_OTHER,
+    TABLE_ID_SDT_ACTUAL,
+    TABLE_ID_SDT_OTHER,
+];
+
 /// Assembles sections out of TS packets and parses the four tables of SPEC §8.
+///
+/// By default only PIDs `0x0000` (PAT), `0x0010` (NIT), `0x0011` (SDT) and the
+/// PMT PIDs named by the PAT are assembled, and only the six table ids above
+/// are handed to the parser; everything else is counted in
+/// [`SiStats::non_si_packets`] or [`SiStats::ignored_sections`]. This keeps
+/// `invalid_sections` a real corruption metric on a healthy mux.
+///
+/// Sections with `current_next_indicator == 0` are *not* reported: they
+/// describe a table that is not yet applicable, and a scan that applied them
+/// would fill the service table with next-version entries. They are dropped
+/// silently (they are not corruption).
 ///
 /// ```
 /// use unituner::si::SiParser;
@@ -562,18 +885,46 @@ pub struct SiStats {
 /// null_packet[1] = 0x1F;
 /// null_packet[2] = 0xFF;
 /// assert!(parser.push_packets(&null_packet).is_empty());
+/// assert_eq!(parser.stats().non_si_packets, 1);
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SiParser {
     assembler: SectionAssembler,
     stats: SiStats,
     network_id: Option<u16>,
+    /// `transport_stream_id`s of the multiplex the `network_id` came from,
+    /// learned from the NIT-actual's transport-stream loop.
+    network_tsids: HashSet<u16>,
+}
+
+impl Default for SiParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SiParser {
-    /// Creates a parser with no state.
+    /// Creates a parser with the default interest and table filters.
     pub fn new() -> Self {
-        Self::default()
+        let assembler =
+            SectionAssembler::with_interest(DEFAULT_INTEREST).with_tables(SUPPORTED_TABLES);
+        Self {
+            assembler,
+            stats: SiStats::default(),
+            network_id: None,
+            network_tsids: HashSet::new(),
+        }
+    }
+
+    /// Creates a parser that assembles every PID and every table.
+    ///
+    /// Only useful for tests and diagnostics: on real input this copies every
+    /// PES and EIT section before discarding it.
+    pub fn with_full_assembly() -> Self {
+        Self {
+            assembler: SectionAssembler::new(),
+            ..Self::new()
+        }
     }
 
     /// Parses one 188-byte packet and returns the tables it completed.
@@ -584,18 +935,33 @@ impl SiParser {
     }
 
     /// Parses a run of 188-byte packets and returns the tables it completed.
+    ///
+    /// Packets are parsed one at a time rather than assembled as one batch:
+    /// a PAT in the run names its PMT PIDs, and those PMTs usually follow it
+    /// within the same read from the tuner. Batching the assembly would see the
+    /// PMT before the PAT had been parsed and skip it until the next PAT.
+    /// A trailing partial packet is ignored.
     pub fn push_packets(&mut self, packets: &[u8]) -> Vec<SiEvent> {
-        self.stats.packets += (packets.len() / TS_PACKET_SIZE) as u64;
-        let assembled = self.assembler.push_packets(packets);
-        self.parse_assembled(assembled)
+        let mut events = Vec::new();
+        for packet in packets.chunks_exact(TS_PACKET_SIZE) {
+            events.extend(self.push_packet(packet));
+        }
+        events
     }
 
     /// Counters of this parser.
     pub fn stats(&self) -> SiStats {
-        self.stats
+        SiStats {
+            non_si_packets: self.assembler.non_si_packets(),
+            ignored_sections: self.stats.ignored_sections + self.assembler.ignored_sections(),
+            ..self.stats
+        }
     }
 
-    /// The `network_id` of the most recently parsed NIT, if any.
+    /// The `network_id` learned from the most recent NIT *actual*, if any.
+    ///
+    /// A NIT *other* (table id `0x41`) describes a different transport stream
+    /// and never changes this value; see [`NitInfo::is_actual`].
     pub fn network_id(&self) -> Option<u16> {
         self.network_id
     }
@@ -605,10 +971,17 @@ impl SiParser {
         self.assembler.dropped_sections()
     }
 
-    /// Forgets all parse state, keeping the statistics.
+    /// Forgets all parse state.
+    ///
+    /// Packet, section and corruption counters (`packets`, `sections`,
+    /// `invalid_sections`, parse-level `ignored_sections`) are kept; the
+    /// assembler's own counters restart with its state, so
+    /// [`SiStats::non_si_packets`] and the assembler share of
+    /// `ignored_sections` go back to zero.
     pub fn reset(&mut self) {
         self.assembler.reset();
         self.network_id = None;
+        self.network_tsids.clear();
     }
 
     fn parse_assembled(&mut self, assembled: Vec<AssembledSection>) -> Vec<SiEvent> {
@@ -630,12 +1003,28 @@ impl SiParser {
                 continue;
             }
             match parse_section(&section.bytes) {
+                Ok(event) if !is_current(&event) => {
+                    // A next-version table: parsed but not yet applicable.
+                    self.stats.ignored_sections += 1;
+                }
                 Ok(SiEvent::Pat(mut pat)) => {
-                    pat.network_id = self.network_id;
+                    pat.network_id = self.network_id_for(pat.transport_stream_id);
+                    for &(_, pmt_pid) in &pat.programs {
+                        // A PAT names its PMT PIDs; assemble them from now on.
+                        self.assembler.add_interest(pmt_pid);
+                    }
+                    if let Some(network_pid) = pat.network_pid {
+                        // ...and its NIT PID, which is only conventionally
+                        // 0x0010.
+                        self.assembler.add_interest(network_pid);
+                    }
                     events.push(SiEvent::Pat(pat));
                 }
                 Ok(SiEvent::Nit(nit)) => {
-                    self.network_id = Some(nit.network_id);
+                    if nit.is_actual {
+                        self.network_id = Some(nit.network_id);
+                        self.network_tsids = nit.transport_stream_ids.iter().copied().collect();
+                    }
                     events.push(SiEvent::Nit(nit));
                 }
                 Ok(event) => events.push(event),
@@ -643,6 +1032,33 @@ impl SiParser {
             }
         }
         events
+    }
+
+    /// The network id to stamp onto a PAT of `transport_stream_id`.
+    ///
+    /// A PAT carries no network id. The only trustworthy source is a NIT
+    /// *actual* (a NIT *other* never sets `self.network_id`, so a stray
+    /// NIT-other in the stream cannot leak another network's id onto this PAT).
+    ///
+    /// It is stamped only when the NIT-actual's transport-stream loop names this
+    /// very transport stream, i.e. the PAT's TSID is the NIT's TSID. Otherwise
+    /// the result is `None`: a missing network id is recoverable (the next NIT
+    /// retries), a wrong one is not.
+    fn network_id_for(&self, transport_stream_id: u16) -> Option<u16> {
+        let network_id = self.network_id?;
+        self.network_tsids
+            .contains(&transport_stream_id)
+            .then_some(network_id)
+    }
+}
+
+/// Whether a parsed table is applicable now (`current_next_indicator == 1`).
+fn is_current(event: &SiEvent) -> bool {
+    match event {
+        SiEvent::Pat(info) => info.current_next,
+        SiEvent::Pmt(info) => info.current_next,
+        SiEvent::Sdt(info) => info.current_next,
+        SiEvent::Nit(info) => info.current_next,
     }
 }
 
@@ -661,6 +1077,19 @@ mod tests {
     /// transport_stream_id, network_id or program_number), version 0/current,
     /// section 0 of 0, `rest`, and the CRC32.
     fn section(table_id: u8, id: u16, rest: Vec<u8>) -> Vec<u8> {
+        section_header(table_id, id, 0xC1, 0x00, 0x00, rest)
+    }
+
+    /// Builds a section with explicit `version_and_current`, `section_number`
+    /// and `last_section_number`.
+    fn section_header(
+        table_id: u8,
+        id: u16,
+        version_and_current: u8,
+        section_number: u8,
+        last_section_number: u8,
+        rest: Vec<u8>,
+    ) -> Vec<u8> {
         let section_length = 5 + rest.len() + 4;
         let mut bytes = vec![
             table_id,
@@ -668,9 +1097,9 @@ mod tests {
             section_length as u8,
             (id >> 8) as u8,
             id as u8,
-            0xC1,
-            0x00,
-            0x00,
+            version_and_current,
+            section_number,
+            last_section_number,
         ];
         bytes.extend_from_slice(&rest);
         with_crc(bytes)
@@ -760,7 +1189,8 @@ mod tests {
         section(0x42, 0x7FE0, rest)
     }
 
-    /// NIT: network_id 0x7FE0 with a TS information descriptor (0xCD).
+    /// NIT: network_id 0x7FE0 with a TS information descriptor (0xCD) and a
+    /// transport-stream loop naming TSID 0x7FE0 (the PAT's TSID).
     fn nit_section() -> Vec<u8> {
         let ts_information = vec![
             0xCD, 0x08, // TS information descriptor, length 8
@@ -773,7 +1203,8 @@ mod tests {
         ];
         let mut rest = vec![0xF0, ts_information.len() as u8];
         rest.extend_from_slice(&ts_information);
-        rest.extend_from_slice(&[0xF0, 0x00]); // transport_stream_loop_length 0
+        rest.extend_from_slice(&[0xF0, 0x06]); // transport_stream_loop_length 6
+        rest.extend_from_slice(&[0x7F, 0xE0, 0x7F, 0xE0, 0xF0, 0x00]);
         section(0x40, 0x7FE0, rest)
     }
 
@@ -842,7 +1273,37 @@ mod tests {
         let info = parse_pat(&pat_section()).expect("PAT must parse");
         assert_eq!(info.transport_stream_id, 0x7FE0);
         assert_eq!(info.network_id, None);
+        assert_eq!(info.network_pid, Some(NIT_PID));
         assert_eq!(info.programs, vec![(0x0408, 0x01F0)]);
+        assert_eq!(info.version_number, 0);
+        assert!(info.current_next);
+        assert_eq!(info.section_number, 0);
+        assert_eq!(info.last_section_number, 0);
+    }
+
+    #[test]
+    fn a_pat_without_a_network_entry_has_no_network_pid() {
+        let section = section(0x00, 0x7FE0, vec![0x04, 0x08, 0xE1, 0xF0]);
+        let info = parse_pat(&section).expect("PAT must parse");
+        assert_eq!(info.network_pid, None);
+        assert_eq!(info.programs, vec![(0x0408, 0x01F0)]);
+    }
+
+    #[test]
+    fn a_pat_keeps_its_table_version_and_section_numbers() {
+        let section = section_header(
+            0x00,
+            0x7FE0,
+            0xC0 | (7 << 1) | 1,
+            3,
+            9,
+            vec![0x04, 0x08, 0xE1, 0xF0],
+        );
+        let info = parse_pat(&section).expect("PAT must parse");
+        assert_eq!(info.version_number, 7);
+        assert!(info.current_next);
+        assert_eq!(info.section_number, 3);
+        assert_eq!(info.last_section_number, 9);
     }
 
     #[test]
@@ -851,6 +1312,30 @@ mod tests {
         assert_eq!(info.program_number, 0x0408);
         assert_eq!(info.pcr_pid, 0x1F1);
         assert_eq!(info.streams, vec![(0x1B, 0x1F1), (0x0F, 0x1F2)]);
+        assert_eq!(info.version_number, 0);
+        assert!(info.current_next);
+        assert_eq!(info.section_number, 0);
+        assert_eq!(info.last_section_number, 0);
+    }
+
+    #[test]
+    fn a_pmt_reports_a_next_version_section() {
+        let section = section_header(
+            0x02,
+            0x0408,
+            0xC0 | (2 << 1),
+            1,
+            4,
+            vec![
+                0xE1, 0xF1, // PCR_PID 0x1F1
+                0xF0, 0x00, // program_info_length 0
+            ],
+        );
+        let info = parse_pmt(&section).expect("PMT must parse");
+        assert_eq!(info.version_number, 2);
+        assert!(!info.current_next);
+        assert_eq!(info.section_number, 1);
+        assert_eq!(info.last_section_number, 4);
     }
 
     #[test]
@@ -869,6 +1354,11 @@ mod tests {
         assert_eq!(*service_id, 0x0409);
         assert_eq!(*service_type, 0xA5);
         assert_eq!(name, &"A".repeat(130));
+
+        assert_eq!(info.version_number, 0);
+        assert!(info.current_next);
+        assert_eq!(info.section_number, 0);
+        assert_eq!(info.last_section_number, 0);
     }
 
     #[test]
@@ -876,6 +1366,10 @@ mod tests {
         let info = parse_nit(&nit_section()).expect("NIT must parse");
         assert_eq!(info.network_id, 0x7FE0);
         assert_eq!(info.remote_control_key_id, Some(0x05));
+        assert!(info.is_actual);
+        assert_eq!(info.transport_stream_ids, vec![0x7FE0]);
+        assert_eq!(info.version_number, 0);
+        assert!(info.current_next);
     }
 
     #[test]
@@ -883,6 +1377,93 @@ mod tests {
         let info = parse_nit(&empty_nit_section()).expect("NIT must parse");
         assert_eq!(info.network_id, 0x7FE0);
         assert_eq!(info.remote_control_key_id, None);
+    }
+
+    #[test]
+    fn nit_other_is_reported_but_does_not_become_the_session_network_id() {
+        // A NIT-other for a different multiplex (network 0x0001, TSID 0x0002).
+        let other = section(0x41, 0x0001, vec![0xF0, 0x00, 0xF0, 0x00]);
+        let info = parse_nit(&other).expect("NIT other must parse");
+        assert!(!info.is_actual);
+
+        let mut parser = SiParser::new();
+        let events = parser.push_packets(&section_packet(NIT_PID, &other));
+        assert_eq!(events.len(), 1, "NIT-other is still reported");
+        assert_eq!(
+            parser.network_id(),
+            None,
+            "NIT-other must not be remembered"
+        );
+
+        // A NIT-actual later sets the id. (Different continuity counter: the
+        // assembler would treat the same one twice as a retransmission.)
+        parser.push_packets(&section_packets(NIT_PID, &nit_section(), 1));
+        assert_eq!(parser.network_id(), Some(0x7FE0));
+    }
+
+    #[test]
+    fn a_pat_is_not_stamped_with_the_network_id_of_another_transport_stream() {
+        // NIT-actual for network 0x7FE0 whose TS loop names TSID 0x7FE1 only.
+        let mut rest = Vec::new();
+        rest.extend_from_slice(&[0xF0, 0x00]); // network descriptors
+        rest.extend_from_slice(&[0xF0, 0x06]); // TS loop length 6
+        rest.extend_from_slice(&[0x7F, 0xE1, 0x7F, 0xE0, 0xF0, 0x00]);
+        let nit = section(0x40, 0x7FE0, rest);
+
+        let mut parser = SiParser::new();
+        let events = parser.push_packets(&section_packet(NIT_PID, &nit));
+        let SiEvent::Nit(info) = &events[0] else {
+            panic!("expected a NIT");
+        };
+        assert_eq!(info.transport_stream_ids, vec![0x7FE1]);
+
+        // The PAT is for TSID 0x7FE0, which the NIT does not describe.
+        let events = parser.push_packets(&section_packet(PAT_PID, &pat_section()));
+        match &events[0] {
+            SiEvent::Pat(info) => assert_eq!(info.network_id, None),
+            other => panic!("expected a PAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pat_is_stamped_when_the_nit_actual_names_its_transport_stream() {
+        // NIT-actual for network 0x7FE0 describing TSID 0x7FE0.
+        let mut rest = Vec::new();
+        rest.extend_from_slice(&[0xF0, 0x00]);
+        rest.extend_from_slice(&[0xF0, 0x06]); // TS loop length 6
+        rest.extend_from_slice(&[0x7F, 0xE0, 0x7F, 0xE0, 0xF0, 0x00]);
+        let nit = section(0x40, 0x7FE0, rest);
+
+        let mut parser = SiParser::new();
+        parser.push_packets(&section_packet(NIT_PID, &nit));
+        let events = parser.push_packets(&section_packet(PAT_PID, &pat_section()));
+        match &events[0] {
+            SiEvent::Pat(info) => assert_eq!(info.network_id, Some(0x7FE0)),
+            other => panic!("expected a PAT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sections_with_current_next_false_are_not_reported() {
+        let next_version = section_header(
+            0x00,
+            0x7FE0,
+            0xC0, // version 0, current_next = 0
+            0,
+            0,
+            vec![0x04, 0x08, 0xE1, 0xF0],
+        );
+
+        let mut parser = SiParser::new();
+        let events = parser.push_packets(&section_packet(PAT_PID, &next_version));
+        assert!(events.is_empty(), "next-version PAT must not be reported");
+        assert_eq!(parser.stats().ignored_sections, 1);
+        assert_eq!(parser.stats().invalid_sections, 0);
+
+        // The current version of the same table is reported. A new continuity
+        // counter, or the assembler would take it for a retransmission.
+        let events = parser.push_packets(&section_packets(PAT_PID, &pat_section(), 1));
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
@@ -1137,11 +1718,12 @@ mod tests {
     fn the_parser_ignores_unknown_tables_and_counts_bad_sections() {
         let mut parser = SiParser::new();
 
-        // A table id nobody handles, with a valid CRC.
+        // A table id nobody handles, with a valid CRC, on a PID we assemble.
         let unknown = section(0x70, 0x0001, Vec::new());
-        let events = parser.push_packets(&section_packet(0x0014, &unknown));
+        let events = parser.push_packets(&section_packet(SDT_PID, &unknown));
         assert!(events.is_empty());
         assert_eq!(parser.stats().ignored_sections, 1);
+        assert_eq!(parser.stats().invalid_sections, 0);
 
         let mut broken = pat_section();
         let last = broken.len() - 1;
@@ -1165,6 +1747,187 @@ mod tests {
             decode_arib_text(&[0x1B, 0x24, 0x42, 0x23, 0x4E, 0x23, 0x48, 0x23, 0x4B]),
             "ＮＨＫ"
         );
+    }
+
+    #[test]
+    fn drcs_glyphs_decode_to_the_replacement_character() {
+        // ESC ) 20 41: designate DRCS-1 into G1, shift out, then one glyph.
+        // The default mapping would invent a private-use U+EC00 here.
+        let decoded = decode_arib_text(&[0x1B, 0x29, 0x20, 0x41, 0x0E, 0x21]);
+        assert_eq!(decoded, "\u{FFFD}");
+        assert!(
+            !decoded
+                .chars()
+                .any(|c| ('\u{E000}'..='\u{F8FF}').contains(&c)),
+            "no private-use code point may survive: {decoded:?}"
+        );
+
+        // A DRCS glyph inside otherwise ordinary text keeps the text.
+        assert_eq!(
+            decode_arib_text(&[
+                0x1B, 0x28, 0x4A, b'A', // designates JIS X 0201 alphanumeric
+                0x1B, 0x29, 0x20, 0x41, // designates DRCS-1 into G1
+                0x0E, 0x21, // shift out, one DRCS glyph
+            ]),
+            "A\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn malformed_text_decodes_without_panicking_or_printing_to_stderr() {
+        // C1 control sequences, truncated escapes and random high bytes: the
+        // decoder must swallow all of it (the panic hook is muted inside
+        // `decode_arib_text`, so a corrupt name produces no stderr noise).
+        let mut seed = 0x1234_5678u32;
+        for len in 0..64 {
+            for _ in 0..20 {
+                let bytes: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u8
+                    })
+                    .collect();
+                let decoded = decode_arib_text(&bytes);
+                // Whatever comes out must be valid, printable-ish text.
+                assert!(
+                    !decoded.contains('\u{0}'),
+                    "NUL must be trimmed from {bytes:02X?}"
+                );
+            }
+        }
+
+        // A truncated escape and a lead byte without its trail decode to ""
+        // rather than panicking, and a complete escape still decodes.
+        assert_eq!(decode_arib_text(&[0x1B, 0x24, 0x42, 0x21]), "");
+        assert_eq!(decode_arib_text(&[0x1B]), "");
+        assert_eq!(decode_arib_text(&[0x1B, 0x24, 0x42, 0x22, 0x2F]), "＇");
+    }
+
+    #[test]
+    fn pes_packets_do_not_inflate_invalid_sections() {
+        let mut parser = SiParser::new();
+
+        // A PES payload on a video PID: PUSI set, so a naive assembler would
+        // start a "section" from the PES header and fail to parse it.
+        let mut payload = vec![0x00, 0x00, 0x01, 0xE0];
+        payload.extend_from_slice(&[0x00, 0x00, 0x80, 0x80, 0x05]);
+        payload.extend(std::iter::repeat_n(0xAA, 100));
+        let events = parser.push_packets(&packet(0x0111, true, 0, &payload));
+        assert!(events.is_empty());
+        assert_eq!(parser.stats().invalid_sections, 0);
+        assert_eq!(parser.stats().non_si_packets, 1);
+
+        // A healthy PAT still parses and does not count as an error.
+        let events = parser.push_packets(&section_packet(PAT_PID, &pat_section()));
+        assert_eq!(events.len(), 1);
+        assert_eq!(parser.stats().invalid_sections, 0);
+    }
+
+    #[test]
+    fn eit_sections_on_their_pid_are_not_assembled_at_all() {
+        // An EIT (table id 0x4E) on PID 0x0012: valid CRC, but nobody asked
+        // for it. It must not be copied, reported, or counted as corruption.
+        let eit = section(0x4E, 0x0408, vec![0x00; 40]);
+
+        let mut assembler = SectionAssembler::with_interest([PAT_PID, NIT_PID, SDT_PID]);
+        let sections = assembler.push_packet(&section_packet(0x0012, &eit));
+        assert!(sections.is_empty());
+        assert_eq!(assembler.non_si_packets(), 1);
+        assert_eq!(assembler.ignored_sections(), 0);
+
+        let mut parser = SiParser::new();
+        let events = parser.push_packets(&section_packet(0x0012, &eit));
+        assert!(events.is_empty());
+        assert_eq!(parser.stats().sections, 0);
+        assert_eq!(parser.stats().invalid_sections, 0);
+        assert_eq!(parser.stats().non_si_packets, 1);
+    }
+
+    #[test]
+    fn a_table_allowlist_skips_sections_without_copying_them() {
+        // The EIT is on an allowed PID but its table is not allowed: it is
+        // skipped at the table-id byte, counted as ignored but never handed
+        // out and never counted as invalid.
+        let eit = section(0x4E, 0x0408, vec![0x00; 40]);
+
+        let mut assembler = SectionAssembler::with_interest([SDT_PID]).with_tables([0x42]);
+        let sections = assembler.push_packet(&section_packet(SDT_PID, &eit));
+        assert!(sections.is_empty());
+        assert_eq!(assembler.ignored_sections(), 1);
+
+        // A multi-packet unwanted section is skipped too, without buffering it.
+        let long = section(0x4E, 0x0408, vec![0x11; 400]);
+        assert!(long.len() > TS_PACKET_SIZE * 2);
+        let mut assembler = SectionAssembler::with_interest([SDT_PID]).with_tables([0x42]);
+        let mut sections = Vec::new();
+        for packet in section_packets(SDT_PID, &long, 0).chunks_exact(TS_PACKET_SIZE) {
+            sections.extend(assembler.push_packet(packet));
+        }
+        assert!(sections.is_empty());
+        assert_eq!(assembler.ignored_sections(), 1);
+
+        // The wanted table on the same PID still comes through.
+        let wanted = sdt_section();
+        let sections = assembler.push_packets(&section_packets(SDT_PID, &wanted, 5));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].bytes, wanted);
+    }
+
+    #[test]
+    fn the_default_interest_filter_still_parses_pat_pmt_sdt_and_nit() {
+        let mut parser = SiParser::new();
+        let mut events = Vec::new();
+        events.extend(parser.push_packets(&section_packet(PAT_PID, &pat_section())));
+        // The PMT PID is only known once the PAT named it.
+        assert!(parser.assembler.is_interested(0x01F0));
+        events.extend(parser.push_packets(&section_packet(0x01F0, &pmt_section())));
+        events.extend(parser.push_packets(&section_packet(SDT_PID, &sdt_section())));
+        events.extend(parser.push_packets(&section_packet(NIT_PID, &nit_section())));
+
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], SiEvent::Pat(_)));
+        assert!(matches!(events[1], SiEvent::Pmt(_)));
+        assert!(matches!(events[2], SiEvent::Sdt(_)));
+        assert!(matches!(events[3], SiEvent::Nit(_)));
+        assert_eq!(parser.stats().invalid_sections, 0);
+        assert_eq!(parser.stats().non_si_packets, 0);
+    }
+
+    #[test]
+    fn full_assembly_still_assembles_every_pid_for_tests() {
+        let eit = section(0x4E, 0x0408, vec![0x00; 10]);
+        let mut parser = SiParser::with_full_assembly();
+        let events = parser.push_packets(&section_packet(0x0012, &eit));
+        assert!(events.is_empty());
+        // The section was assembled and then ignored by table id.
+        assert_eq!(parser.stats().sections, 1);
+        assert_eq!(parser.stats().ignored_sections, 1);
+        assert_eq!(parser.stats().non_si_packets, 0);
+    }
+
+    #[test]
+    fn the_parser_learns_a_non_standard_nit_pid_from_the_pat() {
+        // PAT with program 0 -> NIT PID 0x0020 instead of the usual 0x0010.
+        let pat = section(
+            0x00,
+            0x7FE0,
+            vec![
+                0x00, 0x00, 0xE0, 0x20, // program 0 -> NIT PID 0x020
+                0x04, 0x08, 0xE1, 0xF0, // program 0x0408 -> PMT PID 0x1F0
+            ],
+        );
+
+        let mut parser = SiParser::new();
+        parser.push_packets(&section_packet(PAT_PID, &pat));
+        assert!(parser.assembler.is_interested(0x0020));
+
+        // A NIT on that PID now parses.
+        let events = parser.push_packets(&section_packets(0x0020, &nit_section(), 0));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SiEvent::Nit(_)));
+        assert_eq!(parser.network_id(), Some(0x7FE0));
     }
 
     #[test]

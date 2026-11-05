@@ -5,7 +5,7 @@
 //! The stream is built programmatically, both 188- and 204-framed, with null
 //! packets interleaved and the SDT split over several packets.
 
-use unituner::services::{ServiceItemId, ServiceTable};
+use unituner::services::{ServiceItemId, ServiceRecord, ServiceTable};
 use unituner::si::{crc32_mpeg2, SiEvent, SiParser};
 use unituner::tsframe::{TsNormalizer, TS_PACKET_SIZE, TS_PACKET_SIZE_204};
 
@@ -201,18 +201,20 @@ fn to_204(stream: &[u8]) -> Vec<u8> {
 
 /// Minimal scan sink for the test: folds SI events into a [`ServiceTable`].
 ///
-/// This mirrors what the phase 7 scanner will do. Two orderings matter and are
-/// handled here: a PAT carries no network id (only a network PID), so services
-/// are keyed by the SDT's `original_network_id`; and the NIT's remote-control
-/// key id may arrive before or after the SDT it applies to.
+/// This mirrors what the phase 7 scanner will do and uses only the table's own
+/// API — no shadow maps. `ServiceTable::upsert` merges, so SDT-before-NIT and
+/// NIT-before-PAT both come out complete; `set_remote_control_key_id` and
+/// `set_pmt_pid` update one field under a single write lock.
+///
+/// A batch of events is applied in a fixed order (SDT first, then NIT, then
+/// PAT) so that the record-creating table runs before the tables that only
+/// enrich it, regardless of the order the sections physically arrived in. A
+/// real scanner re-applies every few hundred milliseconds anyway; the ordering
+/// just makes a single pass sufficient here.
 #[derive(Default)]
 struct ScanSink {
     table: ServiceTable,
     channel: Option<(String, String)>,
-    /// PMT PID per service id, learned from the PAT.
-    pmt_pids: std::collections::HashMap<u16, u16>,
-    /// Remote-control key id per network id, learned from the NIT.
-    key_ids: std::collections::HashMap<u16, u8>,
 }
 
 impl ScanSink {
@@ -223,41 +225,62 @@ impl ScanSink {
         }
     }
 
-    fn apply(&mut self, event: &SiEvent) {
-        match event {
-            SiEvent::Pat(pat) => {
-                for (service_id, pmt_pid) in &pat.programs {
-                    self.pmt_pids.insert(*service_id, *pmt_pid);
+    fn channel_ref(&self) -> Option<(&str, &str)> {
+        self.channel
+            .as_ref()
+            .map(|(channel_type, channel)| (channel_type.as_str(), channel.as_str()))
+    }
+
+    fn apply_all(&mut self, events: &[SiEvent]) {
+        // 1. SDT creates/updates the records and binds them to the channel.
+        for event in events {
+            let SiEvent::Sdt(sdt) = event else {
+                continue;
+            };
+            for (service_id, service_type, name) in &sdt.services {
+                let mut record = ServiceRecord::new(
+                    sdt.original_network_id,
+                    sdt.transport_stream_id,
+                    *service_id,
+                    *service_type,
+                    name.clone(),
+                );
+                record.channel.clone_from(&self.channel);
+                self.table.upsert(record);
+            }
+        }
+
+        // 2. NIT supplies the remote-control key id for its whole network.
+        for event in events {
+            let SiEvent::Nit(nit) = event else {
+                continue;
+            };
+            let Some(key_id) = nit.remote_control_key_id else {
+                continue;
+            };
+            for record in self.table.list() {
+                if record.network_id == nit.network_id {
+                    self.table
+                        .set_remote_control_key_id(record.item_id(), key_id);
                 }
             }
-            SiEvent::Pmt(_) => {}
-            SiEvent::Nit(nit) => {
-                if let Some(key_id) = nit.remote_control_key_id {
-                    self.key_ids.insert(nit.network_id, key_id);
-                }
-                for record in self.table.list() {
-                    let Some(key_id) = self.key_ids.get(&record.network_id).copied() else {
-                        continue;
-                    };
-                    let mut updated = record;
-                    updated.remote_control_key_id = Some(key_id);
-                    self.table.upsert(updated);
-                }
-            }
-            SiEvent::Sdt(sdt) => {
-                for (service_id, service_type, name) in &sdt.services {
-                    let mut record = unituner::services::ServiceRecord::new(
-                        sdt.original_network_id,
-                        sdt.transport_stream_id,
-                        *service_id,
-                        *service_type,
-                        name.clone(),
-                    );
-                    record.channel.clone_from(&self.channel);
-                    record.pmt_pid = self.pmt_pids.get(service_id).copied();
-                    record.remote_control_key_id =
-                        self.key_ids.get(&sdt.original_network_id).copied();
-                    self.table.upsert(record);
+        }
+
+        // 3. PAT supplies each programme's PMT PID; the channel makes the
+        //    lookup unambiguous.
+        let Some((channel_type, channel)) = self.channel_ref() else {
+            return;
+        };
+        for event in events {
+            let SiEvent::Pat(pat) = event else {
+                continue;
+            };
+            for (service_id, pmt_pid) in &pat.programs {
+                if let Ok(record) =
+                    self.table
+                        .resolve_on_channel(channel_type, channel, *service_id)
+                {
+                    self.table.set_pmt_pid(record.item_id(), *pmt_pid);
                 }
             }
         }
@@ -265,25 +288,28 @@ impl ScanSink {
 }
 
 /// Runs the whole path and returns the resulting table.
+///
+/// Events are collected across the whole stream and applied in one pass at the
+/// end: SI tables may arrive in any order relative to each other, and a PAT
+/// cannot set a PMT PID before the SDT has created the record it belongs to.
+/// This is what a periodic re-scan does too (apply the accumulated state, not
+/// each section in isolation).
 fn scan(framed: &[u8], chunk: usize, channel: (&str, &str)) -> (ServiceTable, u64, TsNormalizer) {
     let mut normalizer = TsNormalizer::new();
     let mut parser = SiParser::new();
     let mut sink = ScanSink::new(channel);
-    let mut events = 0u64;
+    let mut events = Vec::new();
 
     for piece in framed.chunks(chunk) {
         let packets = normalizer.push(piece);
-        for event in parser.push_packets(&packets) {
-            events += 1;
-            sink.apply(&event);
-        }
+        events.extend(parser.push_packets(&packets));
     }
     let packets = normalizer.finish();
-    for event in parser.push_packets(&packets) {
-        events += 1;
-        sink.apply(&event);
-    }
-    (sink.table, events, normalizer)
+    events.extend(parser.push_packets(&packets));
+
+    let count = events.len() as u64;
+    sink.apply_all(&events);
+    (sink.table, count, normalizer)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +466,11 @@ fn pat_and_pmt_agree_on_the_programme_and_pids() {
     };
     assert_eq!(pat.transport_stream_id, TSID);
     assert_eq!(pat.programs, vec![(SERVICE_ID, PMT_PID)]);
+    assert_eq!(pat.network_pid, Some(NIT_PID));
+    assert_eq!(pat.version_number, 0);
+    assert!(pat.current_next);
+    assert_eq!(pat.section_number, 0);
+    assert_eq!(pat.last_section_number, 0);
 
     let events = parser.push_packets(&section_packets(PMT_PID, &pmt_section(), 0));
     let pmt = match &events[0] {
@@ -449,4 +480,140 @@ fn pat_and_pmt_agree_on_the_programme_and_pids() {
     assert_eq!(pmt.program_number, SERVICE_ID);
     assert_eq!(pmt.pcr_pid, 0x1F1);
     assert_eq!(pmt.streams, vec![(0x1B, 0x1F1), (0x0F, 0x1F2)]);
+}
+
+#[test]
+fn a_204_stream_whose_parity_byte_is_0x47_is_not_read_as_188() {
+    // The first packet's parity tail starts with 0x47, i.e. a false sync at the
+    // 188 stride. A naive detector decides 188 on the tie and every following
+    // packet is misaligned; the fixed one waits for the 204 lead.
+    let stream = transport_stream();
+    let mut framed: Vec<u8> = stream
+        .chunks_exact(TS_PACKET_SIZE)
+        .enumerate()
+        .flat_map(|(index, packet)| {
+            let mut framed = packet.to_vec();
+            framed.extend_from_slice(&[0xA5; 16]);
+            // Only the very first tail is 0x47: later ones must not extend the
+            // false 188 chain past the detection window.
+            if index == 0 {
+                framed[TS_PACKET_SIZE] = 0x47;
+            }
+            framed
+        })
+        .collect();
+    assert_eq!(framed[TS_PACKET_SIZE], 0x47);
+    // Feeding in 188-byte chunks makes the tie appear after ~2 packets, which
+    // is exactly the state the bug froze.
+    let (table, _, normalizer) = scan(&framed, TS_PACKET_SIZE, ("GR", "27"));
+    assert_eq!(
+        normalizer.framing(),
+        Some(unituner::tsframe::Framing::Ts204),
+        "the 0x47 parity byte must not lock in 188 framing"
+    );
+    assert_eq!(normalizer.bytes_discarded, 0);
+    assert_eq!(normalizer.sync_errors, 0);
+    let record = table
+        .get(ServiceItemId::new(NETWORK_ID, SERVICE_ID))
+        .expect("the service must be in the table");
+    assert_eq!(record.name, SERVICE_NAME);
+    assert_eq!(record.pmt_pid, Some(PMT_PID));
+    framed.clear();
+}
+
+#[test]
+fn the_same_service_on_two_channels_coexists_and_resolves_per_channel() {
+    let stream = transport_stream();
+    let (gr, _, _) = scan(&stream, 4096, ("GR", "27"));
+    // The second channel gets its own table, as a per-channel scan would.
+    let (catv, _, _) = scan(&stream, 4096, ("CABLE_CATV", "C17"));
+
+    // Merge both into one table, the way a whole-server scan would.
+    let table = ServiceTable::new();
+    for record in gr.list().into_iter().chain(catv.list()) {
+        table.upsert(record);
+    }
+
+    let id = ServiceItemId::new(NETWORK_ID, SERVICE_ID);
+    assert_eq!(table.len(), 2, "both channels must be kept");
+    assert_eq!(table.get_all(id).len(), 2);
+    assert_eq!(
+        table
+            .get_on_channel("GR", "27", id)
+            .expect("GR record")
+            .channel,
+        Some(("GR".to_owned(), "27".to_owned()))
+    );
+    assert_eq!(
+        table
+            .get_on_channel("CABLE_CATV", "C17", id)
+            .expect("CATV record")
+            .channel,
+        Some(("CABLE_CATV".to_owned(), "C17".to_owned()))
+    );
+    assert_eq!(table.list_by_channel("GR", "27").len(), 1);
+    assert_eq!(table.list_by_channel("CABLE_CATV", "C17").len(), 1);
+
+    // A channel-less lookup cannot pick one, but a channel-scoped one can.
+    assert!(matches!(
+        table.get_by_sid(SERVICE_ID),
+        Err(unituner::services::SidLookupError::Ambiguous(_))
+    ));
+    assert_eq!(
+        table
+            .resolve_on_channel("GR", "27", SERVICE_ID)
+            .expect("resolves on the channel")
+            .channel,
+        Some(("GR".to_owned(), "27".to_owned()))
+    );
+    assert_eq!(
+        table
+            .resolve_raw_on_channel("CABLE_CATV", "C17", &id.to_string())
+            .expect("resolves by item id on the channel")
+            .channel,
+        Some(("CABLE_CATV".to_owned(), "C17".to_owned()))
+    );
+
+    // Refreshing one channel leaves the other alone.
+    assert_eq!(table.remove_channel("GR", "27"), 1);
+    assert_eq!(table.len(), 1);
+    assert!(table.get_on_channel("GR", "27", id).is_none());
+    assert!(table.get_on_channel("CABLE_CATV", "C17", id).is_some());
+}
+
+#[test]
+fn sdt_and_nit_arriving_in_either_order_both_keep_the_key_id() {
+    // NIT first, then SDT: the SDT's record must not lose the key id.
+    let table = ServiceTable::new();
+    let mut nit = ServiceRecord::new(NETWORK_ID, TSID, SERVICE_ID, 0, "");
+    nit.remote_control_key_id = Some(REMOTE_CONTROL_KEY_ID);
+    nit.channel = Some(("GR".to_owned(), "27".to_owned()));
+    table.upsert(nit);
+
+    let mut sdt = ServiceRecord::new(NETWORK_ID, TSID, SERVICE_ID, SERVICE_TYPE, SERVICE_NAME);
+    sdt.channel = Some(("GR".to_owned(), "27".to_owned()));
+    table.upsert(sdt);
+
+    let stored = table
+        .get(ServiceItemId::new(NETWORK_ID, SERVICE_ID))
+        .expect("record");
+    assert_eq!(stored.name, SERVICE_NAME);
+    assert_eq!(stored.service_type, SERVICE_TYPE);
+    assert_eq!(stored.remote_control_key_id, Some(REMOTE_CONTROL_KEY_ID));
+
+    // And SDT first, NIT second: the NIT's key id lands on the existing record.
+    table.clear();
+    let mut sdt = ServiceRecord::new(NETWORK_ID, TSID, SERVICE_ID, SERVICE_TYPE, SERVICE_NAME);
+    sdt.channel = Some(("GR".to_owned(), "27".to_owned()));
+    table.upsert(sdt);
+    assert!(table.set_remote_control_key_id(
+        ServiceItemId::new(NETWORK_ID, SERVICE_ID),
+        REMOTE_CONTROL_KEY_ID
+    ));
+
+    let stored = table
+        .get(ServiceItemId::new(NETWORK_ID, SERVICE_ID))
+        .expect("record");
+    assert_eq!(stored.name, SERVICE_NAME);
+    assert_eq!(stored.remote_control_key_id, Some(REMOTE_CONTROL_KEY_ID));
 }
