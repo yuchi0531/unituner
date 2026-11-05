@@ -52,11 +52,14 @@ chunk_size_bytes: 65536
 
 ```yaml
 # /etc/unituner/pipelines.yml
+# Stages run as argv-spawned processes, chained stdin -> stdout.
+# Stage 1 here is the external B25 decoder (mirakurun-style install:
+#   sudo npm install arib-b25-stream-test -g --unsafe-perm).
 pipelines:
-  soft:
-    - "softcas-dec /etc/softcas/keys.json"
+  cas:
+    - "arib-b25-stream-test"
 types:
-  GR: { pipeline: soft }
+  GR: { pipeline: cas }
 ```
 
 ### Channel types and channel values

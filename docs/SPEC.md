@@ -12,7 +12,7 @@
 - 役割: recpt1 系チューナー（外部コマンド）の共有・排他制御と、mirakurun 互換 API の最小サブセット配信。
 - 扱わないもの: MMT/TLV の内部処理、EPG、ロゴ (CDT)、B-CAS/B25/C-CAS の内蔵デコード、録画/タイムシフト、HDHR/xmltv、websocket、永続化 DB、hot reload。
   - TLV は必ず pipeline 内の外部コマンドで TS 変換されてから内蔵コードに来る前提。内蔵処理は MPEG-TS のみ。
-- TS 変換・デスクランブルは全てユーザー定義 pipeline の外部コマンドに委譲する。パイプライン通過後の TS だけをサービス検出・フィルタ・配信に使う。
+- TS 変換・デスクランブルは全てユーザー定義 pipeline の外部コマンドに委譲する（デスクランブルは外部 B25 デコーダ、例: `arib-b25-stream-test`）。パイプライン通過後の TS だけをサービス検出・フィルタ・配信に使う。
 
 ## 2. 自己識別（mirakc 方式）
 
@@ -35,6 +35,9 @@ allowed_cidrs:                       # 許容 CIDR。既定は RFC1918 + loopbac
   - 127.0.0.0/8
   - 172.16.0.0/12
   - 192.168.0.0/16
+idle_timeout_secs: 5                 # 既定 5。最後の購読者が抜けてからプロセス群を kill
+subscriber_buffer_chunks: 1024       # 既定 1024。購読者ごとの bounded queue 容量（chunks）
+chunk_size_bytes: 65536              # 既定 65536。購読者へ渡す chunk サイズ（64KB）
 ```
 
 - `addr` の既定値（loopback か全インタフェースか）は実装時に確定し、本書と README に記す。
@@ -67,17 +70,21 @@ allowed_cidrs:                       # 許容 CIDR。既定は RFC1918 + loopbac
 
 ```yaml
 pipelines:
-  soft:                            # ユーザー定義名
-    - "softcas-dec /etc/softcas/keys.json"      # stdin→stdout で直列に繋がる外部コマンド
-  soft4k:
-    - "softcas-bs /etc/softcas/bs.json"
-    - "arib-common-convert ..."
-types:                               # チャンネルタイプ → pipeline バインド（ユーザー定義名）
-  GR:         { pipeline: soft }
-  BS:         { pipeline: soft4k }
-  CABLE_CATV: { pipeline: soft }
+  cas:                                # ユーザー定義名
+    - "arib-b25-stream-test"          # stdin→stdout で直列に繋がる外部コマンド（外部 B25 デコーダ）
+  cas4k:
+    - "arib-b25-stream-test"          # 4K/BS も同じ B25 デコーダを 1 段目に置く
+    - "ts-converter <args>"           # 2 段目は TS 変換（MMT/TLV → MPEG-TS 等）
+types:                                # チャンネルタイプ → pipeline バインド（ユーザー定義名）
+  GR:         { pipeline: cas }
+  BS:         { pipeline: cas4k }
+  CABLE_CATV: { pipeline: cas }
   # バインド無しのタイプ = 生 TS そのまま配信
 ```
+
+- CAS（デスクランブル）は特定実装に依存しない。B25 系のスクランブル解除は外部 B25 デコーダ
+  （例: `arib-b25-stream-test`。引数なしで stdin の TS を stdout へ流す）を pipeline の
+  1 段として置く。段数・順序はユーザー定義で、TS 変換段はその後段に置く。
 
 ### 3.5 プレースホルダとコマンド実行
 
