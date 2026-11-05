@@ -1353,6 +1353,37 @@ async fn a_scan_appends_entries_and_keeps_other_types() {
 }
 
 #[tokio::test]
+async fn a_scan_that_finds_nothing_new_does_not_rewrite_channels_yml() {
+    let (fixture, _) = scan_fixture();
+    // Exactly what the scan will produce for channel 24: same values, but with
+    // the double quotes a human (or the webui) would write. Re-serialising would
+    // only turn "24" into '24' and change the file hash.
+    let seeded = "- name: NHK General\n  type: GR\n  channel: \"24\"\n  disabled: false\n";
+    std::fs::write(fixture.path.join("channels.yml"), seeded).expect("seed channels.yml");
+    let before = fixture.channels_yml();
+    let state = fixture.state();
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(text.contains("channels.yml unchanged"), "{text}");
+    assert!(!text.contains("wrote "), "{text}");
+    assert_eq!(
+        fixture.channels_yml(),
+        before,
+        "an unchanged channel list must not be rewritten"
+    );
+}
+
+#[tokio::test]
 async fn a_running_scan_makes_the_next_one_a_409() {
     let (fixture, _) = scan_fixture();
     let state = fixture.state();

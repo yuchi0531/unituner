@@ -49,7 +49,11 @@
 //! (`Config::validate`) before it is written through a `.tmp` file plus rename,
 //! so a failed write can never truncate the live configuration. The write takes
 //! the same per-file lock as the webui save and re-reads the file inside it, so
-//! a concurrent webui save is never silently lost.
+//! a concurrent webui save is never silently lost. When the merged list is
+//! semantically identical to the file's current content (compared as parsed
+//! entries, never as bytes) nothing is written at all: re-serialising would only
+//! change YAML quoting (`"24"` → `'24'`) and therefore the file hash, which makes
+//! an unchanged configuration look edited.
 //!
 //! `dryRun=true` skips both the write and the service-table update: it only
 //! prints what a real scan would do.
@@ -583,7 +587,7 @@ pub async fn run_scan(
             ))
             .await;
     } else {
-        let entries = write_channels(
+        let (entries, written) = write_channels(
             config,
             config_dir,
             query,
@@ -591,14 +595,26 @@ pub async fn run_scan(
             &families,
             found_entries,
         )?;
-        lines
-            .push(format!(
-                "\nwrote {} entries to {} ({} channels scanned).\n",
-                entries.len(),
-                config_dir.join("channels.yml").display(),
-                scanned_channels
-            ))
-            .await;
+        if written {
+            lines
+                .push(format!(
+                    "\nwrote {} entries to {} ({} channels scanned).\n",
+                    entries.len(),
+                    config_dir.join("channels.yml").display(),
+                    scanned_channels
+                ))
+                .await;
+        } else {
+            // Semantically identical: rewriting only changes YAML quoting and
+            // the file hash, and a hash change would look like a config edit.
+            lines
+                .push(format!(
+                    "\nchannels.yml unchanged: {} entries ({} channels scanned), nothing written.\n",
+                    entries.len(),
+                    scanned_channels
+                ))
+                .await;
+        }
     }
     lines
         .push("**RESTART REQUIRED** to apply changes.\n".to_string())
@@ -1272,7 +1288,8 @@ fn upsert_startup_services(
 }
 
 /// Validates the merged channel list with the startup rules and writes it
-/// atomically (SPEC §3.6, §8.1).
+/// atomically (SPEC §3.6, §8.1), returning the merged entries and whether the
+/// file was written.
 ///
 /// The write takes the same per-file lock as a webui save and re-reads
 /// `channels.yml` **inside** it: a save that landed while the scan was tuning
@@ -1280,6 +1297,12 @@ fn upsert_startup_services(
 /// The re-read is merged exactly like the initial one, so the scan's own result
 /// still replaces what it produced and everything else (including the webui's
 /// change) survives.
+///
+/// When the merged list is *semantically* identical to the file's current
+/// content, nothing is written: re-serialising would only change YAML quoting
+/// (`"24"` → `'24'`), which changes the file hash and makes an unchanged
+/// configuration look edited. The comparison is on parsed
+/// [`ChannelEntry`] values, never on bytes.
 fn write_channels(
     config: &Config,
     config_dir: &Path,
@@ -1287,10 +1310,13 @@ fn write_channels(
     rescanned: &HashSet<String>,
     families: &HashSet<String>,
     found: Vec<ChannelEntry>,
-) -> Result<Vec<ChannelEntry>, String> {
+) -> Result<(Vec<ChannelEntry>, bool), String> {
     let _guard = store::lock(store::CHANNELS_FILE);
     let existing = read_channels(config_dir)?;
     let entries = merge(&existing, query, rescanned, families, found);
+    if entries == existing {
+        return Ok((entries, false));
+    }
 
     let mut candidate = config.clone();
     candidate.channels = entries
@@ -1320,7 +1346,7 @@ fn write_channels(
     let path = config_dir.join("channels.yml");
     let tmp = temp_path(config_dir);
     write_atomically(&path, &tmp, yaml.as_bytes())?;
-    Ok(entries)
+    Ok((entries, true))
 }
 
 /// The temporary sibling used for the atomic rename.
@@ -1744,7 +1770,7 @@ mod tests {
             channel: "28".to_string(),
             disabled: false,
         }];
-        let written = write_channels(
+        let (written, did_write) = write_channels(
             &config,
             dir.path(),
             &query,
@@ -1753,6 +1779,7 @@ mod tests {
             found,
         )
         .expect("write");
+        assert!(did_write, "a new entry must be written");
         let channels: HashSet<String> = written.iter().map(|entry| entry.channel.clone()).collect();
         assert!(channels.contains("27"), "the scan's own entry is kept");
         assert!(channels.contains("28"), "the new entry is appended");
@@ -1760,6 +1787,118 @@ mod tests {
             channels.contains("40"),
             "the concurrent webui save must survive: {channels:?}"
         );
+    }
+
+    #[test]
+    fn an_unchanged_channel_list_is_not_rewritten() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, body) in [
+            ("server.yml", "addr: \":0\"\n".to_string()),
+            (
+                "tuners.yml",
+                "- name: t0\n  types: [GR]\n  command: 'true'\n".to_string(),
+            ),
+            // A channel the scan will find again, with the quoting a user wrote.
+            (
+                "channels.yml",
+                "- name: NHK\n  type: GR\n  channel: \"24\"\n  disabled: false\n".to_string(),
+            ),
+            (
+                "pipelines.yml",
+                "pipelines:\n  pass:\n    - \"cat\"\ntypes:\n  GR: { pipeline: pass }\n"
+                    .to_string(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write config");
+        }
+        let config = Config::load(dir.path()).expect("config loads");
+        let path = dir.path().join("channels.yml");
+        let before = std::fs::read_to_string(&path).expect("read back");
+        let before_meta = std::fs::metadata(&path).expect("metadata");
+
+        // The scan finds exactly the entry already in the file.
+        let query = ScanQuery::from_params(&params(&[("type", "GR")])).expect("query");
+        let found = vec![ChannelEntry {
+            name: "NHK".to_string(),
+            channel_type: "GR".to_string(),
+            channel: "24".to_string(),
+            disabled: false,
+        }];
+        let (entries, written) = write_channels(
+            &config,
+            dir.path(),
+            &query,
+            &HashSet::new(),
+            &HashSet::new(),
+            found,
+        )
+        .expect("write");
+
+        assert!(
+            !written,
+            "a semantically unchanged list must not be written"
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            before,
+            "the file must stay byte-identical (quoting included)"
+        );
+        let after_meta = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(
+            before_meta.modified().ok(),
+            after_meta.modified().ok(),
+            "the file must not be rewritten at all"
+        );
+    }
+
+    #[test]
+    fn a_changed_channel_list_is_still_written() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, body) in [
+            ("server.yml", "addr: \":0\"\n".to_string()),
+            (
+                "tuners.yml",
+                "- name: t0\n  types: [GR]\n  command: 'true'\n".to_string(),
+            ),
+            (
+                "channels.yml",
+                "- name: NHK\n  type: GR\n  channel: \"24\"\n  disabled: false\n".to_string(),
+            ),
+            (
+                "pipelines.yml",
+                "pipelines:\n  pass:\n    - \"cat\"\ntypes:\n  GR: { pipeline: pass }\n"
+                    .to_string(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write config");
+        }
+        let config = Config::load(dir.path()).expect("config loads");
+        let path = dir.path().join("channels.yml");
+        let before = std::fs::read_to_string(&path).expect("read back");
+
+        let query = ScanQuery::from_params(&params(&[("type", "GR")])).expect("query");
+        let found = vec![ChannelEntry {
+            name: "New".to_string(),
+            channel_type: "GR".to_string(),
+            channel: "25".to_string(),
+            disabled: false,
+        }];
+        let (entries, written) = write_channels(
+            &config,
+            dir.path(),
+            &query,
+            &HashSet::new(),
+            &HashSet::new(),
+            found,
+        )
+        .expect("write");
+
+        assert!(written, "an added entry must be written");
+        assert_eq!(entries.len(), 2);
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_ne!(after, before);
+        assert!(after.contains("channel: '25'"), "{after}");
     }
 
     fn nit(network_id: u16, is_actual: bool, key_id: Option<u8>) -> SiEvent {
