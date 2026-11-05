@@ -918,6 +918,92 @@ async fn a_higher_priority_takes_over_the_tuner() {
 }
 
 #[tokio::test]
+async fn a_priority_takeover_succeeds_on_an_exclusive_frontend() {
+    // Models a real tuner: the frontend can only be opened once. `flock -n -x`
+    // makes the second tuner process fail immediately (no output, exit 1) while
+    // the first still holds the device, which is exactly the hardware behaviour
+    // (`Device or resource busy`) that broke spawn-first takeover.
+    let fixture = Fixture::new(
+        &tuners("true"),
+        &channels(&[("A", "24"), ("B", "25")]),
+        PIPELINE_CAT,
+    );
+    let ts24 = [packet_bytes(0x24), packet_bytes(0xA4)].concat();
+    let ts25 = [packet_bytes(0x25), packet_bytes(0xB5)].concat();
+    fixture.write_ts("24.ts", &ts24);
+    fixture.write_ts("25.ts", &ts25);
+    let lock = fixture.path.join("frontend.lock");
+    let command = format!(
+        "flock -n -x {} sh -c \"cat {}/{{channel}}.ts; sleep 30\"",
+        lock.display(),
+        fixture.path.display()
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command)).expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let held = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/24/stream"),
+    )
+    .await;
+    assert_eq!(held.status(), StatusCode::OK);
+    let mut held_body = held.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(20), held_body.frame())
+        .await
+        .expect("first chunk")
+        .expect("body")
+        .expect("frame");
+    assert_eq!(first.into_data().expect("data").to_vec(), ts24);
+
+    // The device really is exclusive: another `flock` cannot take it now.
+    let competing = std::process::Command::new("flock")
+        .args(["-n", "-x", lock.to_str().expect("utf-8 path"), "true"])
+        .status()
+        .expect("run flock");
+    assert!(!competing.success(), "the device must be held");
+
+    // Priority 1 takes over: kill-first frees the device before the spawn, so
+    // the request gets a 200 instead of 503.
+    let response = send(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/channels/GR/25/stream",
+            &[("x-mirakurun-priority", "1")],
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the takeover must succeed"
+    );
+    let mut served_body = response.into_body();
+    let served = tokio::time::timeout(Duration::from_secs(20), served_body.frame())
+        .await
+        .expect("first chunk")
+        .expect("body")
+        .expect("frame");
+    assert_eq!(served.into_data().expect("data").to_vec(), ts25);
+
+    // The victim's subscriber observes EOF rather than hanging or erroring.
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), held_body.frame())
+            .await
+            .expect("the victim's body must end");
+        match frame {
+            None => break,
+            Some(Ok(_)) => continue,
+            Some(Err(error)) => panic!("the victim's body errored instead of EOF: {error}"),
+        }
+    }
+
+    drop(served_body);
+}
+
+#[tokio::test]
 async fn pinning_an_unknown_tuner_is_400_on_every_stream_route() {
     let (fixture, _, services) = service_fixture();
     let state = fixture.state_with(services);

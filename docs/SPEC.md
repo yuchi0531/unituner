@@ -173,7 +173,7 @@ types:                                # チャンネルタイプ → pipeline �
 
 - **原子的 pick-and-spawn**: pick→reserve→spawn は単一ロッカー（登録レジストリ）で原子化し、同時 spawn や二重 kill を防ぐ。「Starting」状態を導入して、pick されたチューナーは他要求から不可視にする。
 - **0-user セッションの再利用**: idle 期間中の 0-user セッションについて、同 `(type, channel)` なら再利用する。別 channel なら kill + 再起動する（SIGTERM の-latency が発生する点は仕様として記録）。
-- **奪取の順序**: spawn が完了し readiness（最初の TS 到達）を確認した**後に** victim を kill 確定する。spawn 失敗したら victim を無駄に kill しない。
+- **奪取の順序（kill-first）**: チューナーの frontend は排他デバイスであり、victim が保持している間は代替プロセスが `open()` できない（実機では `Device or resource busy` で spawn が失敗し、victim は生きたまま 503 になる）。したがって奪取決定後は **victim を先に kill する**：victim をレジストリから外して購読者に EOF を返し、SIGTERM → 猶予 → SIGKILL でプロセスグループを止め、**プロセスグループが消えてデバイスが解放されたことを確認してから**代替を spawn する。spawn 失敗時は victim を kill 済みのため 503 となり、そのチャンネルは次回要求まで停止する（この tradeoff は仕様として許容する）。応答の readiness gate（最初の TS パケットまで 200 を返さない）は維持する。victim 選択後に他要求が victim へ参加した場合は、レジストリロック下での再検査で奪取を中止し victim のストリームを維持する。
 - **終了**: SIGTERM を送信し、プロセスグループが退出するまで待つ。猶予は 2 秒。固定 wait ではなく退出確認で行い、猶予を超えたら SIGKILL する。
 - **unpinned 起動失敗時は次候補 tuner を試す** fall-through を既定 ON とする（broken tuner が pool 全体を落とさないため）。
 - **奪取の kill 対象**: victim セッションの全ユーザーが切断される。

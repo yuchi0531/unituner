@@ -37,31 +37,34 @@
 //! the spawn itself runs outside the lock. The placeholder is what concurrent
 //! requests wait on, which keeps every `await` out of the critical section.
 //!
-//! A victim with subscribers is **never** killed before the replacement has
-//! produced its first TS data (SPEC §6.2). The replacement is spawned first,
-//! its first chunk is awaited, and only then is the victim removed from the
-//! registry, its broadcast closed (all its subscribers see EOF) and its process
-//! tree stopped. The tradeoff is explicit: during that window both process
-//! trees are started on the same device. If the device is exclusive and the
-//! second `open()` fails, the spawn fails, the victim is left untouched and the
-//! request gets a 503-equivalent error. That is the order SPEC §6.2 requires.
+//! A takeover is **kill-first**. A tuner frontend is an exclusive device: the
+//! replacement cannot `open()` it while the victim still holds it, so the
+//! documented "spawn first, kill after readiness" order cannot work on real
+//! hardware (the spawn fails with `Device or resource busy` and the victim is
+//! left untouched, i.e. the takeover path is dead). Instead, as soon as
+//! [`select`] has chosen a victim and reserved the tuner, the victim is removed
+//! from the registry (its subscribers see EOF), its process tree is stopped with
+//! the SPEC §6.2 SIGTERM → grace → SIGKILL sequence, and the takeover path
+//! returns only after the process group is gone, i.e. after the device is
+//! released. Only then is the replacement spawned.
 //!
-//! A 0-user (idle) victim is the documented exception: it has no stream to
-//! protect and its device may still be held, so it is retired *before* the
-//! spawn — SPEC §6.2 explicitly accepts the SIGTERM latency of "kill +
-//! restart" for a different channel. The takeover is logged with the old and
-//! new priority either way. The emptiness check is repeated **under the
-//! registry lock** immediately before the retirement: a request that passed
-//! its own selection earlier can have attached in between, in which case the
-//! takeover falls back to the spawn-first-then-kill order instead of cutting
-//! that stream after the retirement. [`attach`] also refuses a session whose
-//! takeover flag is set, so no new request can attach to a session that is
-//! about to be replaced.
+//! The tradeoff is explicit and accepted (SPEC §6.2): a spawn failure **after**
+//! the kill returns 503 and leaves the channel down until a later request
+//! succeeds. The readiness gate for the *response* is unchanged — no 200 is sent
+//! before the replacement's first TS packet — so a client never sees an empty
+//! 200.
 //!
-//! A retiring session keeps its registry slot (phase `Stopping`) until its
-//! process group has exited, so the tuner is not reported free — and no new
-//! spawn can be placed on a device that is still held — while the old tree is
-//! dying.
+//! The takeover decision is re-checked under the registry lock immediately
+//! before the kill: a request that passed its own selection earlier can have
+//! attached in between, in which case the takeover is abandoned and the victim
+//! keeps running. [`attach`] also refuses a session whose takeover flag is set,
+//! so no new request can attach to a session that is about to be replaced.
+//!
+//! A retiring session keeps its previous registry slot semantics (`Stopping`)
+//! until its process group has exited for the paths that unregister later
+//! (`idle`, `release_session`); on the takeover path the slot is removed and the
+//! new reservation already holds the same tuner, so the tuner is never reported
+//! free while the old tree is dying.
 //!
 //! # Raw vs filtered
 //!
@@ -448,18 +451,30 @@ impl PipelineMode {
 struct ProcessTree {
     tuner: TunerProcess,
     pipeline: Option<PipelineHandle>,
+    /// The tree has been stopped; a later stop is a no-op instead of signalling
+    /// PIDs that may since have been reused.
+    stopped: AtomicBool,
 }
 
 impl ProcessTree {
     /// Stops both halves concurrently; stopping the whole tree takes at most
     /// one grace period.
+    ///
+    /// Idempotent: a later stop returns at once, so a PIDs-that-may-be-reused
+    /// second pass cannot happen. The flag is set only *after* the stop
+    /// completed, so a cancelled caller (a dropped request future) leaves the
+    /// tree stoppable by the next caller instead of leaking it.
     async fn stop(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let pipeline = async {
             if let Some(pipeline) = &self.pipeline {
                 pipeline.stop().await;
             }
         };
         tokio::join!(self.tuner.stop(), pipeline);
+        self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -640,8 +655,14 @@ impl Session {
     }
 
     async fn stop_process(&self) {
-        let tree = self.process.lock().await.take();
-        if let Some(tree) = tree {
+        // The tree is stopped **in place** under the lock, not taken out of it:
+        // a second caller (the pump's `stream_ended`, a takeover, shutdown) then
+        // waits for the same stop to finish instead of returning while the old
+        // process group still holds the device. `kill_all` is idempotent, so the
+        // later caller's own pass is a no-op that returns as soon as the group is
+        // gone.
+        let slot = self.process.lock().await;
+        if let Some(tree) = slot.as_ref() {
             tree.stop().await;
         }
     }
@@ -1190,6 +1211,20 @@ enum SpawnFailure {
     Aborted(AcquireError),
 }
 
+/// What the registry re-check decided about a selected victim, just before the
+/// kill.
+enum Takeover {
+    /// The victim is still registered and may be preempted: kill it now.
+    Kill,
+    /// A subscriber attached to the victim after it was selected, and the
+    /// request may not preempt it: leave the victim alone.
+    Abandon,
+    /// Another request already resolved this victim's takeover: leave it alone.
+    Busy,
+    /// The victim is no longer registered (it ended or was already retired).
+    Gone,
+}
+
 /// SPEC §6.1: may `requester` take over a session whose highest subscriber
 /// priority is `victim_max`?
 fn can_grab(requester: i32, victim_max: i32) -> bool {
@@ -1522,11 +1557,13 @@ fn join(
     Some(subscription)
 }
 
-/// Spawns the tree for a reservation, waits for readiness, promotes it to
-/// `Ready`, and only then stops the victim (SPEC §6.2).
+/// Spawns the tree for a reservation, waits for readiness and promotes it.
 ///
-/// `session` is the reservation created by [`select`]; the session id is fixed
-/// for the whole lifetime of the process tree.
+/// A takeover is **kill-first** (SPEC §6.2): the victim is unregistered and its
+/// process tree stopped — and waited for, so the exclusive device is released —
+/// *before* the replacement is spawned. `session` is the reservation created by
+/// [`select`]; the session id is fixed for the whole lifetime of the process
+/// tree.
 async fn spawn_and_promote(
     inner: &Arc<Inner>,
     session: Arc<Session>,
@@ -1541,78 +1578,101 @@ async fn spawn_and_promote(
     );
     let _guard = SpawnGuard::new(inner);
 
-    // SPEC §6.2: a 0-user (idle) session is killed before the restart, because
-    // there is no stream to protect and an exclusive device must be released
-    // before the replacement can open it. A session with subscribers keeps the
-    // spawn-first ordering below.
+    // SPEC §6.2: kill-first. A tuner frontend is an exclusive device, so the
+    // replacement cannot open it while the victim still holds it. The victim is
+    // re-checked and unregistered under the registry lock, then its tree is
+    // stopped and waited for; only when the process group is gone is the device
+    // free and the replacement may spawn.
     //
-    // The idle decision is re-made under the registry lock: a request that
-    // passed `select` earlier can have attached in the meantime, and retiring
-    // such a session would cut its stream after `[`RELEASE_TIMEOUT`]`'s grace.
-    let retired = match victim.as_ref() {
-        Some(victim) => {
-            let retire = {
-                // Holding the registry lock is what makes the re-check race-free:
-                // `attach` takes the same lock to add a subscriber.
-                let state = lock(&inner.state);
-                let registered = state
-                    .sessions
-                    .get(&victim.key)
-                    .is_some_and(|registered| Arc::ptr_eq(registered, victim));
-                let still_idle = registered
-                    && victim.users_is_empty()
-                    && victim.takeover_pending.load(Ordering::SeqCst);
-                if still_idle {
-                    // Keep the slot as a `Stopping` reservation (see
-                    // `TunerStatus::is_free`): the device is not free until the
-                    // process group is gone.
+    // The re-check matters: a request that passed `select` earlier can have
+    // attached to the victim in the meantime (the takeover flag keeps new
+    // attaches out, but a racing one may have won). In that case the takeover is
+    // no longer legal and the victim keeps running.
+    if let Some(victim) = victim.as_ref() {
+        let decision = {
+            let mut state = lock(&inner.state);
+            let registered = state
+                .sessions
+                .get(&victim.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, victim));
+            if !registered {
+                Takeover::Gone
+            } else if !victim.takeover_pending.load(Ordering::SeqCst) {
+                // Another request already resolved this victim's takeover. Its
+                // users may still be streaming, so neither cut the stream nor
+                // spawn onto a device another request is still deciding about.
+                Takeover::Busy
+            } else {
+                let allowed = match victim.max_priority() {
+                    // A user attached after `select` chose this victim: the
+                    // takeover must still be legal for the *current* users
+                    // (SPEC §6.1), otherwise it is abandoned and they keep their
+                    // stream.
+                    Some(victim_max) => can_grab(user.priority, victim_max),
+                    // Still idle: `select` already decided that this request may
+                    // reuse it (a labelled scan may retire an idle session even
+                    // at its negative priority).
+                    None => true,
+                };
+                if allowed {
+                    // Remove the victim atomically, so no request can join a
+                    // stream that is about to be cut. The new reservation holds
+                    // the same tuner, so it is never reported free.
+                    state.sessions.remove(&victim.key);
+                    victim.takeover_pending.store(false, Ordering::SeqCst);
                     victim.set_phase(SessionPhase::Stopping);
+                    Takeover::Kill
+                } else {
+                    Takeover::Abandon
                 }
-                still_idle
-            };
-            if retire {
+            }
+        };
+        match decision {
+            Takeover::Kill => {
+                let victim_max = victim.max_priority();
                 tracing::info!(
+                    session_id = session.id,
                     victim_session = victim.id,
                     victim_tuner = %victim.key.tuner,
-                    victim_priority = victim.max_priority(),
+                    victim_priority = victim_max,
                     new_priority = user.priority,
-                    "reusing an idle tuner session for another channel"
+                    "taking over tuner (stopping the victim before the spawn)"
                 );
+                // Closing the broadcast ends the victim's subscribers (EOF) as
+                // soon as the pump exits; stopping the tree then releases the
+                // device this spawn needs.
                 victim.close_broadcast();
                 victim.stop_process().await;
-                unregister_stopped(inner, victim);
-                true
-            } else {
-                // A user appeared: the idle exception no longer applies. The
-                // takeover must still be legal for the *current* users (SPEC
-                // §6.1), otherwise it is abandoned and the victim keeps running.
-                let allowed = match victim.max_priority() {
-                    Some(victim_max) => can_grab(user.priority, victim_max),
-                    None => user.priority >= 0,
-                };
-                if !allowed {
-                    tracing::info!(
-                        session_id = session.id,
-                        victim_session = victim.id,
-                        victim_priority = victim.max_priority(),
-                        new_priority = user.priority,
-                        "takeover abandoned: a subscriber joined the victim"
-                    );
-                    release_reservation(inner, &session, Some(victim));
-                    return Err(SpawnFailure::Aborted(AcquireError::Busy));
-                }
-                false
+                // Wake waiters so they re-select instead of sleeping out their
+                // poll interval.
+                victim.wake();
+            }
+            Takeover::Abandon | Takeover::Busy => {
+                tracing::info!(
+                    session_id = session.id,
+                    victim_session = victim.id,
+                    victim_priority = victim.max_priority(),
+                    new_priority = user.priority,
+                    "takeover abandoned: the victim changed before the kill"
+                );
+                release_reservation(inner, &session, Some(victim));
+                return Err(SpawnFailure::Aborted(AcquireError::Busy));
+            }
+            Takeover::Gone => {
+                // The victim was already unregistered (its stream ended or another
+                // request retired it). Its process tree may still be releasing the
+                // device, so wait for that stop to finish before spawning:
+                // `stop_process` serialises on the session's process lock.
+                victim.stop_process().await;
             }
         }
-        None => false,
-    };
-    let victim_stopped_early = retired;
+    }
 
     let readiness = match start_process_tree(inner, &session, &label).await {
         Ok(readiness) => readiness,
         Err(error) => {
             tracing::warn!(session_id = session.id, %label, %error, "spawn failed");
-            release_reservation(inner, &session, victim.as_ref());
+            release_reservation(inner, &session, None);
             return Err(SpawnFailure::Failed { tuner: tuner_name });
         }
     };
@@ -1635,13 +1695,13 @@ async fn spawn_and_promote(
         Readiness::ShuttingDown => {
             tracing::debug!(session_id = session.id, %label, "shutdown during readiness");
             session.stop_process().await;
-            release_reservation(inner, &session, victim.as_ref());
+            release_reservation(inner, &session, None);
             return Err(SpawnFailure::ShuttingDown);
         }
     };
     if !ready {
         session.stop_process().await;
-        release_reservation(inner, &session, victim.as_ref());
+        release_reservation(inner, &session, None);
         return Err(SpawnFailure::Failed { tuner: tuner_name });
     }
 
@@ -1688,23 +1748,6 @@ async fn spawn_and_promote(
                         session.set_phase(SessionPhase::Failed);
                         session.close_broadcast();
                     }
-                    if let Some(victim) = &victim {
-                        if !victim_stopped_early {
-                            // Remove the victim atomically with the promotion
-                            // so no request can join it any more. The slot is
-                            // cleared right away: the new Ready session holds
-                            // the same tuner, so the device is not "free".
-                            remove_and_stop_marking(&mut state, victim);
-                            tracing::info!(
-                                session_id = session.id,
-                                victim_session = victim.id,
-                                victim_tuner = %victim.key.tuner,
-                                victim_priority = victim.max_priority(),
-                                new_priority = user.priority,
-                                "taking over tuner"
-                            );
-                        }
-                    }
                     Ok(pump)
                 }
             }
@@ -1715,20 +1758,13 @@ async fn spawn_and_promote(
         Ok(pump) => pump,
         Err(error) => {
             session.stop_process().await;
-            release_reservation(inner, &session, victim.as_ref());
+            release_reservation(inner, &session, None);
             return Err(error);
         }
     };
 
     let (subscription, pump) = pump;
     spawn_subscriber_pump(Arc::clone(inner), Arc::clone(&session), pump);
-
-    if let Some(victim) = victim.filter(|_| !victim_stopped_early) {
-        // Readiness is confirmed, so the victim may now be killed. Closing the
-        // broadcast ends its subscribers (EOF) as soon as the pump exits.
-        victim.close_broadcast();
-        victim.stop_process().await;
-    }
     Ok(subscription)
 }
 
@@ -1765,24 +1801,6 @@ async fn await_readiness(
             }
         }
     }
-}
-
-/// Removes `victim` from the registry and marks it `Stopping` (under the state
-/// lock) so no request can join it any more.
-///
-/// A later takeover of the same time already keeps the slot until the tree is
-/// gone; the *promoted* victim keeps it too, so `is_free` does not flip while
-/// the old process group is still dying.
-fn remove_and_stop_marking(state: &mut State, victim: &Arc<Session>) {
-    if state
-        .sessions
-        .get(&victim.key)
-        .is_some_and(|registered| Arc::ptr_eq(registered, victim))
-    {
-        state.sessions.remove(&victim.key);
-    }
-    victim.takeover_pending.store(false, Ordering::SeqCst);
-    victim.set_phase(SessionPhase::Stopping);
 }
 
 /// Removes a stopped session from the registry once its process group is gone.
@@ -1938,7 +1956,11 @@ async fn start_process_tree(
 
     {
         let mut slot = session.process.lock().await;
-        *slot = Some(ProcessTree { tuner, pipeline });
+        *slot = Some(ProcessTree {
+            tuner,
+            pipeline,
+            stopped: AtomicBool::new(false),
+        });
     }
     // Close the race with `shutdown` / `release_reservation`: both set a
     // non-`Starting` phase before draining, so a tree stored after their stop
@@ -2644,6 +2666,116 @@ mod tests {
         assert_eq!(early_bytes.len() % PACKET, 0);
         assert_eq!(late_bytes.len() % PACKET, 0);
         assert_eq!(early_bytes, packets.concat()[..early_bytes.len()].to_vec());
+
+        manager.shutdown().await;
+    }
+
+    /// A tuner command that models an exclusive frontend: it takes an exclusive
+    /// `flock` and fails immediately (without output) if another process holds
+    /// it. A spawn-first takeover therefore cannot work on it; kill-first can.
+    fn exclusive_tuner_command(lock: &Path, path: &Path) -> String {
+        format!(
+            "flock -n -x {} sh -c \"cat {}; sleep 30\"",
+            lock.display(),
+            path.display()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_priority_takeover_succeeds_on_an_exclusive_device() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let lock = dir.path().join("frontend.lock");
+        let tuners = tuner_yaml("t0", &["GR"], &exclusive_tuner_command(&lock, &path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let mut victim = manager
+            .acquire("GR", "27", user("low", 0), None, true)
+            .await
+            .expect("victim acquire");
+        let victim_pids = manager.sessions_snapshot()[0].pids.clone();
+        let victim_bytes = read_at_least(&mut victim.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(victim_bytes.len(), 2 * PACKET);
+
+        // The lock is really held: a second tuner process would fail right now.
+        let competing = std::process::Command::new("flock")
+            .args(["-n", "-x", lock.to_str().expect("utf-8 path"), "true"])
+            .status()
+            .expect("run flock");
+        assert!(
+            !competing.success(),
+            "the exclusive device must be held while the victim streams"
+        );
+
+        // Kill-first: the victim is stopped (and the lock released) before the
+        // replacement spawns, so this takeover must succeed even on the
+        // exclusive device.
+        let winner = manager
+            .acquire("GR", "28", user("high", 1), None, true)
+            .await
+            .expect("takeover on an exclusive device");
+        assert_eq!(winner.channel, "28");
+        assert_eq!(manager.sessions_snapshot()[0].channel, "28");
+        for pid in victim_pids {
+            assert!(!process_exists(pid), "victim pid {pid} survived");
+        }
+
+        // The victim's subscribers see EOF.
+        let mut eof = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), victim.rx.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    eof = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(eof, "the victim's subscriber must observe EOF");
+
+        let mut winner = winner;
+        let bytes = read_at_least(&mut winner.rx, 2 * PACKET, Duration::from_secs(10)).await;
+        assert_eq!(bytes.len(), 2 * PACKET, "the winner must stream");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_priority_128_grab_also_works_on_an_exclusive_device() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let lock = dir.path().join("frontend.lock");
+        let tuners = tuner_yaml("t0", &["GR"], &exclusive_tuner_command(&lock, &path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let _victim = manager
+            .acquire("GR", "27", user("victim", GRAB_PRIORITY), None, true)
+            .await
+            .expect("victim acquire");
+
+        let winner = manager
+            .acquire("GR", "28", user("grabber", GRAB_PRIORITY), None, true)
+            .await
+            .expect("grab on an exclusive device");
+        assert_eq!(winner.channel, "28");
+        assert_eq!(manager.sessions_snapshot()[0].channel, "28");
 
         manager.shutdown().await;
     }
@@ -3619,7 +3751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_takeover_leaves_the_victim_running() {
+    async fn a_failed_takeover_spawn_leaves_the_channel_down() {
         let dir = TempDir::new().expect("tempdir");
         let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
         let marker = dir.path().join("fail-now");
@@ -3658,14 +3790,32 @@ mod tests {
             .expect_err("spawn fails during takeover");
         assert_eq!(error, AcquireError::Unavailable);
 
-        // SPEC §6.2: a failed spawn must not kill the victim.
+        // SPEC §6.2's accepted tradeoff: kill-first means the victim is already
+        // gone when the replacement fails to spawn, so the tuner is down (503)
+        // until a later request succeeds. The victim's subscribers see EOF.
         let sessions = manager.sessions_snapshot();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].channel, "27");
-        assert_eq!(sessions[0].pids, victim_pids);
+        assert!(
+            sessions.is_empty(),
+            "the failed takeover must not resurrect the victim: {sessions:?}"
+        );
         for pid in &victim_pids {
-            assert!(process_exists(*pid), "victim pid {pid} was killed");
+            assert!(
+                !process_exists(*pid),
+                "victim pid {pid} survived the kill-first takeover"
+            );
         }
+        let mut eof = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), victim.rx.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {
+                    eof = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(eof, "the victim's subscriber must observe EOF");
 
         manager.shutdown().await;
     }
