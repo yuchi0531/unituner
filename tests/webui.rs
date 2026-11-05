@@ -676,7 +676,7 @@ async fn restart_with_a_broken_config_is_400_and_does_not_exec() {
     let (status, _, body) = send_body(
         &state,
         counter.hook(),
-        request(Method::POST, "/webui/api/restart"),
+        json_request(Method::POST, "/webui/api/restart", serde_json::json!({})),
     )
     .await;
 
@@ -694,7 +694,7 @@ async fn restart_with_a_valid_config_runs_the_exec_hook_once() {
     let (status, _, body) = send_body(
         &state,
         counter.hook(),
-        request(Method::POST, "/webui/api/restart"),
+        json_request(Method::POST, "/webui/api/restart", serde_json::json!({})),
     )
     .await;
 
@@ -717,11 +717,156 @@ async fn an_exec_failure_is_reported_as_500() {
     let state = fixture.state();
     let webui = Webui::with_exec(|| Err("boom".to_string()));
 
-    let (status, _, body) =
-        send_body(&state, webui, request(Method::POST, "/webui/api/restart")).await;
+    let (status, _, body) = send_body(
+        &state,
+        webui,
+        json_request(Method::POST, "/webui/api/restart", serde_json::json!({})),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", text(&body));
     let value = json(&body);
     assert_eq!(value["reason"], "boom");
     assert!(value["errors"].as_array().expect("errors").is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// CSRF hardening
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mutating_requests_require_a_json_content_type() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let before = fixture.read("channels.yml");
+
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("content-type", "text/plain")
+        .body(Body::from(r#"{"channels":[]}"#))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(json(&body)["code"], 403);
+
+    // No content type at all is rejected too (a cross-site form cannot set one).
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .body(Body::from(r#"{"channels":[]}"#))
+        .expect("request");
+    let (status, _, _) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    assert_eq!(fixture.read("channels.yml"), before, "nothing was written");
+
+    // A JSON request to the same path still works.
+    let (status, _) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/channels",
+        serde_json::json!({ "channels": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_foreign_origin_is_rejected_for_mutations() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    // Same origin: the Origin host matches the Host header.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
+        .header("origin", "http://127.0.0.1:40772")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"channels":[]}"#))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    // Another origin: rejected before anything is parsed or written.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
+        .header("origin", "http://evil.example")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"channels":[]}"#))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(json(&body)["code"], 403);
+
+    // The opaque `null` origin is rejected as well.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("origin", "null")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"channels":[]}"#))
+        .expect("request");
+    let (status, _, _) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Reads are unaffected.
+    let (status, _, _) = get(&state, "/webui/api/channels").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_restart_endpoint_is_guarded_too() {
+    let fixture = Fixture::new();
+    let counter = ExecCounter::default();
+    let state = fixture.state();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/webui/api/restart")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send_body(&state, counter.hook(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(counter.count(), 0, "a guarded restart must not exec");
+}
+
+#[tokio::test]
+async fn a_failed_exec_resumes_the_manager() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let webui = Webui::with_exec(|| Err("boom".to_string()));
+
+    let (status, _, _) = send_body(
+        &state,
+        webui,
+        json_request(Method::POST, "/webui/api/restart", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    // The process was not replaced, so the manager must accept requests again
+    // instead of answering 503 `ShuttingDown` for ever. (The fixture's tuner
+    // command does not exist, so the spawn itself fails: that is a different,
+    // expected error.)
+    let error = state
+        .manager
+        .acquire(
+            "GR",
+            "27",
+            unituner::session::TunerUser::new("b", 0),
+            None,
+            true,
+        )
+        .await
+        .expect_err("the fixture tuner does not run");
+    assert_ne!(
+        error,
+        unituner::session::AcquireError::ShuttingDown,
+        "a failed exec must not leave the manager shut down"
+    );
+    state.manager.shutdown().await;
 }

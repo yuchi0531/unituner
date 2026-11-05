@@ -11,9 +11,22 @@
 //! [`SiParser`]; SDT service names and NIT remote-control key ids fill the
 //! [`ServiceTable`] and the generated `channels.yml` entries.
 //!
+//! The candidate list is capped at [`MAX_SCAN_CHANNELS`] channels per request
+//! (including the subchannel expansion and the `skipCh` list). The range is
+//! generated lazily, so progress starts with the first channel instead of after
+//! materialising a multi-billion-entry vector. A request above the cap is a 400
+//! from [`ScanQuery::from_params`].
+//!
 //! A channel that produces no signal, times out, or whose tuner is busy is
 //! skipped and the scan continues (SPEC §8.1). Each per-channel session is
 //! released before the next channel is tuned.
+//!
+//! # Cancellation
+//!
+//! A scan stops when its progress receiver goes away (the HTTP client
+//! disconnected) and when the server-wide shutdown watch fires: both are
+//! observed between channels and while waiting for SI, and neither writes
+//! `channels.yml`.
 //!
 //! # Startup scan
 //!
@@ -30,10 +43,13 @@
 //! type outside the scanned channel range) are preserved at the YAML level.
 //! With `refresh=true` an entry of the scanned type is replaced only when the
 //! scan actually read SI on that channel; a no-signal or busy channel keeps its
-//! existing entry, so a failed refresh can never delete a working channel. The
-//! merged list is validated with the same rules as startup (`Config::validate`)
-//! before it is written through a `.tmp` file plus rename, so a failed write
-//! can never truncate the live configuration.
+//! existing entry, so a failed refresh can never delete a working channel. In
+//! `Service` mode every produced per-service entry is replaced, not just the
+//! first one. The merged list is validated with the same rules as startup
+//! (`Config::validate`) before it is written through a `.tmp` file plus rename,
+//! so a failed write can never truncate the live configuration. The write takes
+//! the same per-file lock as the webui save and re-reads the file inside it, so
+//! a concurrent webui save is never silently lost.
 //!
 //! `dryRun=true` skips both the write and the service-table update: it only
 //! prints what a real scan would do.
@@ -56,9 +72,18 @@ use crate::config::{Config, ConfigError};
 use crate::services::{ServiceRecord, ServiceTable};
 use crate::session::{SessionManager, SessionTap, TunerUser, SCAN_PRIORITY};
 use crate::si::{SiEvent, SiParser};
+use crate::webui::store;
 
 /// Default per-channel scan budget (SPEC §8: "既定 timeout 10s/ch").
 pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on the channels one scan request may touch.
+///
+/// The range is user supplied; without a cap `minCh=0&maxCh=4294967295` builds
+/// a four-billion-element list (remote OOM/hang). 512 covers a full BS/CS
+/// sweep with subchannels and is small enough to stay a handful of bytes of
+/// state per candidate.
+pub const MAX_SCAN_CHANNELS: usize = 512;
 
 /// First retry delay for a startup-scan channel whose tuner was busy
 /// (SPEC §8: "相手がbusyならskip＋次回retry").
@@ -148,21 +173,60 @@ impl ScanQuery {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        Ok(Self {
+        let skip_channels = parse_list(params.get("skipCh"))?;
+        if skip_channels.len() > MAX_SCAN_CHANNELS {
+            return Err(format!(
+                "skipCh lists {} channels; at most {MAX_SCAN_CHANNELS} are allowed",
+                skip_channels.len()
+            ));
+        }
+        let min_sub_channels = parse_list(params.get("minSubCh"))?;
+        let max_sub_channels = parse_list(params.get("maxSubCh"))?;
+
+        let query = Self {
             type_name,
             min_channel,
             max_channel,
-            skip_channels: parse_list(params.get("skipCh"))?,
+            skip_channels,
             refresh,
             dry_run,
             mode,
             set_disabled_on_add,
             channel_name_format,
             use_sub_channel,
-            min_sub_channels: parse_list(params.get("minSubCh"))?,
-            max_sub_channels: parse_list(params.get("maxSubCh"))?,
+            min_sub_channels,
+            max_sub_channels,
             timeout: CHANNEL_TIMEOUT,
-        })
+        };
+        // A remote request must not build an unbounded candidate list.
+        let count = query.candidate_count();
+        if count > MAX_SCAN_CHANNELS as u64 {
+            return Err(format!(
+                "channel range covers {count} channels; at most {MAX_SCAN_CHANNELS} are allowed"
+            ));
+        }
+        Ok(query)
+    }
+
+    /// How many candidates [`candidates`] yields, without building them.
+    ///
+    /// Used to reject an oversized request before any work is done; the scan
+    /// itself walks the range lazily.
+    pub fn candidate_count(&self) -> u64 {
+        let numbers = u64::from(self.max_channel) - u64::from(self.min_channel) + 1;
+        let subs = self.subchannel_count();
+        numbers.saturating_mul(subs)
+    }
+
+    /// Number of subchannels expanded per channel number.
+    fn subchannel_count(&self) -> u64 {
+        if self.use_sub_channel || self.type_name == "BS" {
+            let min = self.min_sub_channels.first().copied().unwrap_or(0).min(1);
+            let max = self.max_sub_channels.last().copied().unwrap_or(0).max(min);
+            u64::from(max - min) + 1
+        } else {
+            1
+        }
     }
 
     /// The channel name for `number`/`sub`, per `channelNameFormat` or the
@@ -374,12 +438,16 @@ impl ChannelSink {
 /// Every line is sent as-is; the caller turns them into the `text/plain` body.
 /// Errors are reported to the caller after the progress text, which is why the
 /// signature returns the error instead of folding it into a line.
+///
+/// The scan stops early — without writing `channels.yml` — when the progress
+/// receiver goes away (the client disconnected) or when `shutdown` fires.
 pub async fn run_scan(
     manager: &SessionManager,
     config: &Config,
     config_dir: &Path,
     query: &ScanQuery,
     tx: mpsc::Sender<String>,
+    shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<(), String> {
     let existing = read_channels(config_dir)?;
     let mut lines = Lines::new(tx);
@@ -390,25 +458,32 @@ pub async fn run_scan(
         ))
         .await;
 
-    let candidates = candidates(query);
-    let total = candidates.len().max(1);
+    let total = query.candidate_count().max(1);
     let mut found_entries: Vec<ChannelEntry> = Vec::new();
     // Channels the scan actually produced results for. `refresh=true` may only
     // replace an existing entry for one of these: a no-signal or busy channel
     // must never delete a working configuration entry (SPEC §8.1).
     let mut rescanned: HashSet<String> = HashSet::new();
+    // Multiplex families of the candidates that produced `Service` entries
+    // (`BS13` for `BS13_0`, `BS13_1`, ...), so a refresh also drops entries the
+    // scan no longer produces.
+    let mut families: HashSet<String> = HashSet::new();
     // Channels whose scan produced at least one service (used to tell "no
     // signal" apart from "tuned but nothing kept").
     let mut scanned_channels = 0usize;
 
-    for (index, candidate) in candidates.iter().enumerate() {
-        let percent = (index + 1) * 100 / total;
+    for (index, candidate) in candidates(query).enumerate() {
+        if lines.is_closed() || cancelled(&shutdown) {
+            tracing::info!("channel scan cancelled");
+            return Ok(());
+        }
+        let percent = (index as u64 + 1) * 100 / total;
         lines
             .push(format!(
                 "channel: {:?} ({}/{}) [{}%] ... ",
                 candidate.channel,
                 index + 1,
-                candidates.len(),
+                total,
                 percent
             ))
             .await;
@@ -432,7 +507,19 @@ pub async fn run_scan(
             }
         }
 
-        match scan_channel(manager, &query.type_name, &candidate.channel, query.timeout).await {
+        let outcome = scan_channel_cancellable(
+            manager,
+            &query.type_name,
+            &candidate.channel,
+            query.timeout,
+            shutdown.clone(),
+        )
+        .await;
+        let Some(outcome) = outcome else {
+            tracing::info!("channel scan cancelled");
+            return Ok(());
+        };
+        match outcome {
             ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
             ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
             ChannelOutcome::Services(services) => {
@@ -447,8 +534,19 @@ pub async fn run_scan(
                     continue;
                 }
                 scanned_channels += 1;
+                let entries = entries_for(query, &existing, &candidate, &services);
+                // Record every produced channel: in `Service` mode one
+                // candidate yields several entries (`BS01_0/1/2`), and a stale
+                // sibling must be replaced too. The multiplex family covers
+                // entries the scan no longer produces (a service that
+                // disappeared); `merge` drops those on refresh.
+                for entry in &entries {
+                    rescanned.insert(entry.channel.clone());
+                }
                 rescanned.insert(candidate.channel.clone());
-                let entries = entries_for(query, &existing, candidate, &services);
+                if query.mode == ScanMode::Service {
+                    families.insert(family_of(&candidate.channel).to_string());
+                }
                 lines
                     .push(format!(
                         "Found {} channels for {}\n",
@@ -470,8 +568,14 @@ pub async fn run_scan(
         }
     }
 
-    let entries = merge(&existing, query, &rescanned, found_entries);
+    // The client may have gone away while the last channel was read.
+    if lines.is_closed() {
+        tracing::info!("channel scan cancelled before saving");
+        return Ok(());
+    }
+
     if query.dry_run {
+        let entries = merge(&existing, query, &rescanned, &families, found_entries);
         lines
             .push(format!(
                 "\ndry run: {} entries would be written, nothing saved.\n",
@@ -479,7 +583,14 @@ pub async fn run_scan(
             ))
             .await;
     } else {
-        write_channels(config, config_dir, &entries)?;
+        let entries = write_channels(
+            config,
+            config_dir,
+            query,
+            &rescanned,
+            &families,
+            found_entries,
+        )?;
         lines
             .push(format!(
                 "\nwrote {} entries to {} ({} channels scanned).\n",
@@ -495,11 +606,19 @@ pub async fn run_scan(
     Ok(())
 }
 
-/// Sends progress lines, ignoring a receiver that hung up.
+/// Whether a shutdown watch has fired (or its sender was dropped).
+fn cancelled(shutdown: &Option<watch::Receiver<bool>>) -> bool {
+    shutdown
+        .as_ref()
+        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+}
+
+/// Sends progress lines; a hung-up receiver stops the scan instead of wedging
+/// it.
 ///
-/// `push` waits for the bounded channel, so a client that reads the stream
-/// gets every line (including the final `RESTART REQUIRED`); a client that
-/// disconnects stops the waiting immediately instead of wedging the scan.
+/// `push` waits for the bounded channel, so a client that reads the stream gets
+/// every line (including the final `RESTART REQUIRED`); a client that
+/// disconnects is noticed by [`is_closed`](Self::is_closed) on the next line.
 struct Lines {
     tx: mpsc::Sender<String>,
 }
@@ -507,6 +626,11 @@ struct Lines {
 impl Lines {
     fn new(tx: mpsc::Sender<String>) -> Self {
         Self { tx }
+    }
+
+    /// Whether the HTTP client behind this progress stream has disconnected.
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 
     async fn push(&mut self, line: String) {
@@ -524,27 +648,27 @@ struct Candidate {
     channel: String,
 }
 
-/// Enumerates the channels to tune, expanding BS subchannels (SPEC §8.1).
-fn candidates(query: &ScanQuery) -> Vec<Candidate> {
-    let sub_channels: Vec<u32> = if query.use_sub_channel || query.type_name == "BS" {
+/// Enumerates the channels to tune lazily, expanding BS subchannels
+/// (SPEC §8.1).
+///
+/// `ScanQuery::from_params` already rejected a range above
+/// [`MAX_SCAN_CHANNELS`], so this iterator is bounded; it is still lazy so the
+/// first progress line is emitted before any list is built.
+fn candidates(query: &ScanQuery) -> impl Iterator<Item = Candidate> + '_ {
+    let (sub_min, sub_max) = if query.use_sub_channel || query.type_name == "BS" {
         let min = query.min_sub_channels.first().copied().unwrap_or(0).min(1);
         let max = query.max_sub_channels.last().copied().unwrap_or(0).max(min);
-        (min..=max).collect()
+        (min, max)
     } else {
-        vec![0]
+        (0, 0)
     };
-
-    let mut candidates = Vec::new();
-    for number in query.min_channel..=query.max_channel {
-        for sub in &sub_channels {
-            candidates.push(Candidate {
-                number,
-                sub: *sub,
-                channel: query.channel_name(number, *sub),
-            });
-        }
-    }
-    candidates
+    (query.min_channel..=query.max_channel).flat_map(move |number| {
+        (sub_min..=sub_max).map(move |sub| Candidate {
+            number,
+            sub,
+            channel: query.channel_name(number, sub),
+        })
+    })
 }
 
 /// Why a channel produced no entries.
@@ -560,17 +684,68 @@ pub(crate) enum ChannelOutcome {
     Services(Vec<FoundService>),
 }
 
+/// [`scan_channel`] with a shutdown watch.
+///
+/// The cancellation is observed **between reads**, never by dropping a future
+/// that is still acquiring: an interrupted `acquire` can leave a reservation
+/// behind, while a read-loop break still runs the normal "release the scan
+/// session" path. `None` means shutdown fired while the channel was being read;
+/// the caller stops without writing `channels.yml`.
+async fn scan_channel_cancellable(
+    manager: &SessionManager,
+    type_name: &str,
+    channel: &str,
+    timeout: Duration,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Option<ChannelOutcome> {
+    let Some(mut shutdown) = shutdown else {
+        return Some(scan_channel(manager, type_name, channel, timeout).await);
+    };
+    if stopped(&shutdown) {
+        return None;
+    }
+    let (outcome, cancelled) =
+        scan_channel_watched(manager, type_name, channel, timeout, Some(&mut shutdown)).await;
+    if cancelled || stopped(&shutdown) {
+        None
+    } else {
+        Some(outcome)
+    }
+}
+
+/// Whether the shutdown watch has fired (or its sender was dropped).
+fn stopped(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
 /// Tunes one channel, collects SI for at most `timeout`, and releases the scan
 /// session before returning (SPEC §8).
 ///
 /// Shared by the SPEC §8 startup scan and the SPEC §8.1 scan API so both parse
-/// SI the same way.
+/// SI the same way. The session is acquired through
+/// [`SessionManager::acquire_scan`], which may retire an idle session even at
+/// [`SCAN_PRIORITY`]; every path releases that session again before returning,
+/// so the next channel always finds the tuner.
 pub(crate) async fn scan_channel(
     manager: &SessionManager,
     type_name: &str,
     channel: &str,
     timeout: Duration,
 ) -> ChannelOutcome {
+    scan_channel_watched(manager, type_name, channel, timeout, None)
+        .await
+        .0
+}
+
+/// [`scan_channel`] with an optional shutdown watch, returning whether the read
+/// loop was cancelled.
+async fn scan_channel_watched(
+    manager: &SessionManager,
+    type_name: &str,
+    channel: &str,
+    timeout: Duration,
+    mut shutdown: Option<&mut watch::Receiver<bool>>,
+) -> (ChannelOutcome, bool) {
     // SPEC §8: scan is a plain subscriber on the shared broadcast. Joining a
     // session a user already holds is therefore correct, and it must not be
     // released afterwards.
@@ -585,36 +760,59 @@ pub(crate) async fn scan_channel(
     let deadline = Instant::now() + timeout;
     let acquired = tokio::time::timeout_at(
         deadline,
-        manager.acquire_full(type_name, channel, user, None, SessionTap::Raw, false),
+        manager.acquire_scan(type_name, channel, user, SessionTap::Raw, false),
     )
     .await;
 
     let mut subscription = match acquired {
         Err(_) => {
             tracing::debug!(channel, "scan acquire timed out");
-            return ChannelOutcome::NoSignal;
+            return (ChannelOutcome::NoSignal, false);
         }
         Ok(Err(error)) => {
             tracing::debug!(channel, %error, "scan could not acquire a tuner");
-            return match error {
-                // SPEC §8: "相手がbusyならskip＋次回retry". A busy tuner and a
-                // channel type with no tuner at all are both remembered for
-                // the next pass. A tuner whose command failed to start is
-                // `Unavailable`: retrying it forever would only spin, so it is
-                // reported like no signal.
-                crate::session::AcquireError::Busy | crate::session::AcquireError::NoTuner => {
-                    ChannelOutcome::Busy
-                }
-                _ => ChannelOutcome::NoSignal,
-            };
+            return (
+                match error {
+                    // SPEC §8: "相手がbusyならskip＋次回retry". A busy tuner and a
+                    // channel type with no tuner at all are both remembered for
+                    // the next pass. A tuner whose command failed to start is
+                    // `Unavailable`: retrying it forever would only spin, so it
+                    // is reported like no signal.
+                    crate::session::AcquireError::Busy
+                    | crate::session::AcquireError::NoTuner
+                    | crate::session::AcquireError::DecodeModeConflict => ChannelOutcome::Busy,
+                    _ => ChannelOutcome::NoSignal,
+                },
+                false,
+            );
         }
         Ok(Ok(subscription)) => subscription,
     };
 
     let mut parser = SiParser::new();
     let mut sink = ChannelSink::default();
+    let mut cancelled = false;
+    // Remembered before the subscription is dropped: it tells the release path
+    // which subscriber was ours, so a client that attached meanwhile keeps the
+    // session alive while a stale scan subscriber does not wedge it.
+    let subscriber_id = subscription.subscriber_id;
     loop {
-        let chunk = tokio::time::timeout_at(deadline, subscription.rx.recv()).await;
+        let chunk = match shutdown.as_deref_mut() {
+            Some(rx) => {
+                let watched = tokio::select! {
+                    chunk = tokio::time::timeout_at(deadline, subscription.rx.recv()) => Some(chunk),
+                    _ = rx.changed() => None,
+                };
+                match watched {
+                    Some(chunk) => chunk,
+                    None => {
+                        cancelled = true;
+                        break;
+                    }
+                }
+            }
+            None => tokio::time::timeout_at(deadline, subscription.rx.recv()).await,
+        };
         match chunk {
             Ok(Some(chunk)) => {
                 for event in parser.push_packets(&chunk) {
@@ -627,9 +825,11 @@ pub(crate) async fn scan_channel(
                         sink.finish();
                         drop(subscription);
                         if !preexisting {
-                            manager.release_session(type_name, channel).await;
+                            manager
+                                .release_session(type_name, channel, subscriber_id)
+                                .await;
                         }
-                        return ChannelOutcome::Services(sink.found);
+                        return (ChannelOutcome::Services(sink.found), cancelled);
                     }
                 }
             }
@@ -650,14 +850,17 @@ pub(crate) async fn scan_channel(
     // Release the scan session before the next channel is tuned (SPEC §8.1).
     drop(subscription);
     if !preexisting {
-        manager.release_session(type_name, channel).await;
+        manager
+            .release_session(type_name, channel, subscriber_id)
+            .await;
     }
 
-    if sink.found.is_empty() {
+    let outcome = if sink.found.is_empty() {
         ChannelOutcome::NoSignal
     } else {
         ChannelOutcome::Services(sink.found)
-    }
+    };
+    (outcome, cancelled)
 }
 
 /// Builds the entries generated for one channel (SPEC §8.1 `scanMode`).
@@ -738,8 +941,9 @@ fn entries_for(
 /// Merges the freshly found entries into the existing list (SPEC §8.1).
 ///
 /// * entries of other types are untouched;
-/// * with `refresh=true`, entries of the scanned type whose channel is one of
-///   the candidates are dropped and replaced;
+/// * with `refresh=true`, entries of the scanned type whose channel was
+///   produced by the scan are dropped and replaced, and so are entries of the
+///   scanned multiplex whose service disappeared (`families`);
 /// * without `refresh`, an existing `(type, channel)` always wins;
 /// * names stay unique (the startup validation requires it), so a colliding
 ///   name gets the channel appended.
@@ -747,6 +951,7 @@ fn merge(
     existing: &[ChannelEntry],
     query: &ScanQuery,
     rescanned: &HashSet<String>,
+    families: &HashSet<String>,
     found: Vec<ChannelEntry>,
 ) -> Vec<ChannelEntry> {
     let mut merged: Vec<ChannelEntry> = existing
@@ -754,7 +959,10 @@ fn merge(
         .filter(|entry| {
             !(query.refresh
                 && entry.channel_type == query.type_name
-                && rescanned.contains(entry.channel.as_str()))
+                && (rescanned.contains(entry.channel.as_str())
+                    || families
+                        .iter()
+                        .any(|family| in_family(family, &entry.channel))))
         })
         .cloned()
         .collect();
@@ -780,6 +988,30 @@ fn merge(
         merged.push(entry);
     }
     merged
+}
+
+/// The multiplex a candidate belongs to: its channel name with a trailing
+/// `_<digits>` subchannel suffix removed.
+///
+/// `Service` mode names every service of one multiplex after the same base
+/// (`BS01_0`, `BS01_1`, ... / `CS02_0`, `CS02_1`, ...), so a refresh can drop
+/// the entries of the whole multiplex — including services that disappeared —
+/// instead of leaving stale siblings behind.
+fn family_of(channel: &str) -> &str {
+    match channel.rsplit_once('_') {
+        Some((base, sub)) if !sub.is_empty() && sub.bytes().all(|byte| byte.is_ascii_digit()) => {
+            base
+        }
+        _ => channel,
+    }
+}
+
+/// Whether `channel` belongs to the multiplex named by `family`.
+fn in_family(family: &str, channel: &str) -> bool {
+    channel == family
+        || channel
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('_'))
 }
 
 /// Writes the found services into the shared table (SPEC §13: a scan is
@@ -974,17 +1206,21 @@ async fn scan_pass(
             break;
         }
         summary.attempted += 1;
-        // Not cancelled on the shutdown signal: dropping an `acquire` future
-        // mid-flight could leave a reservation behind. `SessionManager::shutdown`
-        // (called by the server) ends an in-flight tune within its readiness
-        // poll, so the channel returns promptly anyway.
-        let outcome = scan_channel(
+        // Cancelled between reads (never by dropping an in-flight `acquire`,
+        // which could leave a reservation behind): shutdown must not wait for a
+        // channel's whole budget, let alone `timeout × channels`.
+        let Some(outcome) = scan_channel_cancellable(
             manager,
             &channel.type_name,
             &channel.channel,
             CHANNEL_TIMEOUT,
+            Some(shutdown.clone()),
         )
-        .await;
+        .await
+        else {
+            summary.attempted -= 1;
+            break;
+        };
         match outcome {
             ChannelOutcome::Busy => {
                 summary.skipped += 1;
@@ -1037,11 +1273,25 @@ fn upsert_startup_services(
 
 /// Validates the merged channel list with the startup rules and writes it
 /// atomically (SPEC §3.6, §8.1).
+///
+/// The write takes the same per-file lock as a webui save and re-reads
+/// `channels.yml` **inside** it: a save that landed while the scan was tuning
+/// must not be silently overwritten with the copy the scan read at its start.
+/// The re-read is merged exactly like the initial one, so the scan's own result
+/// still replaces what it produced and everything else (including the webui's
+/// change) survives.
 fn write_channels(
     config: &Config,
     config_dir: &Path,
-    entries: &[ChannelEntry],
-) -> Result<(), String> {
+    query: &ScanQuery,
+    rescanned: &HashSet<String>,
+    families: &HashSet<String>,
+    found: Vec<ChannelEntry>,
+) -> Result<Vec<ChannelEntry>, String> {
+    let _guard = store::lock(store::CHANNELS_FILE);
+    let existing = read_channels(config_dir)?;
+    let entries = merge(&existing, query, rescanned, families, found);
+
     let mut candidate = config.clone();
     candidate.channels = entries
         .iter()
@@ -1069,7 +1319,8 @@ fn write_channels(
 
     let path = config_dir.join("channels.yml");
     let tmp = temp_path(config_dir);
-    write_atomically(&path, &tmp, yaml.as_bytes())
+    write_atomically(&path, &tmp, yaml.as_bytes())?;
+    Ok(entries)
 }
 
 /// The temporary sibling used for the atomic rename.
@@ -1186,10 +1437,118 @@ mod tests {
             ScanQuery::from_params(&params(&[("type", "GR"), ("minCh", "24"), ("maxCh", "26")]))
                 .expect("query");
         let names: Vec<String> = candidates(&query)
-            .into_iter()
             .map(|candidate| candidate.channel)
             .collect();
         assert_eq!(names, ["24", "25", "26"]);
+        assert_eq!(query.candidate_count(), 3);
+    }
+
+    #[test]
+    fn a_huge_range_is_rejected_before_anything_is_built() {
+        let error = ScanQuery::from_params(&params(&[
+            ("type", "GR"),
+            ("minCh", "0"),
+            ("maxCh", "4294967295"),
+        ]))
+        .expect_err("unbounded range");
+        assert!(error.contains("at most 512"), "{error}");
+
+        // A BS sweep with subchannels is counted with the expansion.
+        let error = ScanQuery::from_params(&params(&[
+            ("type", "BS"),
+            ("minCh", "1"),
+            ("maxCh", "400"),
+            ("minSubCh", "0"),
+            ("maxSubCh", "1"),
+        ]))
+        .expect_err("800 candidates");
+        assert!(error.contains("at most 512"), "{error}");
+    }
+
+    #[test]
+    fn a_range_exactly_at_the_cap_is_allowed() {
+        let query =
+            ScanQuery::from_params(&params(&[("type", "GR"), ("minCh", "0"), ("maxCh", "511")]))
+                .expect("exactly at the cap");
+        assert_eq!(query.candidate_count(), MAX_SCAN_CHANNELS as u64);
+        assert_eq!(candidates(&query).count(), MAX_SCAN_CHANNELS);
+
+        let error =
+            ScanQuery::from_params(&params(&[("type", "GR"), ("minCh", "0"), ("maxCh", "512")]))
+                .expect_err("one above the cap");
+        assert!(error.contains("513"), "{error}");
+    }
+
+    #[test]
+    fn an_oversized_skip_list_is_rejected() {
+        let list = (0..MAX_SCAN_CHANNELS + 1)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = ScanQuery::from_params(&params(&[
+            ("type", "GR"),
+            ("minCh", "13"),
+            ("maxCh", "13"),
+            ("skipCh", &list),
+        ]))
+        .expect_err("skipCh is capped too");
+        assert!(error.contains("skipCh"), "{error}");
+    }
+
+    #[test]
+    fn a_service_refresh_drops_every_sibling_of_the_multiplex() {
+        let existing = vec![
+            ChannelEntry {
+                name: "Old One".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS01_0".to_string(),
+                disabled: false,
+            },
+            ChannelEntry {
+                name: "Old Two".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS01_1".to_string(),
+                disabled: false,
+            },
+            ChannelEntry {
+                name: "Gone".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS01_2".to_string(),
+                disabled: false,
+            },
+            ChannelEntry {
+                name: "Other".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS02_0".to_string(),
+                disabled: false,
+            },
+        ];
+        let query =
+            ScanQuery::from_params(&params(&[("type", "BS"), ("refresh", "true")])).expect("query");
+        // The scan produced BS01_0 and BS01_1; BS01_2 disappeared.
+        let found = vec![
+            ChannelEntry {
+                name: "New One".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS01_0".to_string(),
+                disabled: false,
+            },
+            ChannelEntry {
+                name: "New Two".to_string(),
+                channel_type: "BS".to_string(),
+                channel: "BS01_1".to_string(),
+                disabled: false,
+            },
+        ];
+        let rescanned: HashSet<String> = ["BS01_0".to_string(), "BS01_1".to_string()]
+            .into_iter()
+            .collect();
+        let families: HashSet<String> = ["BS01".to_string()].into_iter().collect();
+        let merged = merge(&existing, &query, &rescanned, &families, found);
+        let mut channels: Vec<&str> = merged.iter().map(|entry| entry.channel.as_str()).collect();
+        channels.sort_unstable();
+        assert_eq!(channels, ["BS01_0", "BS01_1", "BS02_0"]);
+        assert!(!merged.iter().any(|entry| entry.name == "Gone"));
     }
 
     #[test]
@@ -1216,7 +1575,7 @@ mod tests {
             channel: "28".to_string(),
             disabled: false,
         }];
-        let merged = merge(&existing, &query, &rescanned, found);
+        let merged = merge(&existing, &query, &rescanned, &HashSet::new(), found);
         assert_eq!(merged.len(), 3);
         // The already configured channel is kept, the BS entry is untouched.
         assert!(merged.iter().any(|entry| entry.channel == "27"));
@@ -1249,7 +1608,7 @@ mod tests {
             channel: "27".to_string(),
             disabled: false,
         }];
-        let merged = merge(&existing, &query, &rescanned, found);
+        let merged = merge(&existing, &query, &rescanned, &HashSet::new(), found);
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|entry| entry.name == "Fresh"));
         assert!(merged.iter().any(|entry| entry.name == "Keep"));
@@ -1267,7 +1626,13 @@ mod tests {
         let query =
             ScanQuery::from_params(&params(&[("type", "GR"), ("refresh", "true")])).expect("query");
         // The scan saw no signal on 27, so nothing is rescanned.
-        let merged = merge(&existing, &query, &HashSet::new(), Vec::new());
+        let merged = merge(
+            &existing,
+            &query,
+            &HashSet::new(),
+            &HashSet::new(),
+            Vec::new(),
+        );
         assert_eq!(merged, existing);
     }
 
@@ -1286,7 +1651,7 @@ mod tests {
             channel: "28".to_string(),
             disabled: false,
         }];
-        let merged = merge(&existing, &query, &HashSet::new(), found);
+        let merged = merge(&existing, &query, &HashSet::new(), &HashSet::new(), found);
         assert_eq!(merged[1].name, "Same (28)");
     }
 
@@ -1338,6 +1703,63 @@ mod tests {
         drop(lease);
         assert!(!lock.is_running());
         assert!(lock.acquire().is_some());
+    }
+
+    #[test]
+    fn a_concurrent_save_is_not_lost_by_the_write() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, body) in [
+            ("server.yml", "addr: \":0\"\n".to_string()),
+            (
+                "tuners.yml",
+                "- name: t0\n  types: [GR]\n  command: 'true'\n".to_string(),
+            ),
+            (
+                "channels.yml",
+                "- name: NHK\n  type: GR\n  channel: \"27\"\n".to_string(),
+            ),
+            (
+                "pipelines.yml",
+                "pipelines:\n  pass:\n    - \"cat\"\ntypes:\n  GR: { pipeline: pass }\n"
+                    .to_string(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write config");
+        }
+        let config = Config::load(dir.path()).expect("config loads");
+        // Simulate a webui save that landed while the scan was tuning: the file
+        // on disk now holds a channel the scan never saw.
+        std::fs::write(
+            dir.path().join("channels.yml"),
+            "- name: NHK\n  type: GR\n  channel: \"27\"\n- name: Saved\n  type: GR\n  channel: \"40\"\n",
+        )
+        .expect("simulate webui save");
+
+        let query =
+            ScanQuery::from_params(&params(&[("type", "GR"), ("refresh", "true")])).expect("query");
+        let rescanned: HashSet<String> = ["28".to_string()].into_iter().collect();
+        let found = vec![ChannelEntry {
+            name: "New".to_string(),
+            channel_type: "GR".to_string(),
+            channel: "28".to_string(),
+            disabled: false,
+        }];
+        let written = write_channels(
+            &config,
+            dir.path(),
+            &query,
+            &rescanned,
+            &HashSet::new(),
+            found,
+        )
+        .expect("write");
+        let channels: HashSet<String> = written.iter().map(|entry| entry.channel.clone()).collect();
+        assert!(channels.contains("27"), "the scan's own entry is kept");
+        assert!(channels.contains("28"), "the new entry is appended");
+        assert!(
+            channels.contains("40"),
+            "the concurrent webui save must survive: {channels:?}"
+        );
     }
 
     fn nit(network_id: u16, is_actual: bool, key_id: Option<u8>) -> SiEvent {

@@ -105,25 +105,26 @@ async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
 
     // SPEC §8: the startup service scan runs in the background so the API is
     // reachable while it tunes. It is spawned *after* the listener is bound and
-    // before the server starts accepting, and is stopped through this watch on
-    // shutdown.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // before the server starts accepting, and is stopped through the
+    // process-wide shutdown watch on shutdown — the same watch an API-triggered
+    // scan observes, so neither is held for `timeout × channels`.
+    let shutdown = state.shutdown_watch();
     let mut scan_task = tokio::spawn(scan::startup_scan(
         manager.clone(),
         Arc::clone(&config),
-        shutdown_rx,
+        shutdown,
     ));
 
-    let app = webui::app(state);
+    let app = webui::app(state.clone());
     let result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         signals.wait().await;
-        // Stop the scan first: the tuner cleanup below must not race a scan
+        // Stop the scans first: the tuner cleanup below must not race a scan
         // that is still acquiring, and the scan task must not outlive it.
-        let _ = shutdown_tx.send(true);
+        state.signal_shutdown();
         manager.shutdown().await;
         tracing::info!("all tuner sessions stopped");
     })

@@ -143,6 +143,7 @@ const PIPELINES: &str = "pipelines:\n  pass:\n    - \"cat\"\ntypes: {}\n";
 
 const GOOD_CHANNEL: &str = "- name: NHK\n  type: GR\n  channel: \"27\"\n";
 const DEAD_CHANNEL: &str = "- name: Broken\n  type: DEAD\n  channel: \"1\"\n";
+const SECOND_CHANNEL: &str = "- name: Second\n  type: GR\n  channel: \"28\"\n";
 
 /// `sh -c "cat <path>; sleep 30"`: streams the fixture, then keeps the pipe
 /// open like a real tuner.
@@ -293,4 +294,51 @@ async fn startup_scan_stops_on_shutdown() {
         started.elapsed()
     );
     assert!(manager.sessions_snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn startup_scan_releases_the_tuner_for_the_next_channel() {
+    // The first channel streams a real multiplex and the second also has a
+    // working tuner: the scan's own session must be released in between, so the
+    // second channel is never reported as busy.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let ts = fixture.write_ts("mux.ts", &multiplex());
+    let command = streaming_command(&ts);
+    // Two independent GR tuners, so a lingering scan session on the first would
+    // make the second channel busy.
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: good\n  types: [GR]\n  command: '{command}'\n\
+             - name: second\n  types: [GR]\n  command: '{command}'\n"
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        format!("{GOOD_CHANNEL}{SECOND_CHANNEL}"),
+    )
+    .expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+
+    let channels: Vec<String> = manager
+        .services()
+        .list()
+        .iter()
+        .filter_map(|record| record.channel.as_ref().map(|(_, channel)| channel.clone()))
+        .collect();
+    assert!(
+        channels.contains(&"27".to_string()) && channels.contains(&"28".to_string()),
+        "both channels must be scanned: {channels:?}"
+    );
+    assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
 }

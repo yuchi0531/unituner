@@ -543,7 +543,11 @@ async function restart() {
   $('#restart').disabled = true;
   message('Restarting…');
   try {
-    await api('/webui/api/restart', { method: 'POST' });
+    await api('/webui/api/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
   } catch (error) {
     // A self-exec closes this connection before the body is read, so a network
     // error is expected; only a JSON error means the restart was refused.

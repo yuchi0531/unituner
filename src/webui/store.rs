@@ -93,7 +93,7 @@ pub fn save(dir: &Path, file: &'static str, yaml: &str) -> Result<(), SaveError>
 /// edited, so cross-file rules (for example a `pipelines.types` binding to an
 /// existing pipeline) are checked exactly like at startup.
 pub fn validate_document(dir: &Path, file: &'static str, yaml: &str) -> Result<(), SaveError> {
-    let scratch = scratch_dir();
+    let scratch = scratch_dir()?;
     let result = stage_and_load(&scratch, dir, file, yaml);
     // Best effort: a leftover scratch directory must not fail a successful save.
     let _ = fs::remove_dir_all(&scratch);
@@ -106,9 +106,6 @@ fn stage_and_load(
     file: &'static str,
     yaml: &str,
 ) -> Result<(), SaveError> {
-    fs::create_dir_all(scratch).map_err(|error| {
-        SaveError::internal(format!("failed to create {}: {error}", scratch.display()))
-    })?;
     for other in ALL_FILES.iter().copied().filter(|name| *name != file) {
         let from = dir.join(other);
         let to = scratch.join(other);
@@ -168,13 +165,27 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
 }
 
 /// A scratch directory unique to this process and validation attempt.
-fn scratch_dir() -> PathBuf {
+///
+/// `<tmp>/unituner-validate-<pid>-<seq>`, created with `create_dir` (which fails
+/// if the name already exists, so a pre-seeded path cannot be reused) and mode
+/// `0700`.
+fn scratch_dir() -> Result<PathBuf, SaveError> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
+    let path = std::env::temp_dir().join(format!(
         "unituner-validate-{}-{}",
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ))
+    ));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path).map_err(|error| {
+        SaveError::internal(format!("failed to create {}: {error}", path.display()))
+    })?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -270,5 +281,25 @@ mod tests {
             Err(SaveError::Invalid(issues)) => assert!(!issues.is_empty()),
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_scratch_directory_is_private_and_exclusive() {
+        let scratch = scratch_dir().expect("scratch dir");
+        let metadata = fs::metadata(&scratch).expect("metadata");
+        assert!(metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "the staged config must not be world-readable"
+            );
+        }
+        // `create_dir` (not `create_dir_all`) fails when the path exists, so a
+        // pre-seeded directory cannot be reused.
+        assert!(fs::DirBuilder::new().create(&scratch).is_err());
+        let _ = fs::remove_dir_all(&scratch);
     }
 }

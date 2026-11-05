@@ -22,6 +22,10 @@
 //! `/`. `/api/*` is untouched: [`app`] merges the existing API router with this
 //! one, so the API keeps its own routes and its 404 fallback.
 //!
+//! The per-file locks and the atomic write live in the `store` submodule; the
+//! channel scan takes the same `channels.yml` lock, and re-reads the file inside
+//! it, so a scan and a browser save cannot silently overwrite each other.
+//!
 //! # Validation and writes
 //!
 //! A `PUT` never trusts the browser: the candidate document is written into a
@@ -48,9 +52,24 @@
 //! the listening socket is released exactly when the new image binds it. A
 //! successful restart therefore drops the HTTP connection without a body; the
 //! page treats that as success and polls until the server answers again. A
-//! broken configuration is a 400 and nothing is stopped or replaced.
+//! broken configuration is a 400 and nothing is stopped or replaced. If the
+//! `exec` itself still fails, the manager is resumed
+//! ([`SessionManager::resume`](crate::session::SessionManager::resume)) so the
+//! running process keeps serving (a later request just spawns a fresh tree)
+//! instead of leaving every stream at 503 until someone restarts it by hand; the
+//! failure is reported as a 500.
+//!
+//! # CSRF hardening
+//!
+//! The UI has no authentication; access is limited by `server.allowed_cidrs`.
+//! To stop a page on another origin from driving it, every mutating request
+//! (`PUT /webui/api/*`, `POST /webui/api/restart`) must carry
+//! `Content-Type: application/json`, and a request that sends an `Origin`
+//! header must have it match the request `Host`; anything else is a
+//! `403 {"code":403,…}` and nothing is written or executed.
 
-mod store;
+// Shared with the channel scan so both take the same per-file lock (SPEC §10).
+pub(crate) mod store;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -141,8 +160,74 @@ pub fn router_with(state: AppState, webui: Webui) -> Router {
         )
         .route("/webui/api/server-config", get(server_config))
         .route("/webui/api/restart", post(restart))
+        // Mutating requests are guarded against cross-site use (the UI has no
+        // authentication; `allowed_cidrs` is the only other boundary).
+        .route_layer(axum::middleware::from_fn(csrf_guard))
         .layer(Extension(webui));
     with_common_layers(&state, routes).with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// CSRF guard
+// ---------------------------------------------------------------------------
+
+/// Guard for every mutating `/webui/api/*` request.
+///
+/// `GET`/`HEAD` pass through. A mutation must:
+/// * carry `Content-Type: application/json` (the only content type the UI
+///   sends; a cross-site HTML form cannot set it without a CORS preflight, which
+///   the server never approves), and
+/// * when it sends `Origin`, match the request `Host` (same-origin only).
+///
+/// Everything else is a 403 with the standard JSON error body.
+async fn csrf_guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = request.method();
+    if matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if !json {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Content-Type: application/json is required",
+            Vec::new(),
+        );
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if origin_host(origin) != Some(host) {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "Cross-origin request rejected",
+                Vec::new(),
+            );
+        }
+    }
+    next.run(request).await
+}
+
+/// The `host[:port]` part of an `Origin` header value, or `None` when it is not
+/// a well-formed `scheme://host[:port]` origin (or is the opaque `null`).
+fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin.split_once("://")?.1;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +642,11 @@ async fn server_config(State(state): State<AppState>) -> Response {
 /// cannot put the server into a restart loop. The executable is checked before
 /// the sessions are stopped, because a failed exec after the shutdown would
 /// leave a running server whose streams all 503.
+///
+/// If `exec` still fails, the manager is resumed
+/// ([`SessionManager::resume`](crate::session::SessionManager::resume)) so the
+/// process keeps serving — the next request spawns a fresh tree instead of every
+/// stream answering 503 until a manual restart. The failure is reported as a 500.
 async fn restart(State(state): State<AppState>, Extension(webui): Extension<Webui>) -> Response {
     if let Err(error) = Config::load(&state.config_dir) {
         tracing::warn!(%error, "restart refused: configuration is invalid");
@@ -574,7 +664,10 @@ async fn restart(State(state): State<AppState>, Extension(webui): Extension<Webu
     match (webui.exec)() {
         Ok(()) => Json(json!({ "status": "restarted" })).into_response(),
         Err(message) => {
-            tracing::error!(%message, "restart failed");
+            // The process image was not replaced: undo the shutdown so this
+            // process still serves streams instead of 503ing for ever.
+            state.manager.resume();
+            tracing::error!(%message, "restart failed; sessions resumed");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, message, Vec::new())
         }
     }

@@ -1079,6 +1079,66 @@ async fn an_invalid_channel_value_is_400() {
 }
 
 #[tokio::test]
+async fn head_matches_get_validation_for_the_stream_routes() {
+    let (fixture, _, services) = service_fixture();
+    let state = fixture.state_with(services);
+
+    let routes = [
+        "/api/channels/GR/27/stream".to_string(),
+        format!("/api/channels/GR/27/services/{TARGET_SID}/stream"),
+        format!("/api/services/{TARGET_SID}/stream"),
+    ];
+    for uri in &routes {
+        // An unknown pin is a 400 on GET *and* HEAD.
+        for method in [Method::GET, Method::HEAD] {
+            let response = send(
+                &state,
+                PEER,
+                request_with_headers(method.clone(), uri, &[("x-mirakc-tuner", "nope")]),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} with an unknown pin"
+            );
+        }
+
+        // A malformed priority is a 400 on GET *and* HEAD.
+        for method in [Method::GET, Method::HEAD] {
+            let response = send(
+                &state,
+                PEER,
+                request_with_headers(method.clone(), uri, &[("x-mirakurun-priority", "high")]),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {uri} with a malformed priority"
+            );
+        }
+
+        // A valid pin still succeeds on both (and HEAD never tunes).
+        for method in [Method::GET, Method::HEAD] {
+            let response = send(
+                &state,
+                PEER,
+                request_with_headers(method.clone(), uri, &[("x-mirakc-tuner", "t0")]),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{method} {uri}");
+            if method == Method::GET {
+                // Drain the head so the session is released.
+                let _ = read_first_chunk(response.into_body()).await;
+            } else {
+                assert!(read_all(response.into_body()).await.is_empty(), "{uri}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_malformed_priority_header_is_400() {
     let (fixture, _, _) = two_channel_fixture();
     let state = fixture.state();
@@ -1245,4 +1305,296 @@ async fn an_invalid_scan_query_is_400() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "query {query:?}");
         assert_eq!(json(&body)["code"], 400);
     }
+}
+
+#[tokio::test]
+async fn a_huge_scan_range_is_400_without_allocating() {
+    let (fixture, _) = scan_fixture();
+    let state = fixture.state();
+    let before = fixture.channels_yml();
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            "/api/config/channels/scan?type=GR&minCh=0&maxCh=4294967295",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = json(&body);
+    assert_eq!(error["code"], 400);
+    assert!(
+        error["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("at most"),
+        "{error}"
+    );
+    assert_eq!(fixture.channels_yml(), before, "must not write");
+    // The lock was never taken, so the next scan is not a 409.
+    assert!(!state.scan_lock.is_running());
+}
+
+#[tokio::test]
+async fn a_scan_range_exactly_at_the_cap_is_allowed() {
+    let (fixture, _) = scan_fixture();
+    let state = fixture.state();
+
+    // 512 candidates is the cap. No tuner supports the `XX` type, so each
+    // channel is skipped as "tuner busy" without spawning anything.
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            "/api/config/channels/scan?type=XX&minCh=0&maxCh=511&dryRun=true",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(text.contains("dry run"), "{text}");
+    assert!(
+        text.matches("skipped (tuner busy)").count() == 512,
+        "{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Channel-scoped service resolution
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_sid_on_two_channels_resolves_on_the_channel_path() {
+    let fixture = Fixture::new(
+        &tuners("true"),
+        &channels(&[("A", "27"), ("B", "28")]),
+        PIPELINE_CAT,
+    );
+    let ts = service_multiplex();
+    let path = fixture.write_ts("multiplex.ts", &ts);
+    // Two tuners so both channels can stream at once: the second request must
+    // not be a 503 on a single-tuner pool.
+    let command = streaming_command(&path);
+    let second = format!("- name: t1\n  types: [GR]\n  command: '{command}'\n");
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("{}{}", tuners(&command), second),
+    )
+    .expect("rewrite tuners.yml");
+
+    let services = ServiceTable::new();
+    for channel in ["27", "28"] {
+        let mut record = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "Shared");
+        record.channel = Some(("GR".to_string(), channel.to_string()));
+        services.upsert(record);
+    }
+    let state = fixture.state_with(services);
+
+    // The global lookup is ambiguous (404), the channel path is not.
+    let (status, _, _) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, &format!("/api/services/{TARGET_SID}/stream")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    for uri in [
+        format!("/api/channels/GR/27/services/{TARGET_SID}/stream"),
+        format!("/api/channels/GR/28/services/{TARGET_SID}/stream"),
+    ] {
+        let response = send(&state, PEER, request(Method::GET, &uri)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        // Consume the head so the body is not dropped mid-stream.
+        let bytes = read_first_chunk(response.into_body()).await;
+        assert!(!bytes.is_empty(), "{uri}");
+    }
+
+    // HEAD follows the same resolution and the same validation.
+    for uri in [
+        format!("/api/channels/GR/27/services/{TARGET_SID}/stream"),
+        format!("/api/channels/GR/28/services/{TARGET_SID}/stream"),
+    ] {
+        let response = send(&state, PEER, request(Method::HEAD, &uri)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert!(read_all(response.into_body()).await.is_empty(), "{uri}");
+    }
+    let response = send(
+        &state,
+        PEER,
+        request(
+            Method::HEAD,
+            &format!("/api/channels/GR/99/services/{TARGET_SID}/stream"),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // A malformed channel is validated like the GET: resolution is
+    // channel-scoped, so no service can be bound to an invalid channel and both
+    // methods answer the same way.
+    let mut statuses = Vec::new();
+    for method in [Method::GET, Method::HEAD] {
+        let response = send(
+            &state,
+            PEER,
+            request(
+                method.clone(),
+                &format!("/api/channels/GR/2%3B7/services/{TARGET_SID}/stream"),
+            ),
+        )
+        .await;
+        statuses.push(response.status());
+    }
+    assert_eq!(statuses[0], statuses[1], "HEAD must match GET");
+    assert_eq!(statuses[0], StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_ipv6_loopback_is_allowed_by_the_ipv4_loopback_entry() {
+    let fixture = Fixture::new(&tuners("true"), &channels(&[]), PIPELINE_CAT);
+    let state = fixture.state();
+    let loopback = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1);
+
+    let (status, _, _) = send_body(&state, loopback, request(Method::GET, "/api/version")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a v6 loopback peer must not be forbidden by 127.0.0.0/8"
+    );
+}
+
+#[tokio::test]
+async fn a_decode_zero_request_for_a_piped_channel_is_409() {
+    let (fixture, _, _) = two_channel_fixture();
+    let state = fixture.state();
+
+    // Start the normal (piped) stream and keep its body alive.
+    let held = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream"),
+    )
+    .await;
+    assert_eq!(held.status(), StatusCode::OK);
+    let _held_body = held.into_body();
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream?decode=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let error = json(&body);
+    assert_eq!(error["code"], 409);
+    assert!(
+        error["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("different decode mode"),
+        "{error}"
+    );
+
+    // The piped session is untouched: still one session, one user.
+    let (_, _, tuners) = send_body(&state, PEER, request(Method::GET, "/api/tuners")).await;
+    let tuners = json(&tuners);
+    assert_eq!(tuners[0]["users"].as_array().expect("users").len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Scan cancellation and Service-mode refresh
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_disconnected_scan_writes_nothing() {
+    let fixture = Fixture::new(&tuners("true"), "[]\n", PIPELINE_CAT);
+    let ts = scan_multiplex();
+    let path = fixture.write_ts("scan.ts", &ts);
+    // Slow enough that the client is gone before the last channel finishes.
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&format!(
+            "sh -c \"sleep 0.3; cat {}; sleep 30\"",
+            path.display()
+        )),
+    )
+    .expect("rewrite tuners.yml");
+    let before = fixture.channels_yml();
+    let state = fixture.state();
+
+    let response = send(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            "/api/config/channels/scan?type=GR&minCh=24&maxCh=29",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // Read one frame, then hang up.
+    let mut body = response.into_body();
+    let _ = tokio::time::timeout(Duration::from_secs(5), body.frame()).await;
+    drop(body);
+
+    // The scan must notice and leave channels.yml alone.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        fixture.channels_yml(),
+        before,
+        "a cancelled scan must not write"
+    );
+}
+
+#[tokio::test]
+async fn a_service_mode_refresh_replaces_every_per_service_entry() {
+    let fixture = Fixture::new(&tuners("true"), "[]\n", PIPELINE_CAT);
+    let ts = scan_multiplex();
+    let path = fixture.write_ts("scan.ts", &ts);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: bs\n  types: [BS]\n  command: '{}\n'\n",
+            streaming_command(&path)
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    // Stale per-service entries of the same multiplex.
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        "- name: Stale One\n  type: BS\n  channel: \"BS13_0\"\n\
+         - name: Stale Two\n  type: BS\n  channel: \"BS13_1\"\n\
+         - name: Stale Gone\n  type: BS\n  channel: \"BS13_2\"\n",
+    )
+    .expect("seed channels.yml");
+    let state = fixture.state();
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            "/api/config/channels/scan?type=BS&minCh=13&maxCh=13&refresh=true",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(text.contains("**RESTART REQUIRED**"), "{text}");
+
+    let written = fixture.channels_yml();
+    assert!(written.contains("NHK General"), "{written}");
+    assert!(written.contains("NHK E"), "{written}");
+    assert!(!written.contains("Stale One"), "{written}");
+    assert!(!written.contains("Stale Two"), "{written}");
+    assert!(
+        !written.contains("Stale Gone"),
+        "a disappeared service must be dropped on refresh: {written}"
+    );
+    // Both produced entries are present as per-service channels.
+    assert_eq!(written.matches("channel: BS13_").count(), 2, "{written}");
 }

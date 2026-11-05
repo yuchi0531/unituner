@@ -9,6 +9,13 @@
 //! (SPEC §6.2): at most one session exists for a channel, so two requests can
 //! never spawn two processes for it.
 //!
+//! The decode mode (`decode=0` versus the normal pipeline) is **not** part of
+//! the identity: it is a property of the one session for that channel. A
+//! request for a channel that already streams with the other mode is not
+//! joined and does not preempt it either — it fails with
+//! [`AcquireError::DecodeModeConflict`] (409), because taking the tuner over
+//! would let two alternating clients ping-pong the same channel.
+//!
 //! # Selection and takeover
 //!
 //! [`SessionManager::acquire`] implements SPEC §6.2:
@@ -43,7 +50,18 @@
 //! protect and its device may still be held, so it is retired *before* the
 //! spawn — SPEC §6.2 explicitly accepts the SIGTERM latency of "kill +
 //! restart" for a different channel. The takeover is logged with the old and
-//! new priority either way.
+//! new priority either way. The emptiness check is repeated **under the
+//! registry lock** immediately before the retirement: a request that passed
+//! its own selection earlier can have attached in between, in which case the
+//! takeover falls back to the spawn-first-then-kill order instead of cutting
+//! that stream after the retirement. [`attach`] also refuses a session whose
+//! takeover flag is set, so no new request can attach to a session that is
+//! about to be replaced.
+//!
+//! A retiring session keeps its registry slot (phase `Stopping`) until its
+//! process group has exited, so the tuner is not reported free — and no new
+//! spawn can be placed on a device that is still held — while the old tree is
+//! dying.
 //!
 //! # Raw vs filtered
 //!
@@ -56,11 +74,16 @@
 //!
 //! # `decode=0`
 //!
-//! [`SessionManager::acquire_full`] takes a `bypass_pipeline` flag. It is part
-//! of the session key, because a normal and a `decode=0` session for the same
-//! `(type, channel)` produce different bytes from the same tuner command: with
-//! the flag only the tuner runs and its normalized stdout is broadcast
-//! directly (SPEC §4.1: the whole pipeline is bypassed, not just a decoder).
+//! [`SessionManager::acquire_full`] takes a `bypass_pipeline` flag. With it
+//! only the tuner runs and its normalized stdout is broadcast directly
+//! (SPEC §4.1: the whole pipeline is bypassed, not just a decoder); without it
+//! the type's pipeline runs. The mode is a **property of the one session for a
+//! channel**, not part of the identity: identity stays `(tuner, type, channel)`
+//! so a channel never has two process trees. A request that asks for the other
+//! mode than the one currently streaming on that channel is *not* joined and is
+//! *not* allowed to preempt that same session; it fails with
+//! [`AcquireError::DecodeModeConflict`] (HTTP 409). Otherwise two clients with
+//! different `decode` values would ping-pong the tuner forever.
 //!
 //! # Fan-out and backpressure
 //!
@@ -69,6 +92,15 @@
 //! owns a bounded mpsc and a pump task from broadcast to mpsc. The pump uses
 //! `try_send`: a full queue or a `Lagged` broadcast drops **that subscriber
 //! only**, and the broadcast is never blocked by a slow client (SPEC §7).
+//!
+//! # Replay window
+//!
+//! Until the *first* subscriber attaches, every chunk is kept for replay, up to
+//! one subscriber queue's worth of bytes. A fast source can therefore emit the
+//! head of the stream (typically PAT/PMT) before the promoter attaches without
+//! losing it. After the first attach the window shrinks to the last
+//! [`PRELUDE_CHUNKS`] chunks, which is the original "cover the readiness gap"
+//! size.
 //!
 //! # Idle release
 //!
@@ -95,13 +127,14 @@ use crate::pipeline::{
 use crate::services::ServiceTable;
 use crate::tsframe::TsNormalizer;
 
-/// Number of recent chunks replayed to a newly joined subscriber.
+/// Number of recent chunks replayed to a newly joined subscriber **after the
+/// first subscriber attached**.
 ///
 /// The broadcast only delivers chunks sent after `subscribe()`, so without a
-/// replay the readiness chunk (broadcast a moment before the first subscriber
-/// attaches) would be lost. Two chunks (128 KiB with the defaults) is enough to
-/// cover the gap between readiness and `attach` while keeping the replay
-/// bounded and small for a late joiner.
+/// replay a chunk broadcast a moment before `attach` would be lost. Two chunks
+/// (128 KiB with the defaults) is enough to cover that gap while keeping the
+/// replay bounded and small for a late joiner. Until the first subscriber
+/// attaches, the window is larger: see [`ReplayState`].
 pub const PRELUDE_CHUNKS: usize = 2;
 
 /// Capacity of a session's broadcast ring, in chunks.
@@ -130,6 +163,15 @@ pub const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 /// the damage of a wakeup that was consumed by another waiter before this one
 /// polled, so a request never sleeps out a long timeout.
 const STARTUP_POLL: Duration = Duration::from_millis(250);
+
+/// How long a scan's [`SessionManager::release_session`] waits for its own
+/// subscriber to detach before stopping the session anyway.
+///
+/// The subscriber pump notices a dropped subscription asynchronously; if it is
+/// starved, the session would otherwise keep the tuner forever and every later
+/// channel of the scan would report "tuner busy" (the scan priority cannot
+/// preempt it).
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Scan sessions run at this priority and never preempt (SPEC §6.1, §8).
 pub const SCAN_PRIORITY: i32 = -1000;
@@ -178,7 +220,8 @@ impl TunerUser {
 /// The variants map to SPEC §6.2/§6.3: [`NoTuner`](Self::NoTuner),
 /// [`Unavailable`](Self::Unavailable) and [`Busy`](Self::Busy) are 503,
 /// [`UnknownTuner`](Self::UnknownTuner) and
-/// [`UnsupportedType`](Self::UnsupportedType) are 400, and
+/// [`UnsupportedType`](Self::UnsupportedType) are 400,
+/// [`DecodeModeConflict`](Self::DecodeModeConflict) is 409, and
 /// [`ShuttingDown`](Self::ShuttingDown) is 503.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AcquireError {
@@ -197,6 +240,12 @@ pub enum AcquireError {
     /// All suitable tuners are busy and preemption is not allowed.
     #[error("all tuners are busy")]
     Busy,
+    /// The channel is already streaming with the other decode mode
+    /// (`decode=0` versus the pipeline). Joining would deliver the wrong bytes
+    /// and taking over would make two clients fight over one channel, so the
+    /// request is refused (HTTP 409).
+    #[error("channel already streaming with a different decode mode")]
+    DecodeModeConflict,
     /// The manager is shutting down.
     #[error("server is shutting down")]
     ShuttingDown,
@@ -352,15 +401,36 @@ pub struct SessionStatus {
 
 /// Internal session identity. The tuner is fixed at spawn time (SPEC §6.2).
 ///
-/// `bypass_pipeline` is part of the key because `decode=0` (SPEC §4.1) bypasses
-/// the whole pipeline while a normal request runs it: the two produce different
-/// bytes from the same tuner command, so they cannot share one process tree.
+/// The decode mode is **not** part of the key: identity stays
+/// `(tuner, type, channel)` so a channel never has two process trees. The mode
+/// is a property of the session ([`Session::pipeline_mode`]) and a request that
+/// wants the other one is refused with
+/// [`AcquireError::DecodeModeConflict`].
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionKey {
     tuner: String,
     type_name: String,
     channel: String,
-    bypass_pipeline: bool,
+}
+
+/// How a session produces its broadcast (SPEC §4, §4.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PipelineMode {
+    /// The type's pipeline runs between the tuner and the broadcast.
+    Piped,
+    /// `decode=0`: the whole pipeline is bypassed, the tuner stream is
+    /// normalized and broadcast directly.
+    Raw,
+}
+
+impl PipelineMode {
+    fn of(bypass_pipeline: bool) -> Self {
+        if bypass_pipeline {
+            Self::Raw
+        } else {
+            Self::Piped
+        }
+    }
 }
 
 /// The tuner process plus the pipeline stages it feeds.
@@ -382,10 +452,26 @@ impl ProcessTree {
     }
 }
 
+/// The replay window: chunks kept for a subscriber that attaches after they
+/// were broadcast.
+#[derive(Debug, Default)]
+struct Replay {
+    chunks: VecDeque<Bytes>,
+    /// Sum of `chunks` lengths, so the pre-attach byte cap is O(1).
+    bytes: usize,
+    /// Set by the first [`attach`]. Before it, the window holds everything the
+    /// stream produced (bounded by bytes) so a fast source cannot lose its head
+    /// (typically PAT/PMT). Afterwards it shrinks to [`PRELUDE_CHUNKS`].
+    first_attached: bool,
+}
+
 /// One session: one process tree, one broadcast, one subscriber list.
 struct Session {
     id: u64,
     key: SessionKey,
+    /// The mode the session was started with (SPEC §4, §4.1). A request that
+    /// asks for the other mode is refused; see [`AcquireError::DecodeModeConflict`].
+    pipeline_mode: PipelineMode,
     started_at: SystemTime,
     phase: AtomicU8,
     /// Notified on every phase change. `notify_one` so a change that happens
@@ -393,12 +479,13 @@ struct Session {
     changed: Notify,
     users: Mutex<Vec<SubscriberEntry>>,
     broadcaster: Mutex<Option<broadcast::Sender<Bytes>>>,
-    /// Rolling window of the most recent chunks, replayed to a new subscriber
-    /// so the readiness chunk (broadcast while the session was still
-    /// `Starting`) is never lost. Guarded together with `subscribe` in
-    /// [`attach`], so a chunk is delivered either from here or from the
-    /// broadcast, never twice.
-    prelude: Mutex<VecDeque<Bytes>>,
+    /// Chunks replayed to a new subscriber, guarded together with `subscribe`
+    /// in [`attach`] so a chunk is delivered either from here or from the
+    /// broadcast, never twice. See [`Replay`].
+    replay: Mutex<Replay>,
+    /// Byte bound for [`Replay`] while no subscriber has attached:
+    /// `chunk_size_bytes * subscriber_buffer_chunks`.
+    replay_byte_cap: AtomicUsize,
     next_subscriber_id: AtomicU64,
     /// Invalidates a pending idle timer; bumped on every new subscriber.
     idle_epoch: AtomicU64,
@@ -407,25 +494,31 @@ struct Session {
     /// The stream ended before the session was promoted to `Ready`; the
     /// promoter removes the session instead of leaving a dead `Ready` entry.
     ended: AtomicBool,
+    /// The stream ended without a read error (natural EOF). Such a session must
+    /// not blacklist its tuner for the rest of the request.
+    clean_eof: AtomicBool,
     process: AsyncMutex<Option<ProcessTree>>,
     pids: Mutex<Vec<u32>>,
 }
 
 impl Session {
-    fn new(id: u64, key: SessionKey) -> Self {
+    fn new(id: u64, key: SessionKey, pipeline_mode: PipelineMode) -> Self {
         Self {
             id,
             key,
+            pipeline_mode,
             started_at: SystemTime::now(),
             phase: AtomicU8::new(PHASE_STARTING),
             changed: Notify::new(),
             users: Mutex::new(Vec::new()),
             broadcaster: Mutex::new(None),
-            prelude: Mutex::new(VecDeque::new()),
+            replay: Mutex::new(Replay::default()),
+            replay_byte_cap: AtomicUsize::new(PRELUDE_CHUNKS),
             next_subscriber_id: AtomicU64::new(0),
             idle_epoch: AtomicU64::new(0),
             takeover_pending: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            clean_eof: AtomicBool::new(false),
             process: AsyncMutex::new(None),
             pids: Mutex::new(Vec::new()),
         }
@@ -464,6 +557,11 @@ impl Session {
             .max()
     }
 
+    /// Whether a subscriber other than `id` is attached.
+    fn has_user_other_than(&self, id: u64) -> bool {
+        lock(&self.users).iter().any(|entry| entry.id != id)
+    }
+
     fn user_statuses(&self) -> Vec<TunerUserStatus> {
         lock(&self.users)
             .iter()
@@ -479,16 +577,39 @@ impl Session {
 
     /// Records `chunk` in the replay window and broadcasts it.
     ///
-    /// The prelude lock is held across both the record and the `send`, and
+    /// The replay lock is held across both the record and the `send`, and
     /// [`attach`] holds it across its snapshot and `subscribe`, so every
     /// subscriber receives each chunk exactly once: from the broadcast if it
     /// subscribed in time, or from the replay window if it joined later.
     fn emit(&self, sender: &broadcast::Sender<Bytes>, chunk: Bytes) -> bool {
-        let mut prelude = lock(&self.prelude);
-        let first = prelude.is_empty();
-        prelude.push_back(chunk.clone());
-        while prelude.len() > PRELUDE_CHUNKS {
-            prelude.pop_front();
+        let mut replay = lock(&self.replay);
+        let first = replay.chunks.is_empty();
+        if replay.first_attached {
+            replay.bytes += chunk.len();
+            replay.chunks.push_back(chunk.clone());
+            while replay.chunks.len() > PRELUDE_CHUNKS {
+                if let Some(dropped) = replay.chunks.pop_front() {
+                    replay.bytes -= dropped.len();
+                }
+            }
+        } else {
+            // Before the first subscriber: keep the head of the stream, bounded
+            // by bytes so a fast source cannot grow the window without limit.
+            let cap = self
+                .replay_byte_cap
+                .load(Ordering::Relaxed)
+                .max(chunk.len());
+            replay.bytes += chunk.len();
+            replay.chunks.push_back(chunk.clone());
+            while replay.bytes > cap {
+                match replay.chunks.pop_front() {
+                    Some(dropped) => replay.bytes -= dropped.len(),
+                    None => {
+                        replay.bytes = 0;
+                        break;
+                    }
+                }
+            }
         }
         // No receivers is fine: the stream is still running.
         let _ = sender.send(chunk);
@@ -540,18 +661,27 @@ impl Inner {
         self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Finds the session for `(type, channel)`, whatever its tuner.
+    /// Byte bound for a session's pre-attach replay window: one subscriber
+    /// queue's worth (`chunk_size_bytes * subscriber_buffer_chunks`).
+    fn replay_byte_cap(&self) -> usize {
+        self.config
+            .server
+            .chunk_size_bytes
+            .max(1)
+            .saturating_mul(self.config.server.subscriber_buffer_chunks.max(1))
+    }
+
+    /// Finds the session for `(type, channel)`, whatever its tuner or decode
+    /// mode. At most one session exists per `(type, channel)`.
     fn session_for_channel<'a>(
         state: &'a State,
         type_name: &str,
         channel: &str,
-        bypass_pipeline: bool,
     ) -> Option<&'a Arc<Session>> {
-        state.sessions.values().find(|session| {
-            session.key.type_name == type_name
-                && session.key.channel == channel
-                && session.key.bypass_pipeline == bypass_pipeline
-        })
+        state
+            .sessions
+            .values()
+            .find(|session| session.key.type_name == type_name && session.key.channel == channel)
     }
 
     fn tuner_occupied(&self, state: &State, tuner: &str) -> bool {
@@ -644,9 +774,13 @@ impl SessionManager {
     /// Full acquisition entry point: tap plus `decode=0` support.
     ///
     /// `bypass_pipeline` skips every pipeline stage for this session (SPEC
-    /// §4.1: `decode=0` bypasses the whole pipeline, not just the decoder). The
-    /// session is keyed separately from a normal one, because the same tuner
-    /// command yields different bytes with and without the pipeline.
+    /// §4.1: `decode=0` bypasses the whole pipeline, not just the decoder).
+    ///
+    /// The mode is a **property of the session**, not part of its identity: a
+    /// channel has at most one process tree. A request whose mode differs from
+    /// the session already streaming that `(type, channel)` is refused with
+    /// [`AcquireError::DecodeModeConflict`] instead of joining (wrong bytes) or
+    /// preempting (which would let two clients ping-pong the tuner).
     pub async fn acquire_full(
         &self,
         type_name: &str,
@@ -655,6 +789,42 @@ impl SessionManager {
         pin: Option<String>,
         tap: SessionTap,
         bypass_pipeline: bool,
+    ) -> Result<Subscription, AcquireError> {
+        self.acquire_inner(type_name, channel, user, pin, tap, bypass_pipeline, false)
+            .await
+    }
+
+    /// Like [`acquire_full`](Self::acquire_full) for the channel scan.
+    ///
+    /// `scan` marks an explicitly labelled scan acquisition. Such a request may
+    /// retire an **idle (0-user)** session even at [`SCAN_PRIORITY`] (SPEC
+    /// §6.1 forbids it from preempting a session with subscribers): without
+    /// that, a scan session whose release raced its own detach would keep the
+    /// tuner forever, because `-1000` can never win a takeover. The retired
+    /// session is logged like any other idle reuse.
+    pub async fn acquire_scan(
+        &self,
+        type_name: &str,
+        channel: &str,
+        user: TunerUser,
+        tap: SessionTap,
+        bypass_pipeline: bool,
+    ) -> Result<Subscription, AcquireError> {
+        self.acquire_inner(type_name, channel, user, None, tap, bypass_pipeline, true)
+            .await
+    }
+
+    /// Shared body of the acquisition entry points.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_inner(
+        &self,
+        type_name: &str,
+        channel: &str,
+        user: TunerUser,
+        pin: Option<String>,
+        tap: SessionTap,
+        bypass_pipeline: bool,
+        scan: bool,
     ) -> Result<Subscription, AcquireError> {
         let inner = Arc::clone(&self.inner);
         let pin = pin.and_then(|name| {
@@ -699,6 +869,7 @@ impl SessionManager {
                     pin.as_deref(),
                     &failed,
                     bypass_pipeline,
+                    scan,
                 )
             };
 
@@ -717,8 +888,12 @@ impl SessionManager {
                     if !wait_before_retry(&session, wait_deadline, type_name, channel).await {
                         return Err(AcquireError::Unavailable);
                     }
-                    if session.phase() == SessionPhase::Failed {
-                        // Do not retry a tuner that just failed to start.
+                    // Do not retry a tuner whose stream failed to start. A
+                    // natural EOF (a short recording, a channel that stopped)
+                    // is not a broken tuner, so it stays a candidate.
+                    if session.phase() == SessionPhase::Failed
+                        && !session.clean_eof.load(Ordering::SeqCst)
+                    {
                         failed.insert(session.key.tuner.clone());
                     }
                 }
@@ -726,6 +901,7 @@ impl SessionManager {
                     match spawn_and_promote(&inner, session, victim, &user, tap).await {
                         Ok(subscription) => return Ok(subscription),
                         Err(SpawnFailure::ShuttingDown) => return Err(AcquireError::ShuttingDown),
+                        Err(SpawnFailure::Aborted(error)) => return Err(error),
                         Err(SpawnFailure::Failed { tuner }) => {
                             // Pinned requests never fall back to another tuner.
                             if pin.is_some() {
@@ -752,8 +928,9 @@ impl SessionManager {
     /// Validates a pinned tuner name (SPEC §6.3).
     ///
     /// A `disabled: true` tuner is reported as unknown: it cannot be selected,
-    /// which is what the 400 must convey.
-    fn validate_pin(&self, name: &str, type_name: &str) -> Result<(), AcquireError> {
+    /// which is what the 400 must convey. Public so the HEAD handlers can reject
+    /// a bad pin without acquiring a session.
+    pub fn validate_pin(&self, name: &str, type_name: &str) -> Result<(), AcquireError> {
         let Some(tuner) = self.inner.tuner(name) else {
             return Err(AcquireError::UnknownTuner(name.to_string()));
         };
@@ -824,46 +1001,59 @@ impl SessionManager {
             .collect()
     }
 
-    /// Stops the pipeline session for `(type_name, channel)` when no other
-    /// subscriber is attached, returning whether it did.
+    /// Stops the session for `(type_name, channel)` after `subscriber_id` (the
+    /// scan's own subscription) has been dropped, returning whether it did.
     ///
     /// This is the channel scan's "release the scan session before the next
     /// channel" step (SPEC §8.1). Dropping a [`Subscription`] closes its mpsc
     /// receiver, which the subscriber pump observes asynchronously, so this
-    /// waits briefly for the count to reach zero. A session another client is
-    /// still watching (including a `decode=0` one, which lives under a
-    /// different key) is never stopped.
-    pub async fn release_session(&self, type_name: &str, channel: &str) -> bool {
-        let lookup =
-            |state: &State| Inner::session_for_channel(state, type_name, channel, false).cloned();
-        for _ in 0..20 {
-            let Some(session) = lookup(&lock(&self.inner.state)) else {
+    /// waits up to [`RELEASE_TIMEOUT`] for that subscriber to disappear and then
+    /// stops the session anyway: a starved pump must not leave a session whose
+    /// only user is the stale scan subscription, because the scan priority can
+    /// never preempt it. A session another client is still watching is never
+    /// stopped.
+    ///
+    /// The session stays registered (phase `Stopping`) until its process group
+    /// has exited, so the tuner is not reported free while the old tree is
+    /// still dying.
+    pub async fn release_session(
+        &self,
+        type_name: &str,
+        channel: &str,
+        subscriber_id: u64,
+    ) -> bool {
+        let lookup = |state: &State| Inner::session_for_channel(state, type_name, channel).cloned();
+        let deadline = tokio::time::Instant::now() + RELEASE_TIMEOUT;
+        loop {
+            let session = lookup(&lock(&self.inner.state));
+            let Some(session) = session else {
                 return false;
             };
             if session.phase() != SessionPhase::Ready {
                 return false;
             }
-            let users = session.users_len();
-            // More than our own (already dropped) subscriber: a client is
+            // Any user other than the scan's own subscriber means a client is
             // watching, so the session must live on.
-            if users > 1 {
+            if session.has_user_other_than(subscriber_id) {
                 return false;
             }
-            if users == 0 {
+            if session.users_is_empty() || tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         let session = {
-            let mut state = lock(&self.inner.state);
+            let state = lock(&self.inner.state);
             let Some(session) = lookup(&state) else {
                 return false;
             };
-            if !session.users_is_empty() || session.phase() != SessionPhase::Ready {
+            if session.phase() != SessionPhase::Ready || session.has_user_other_than(subscriber_id)
+            {
                 return false;
             }
-            state.sessions.remove(&session.key);
+            // Keep the registry slot: `tuner_occupied` must stay true until the
+            // process group is gone (the device is still held).
             session.set_phase(SessionPhase::Stopping);
             session
         };
@@ -871,11 +1061,24 @@ impl SessionManager {
             session_id = session.id,
             type_name,
             channel,
-            "releasing idle session"
+            "releasing session"
         );
         session.close_broadcast();
         session.stop_process().await;
+        unregister_stopped(&self.inner, &session);
         true
+    }
+
+    /// Clears the shutdown latch after a restart attempt that did not replace
+    /// the process.
+    ///
+    /// [`shutdown`](Self::shutdown) already stopped and unregistered every
+    /// session, so the manager is empty; only the `shutting_down` flag keeps new
+    /// requests out. Clearing it restores normal service (a new request spawns
+    /// a fresh tree) instead of leaving the running process with every stream
+    /// answering 503.
+    pub fn resume(&self) {
+        self.inner.shutting_down.store(false, Ordering::SeqCst);
     }
 
     /// Stops every session and waits for all process trees to exit.
@@ -957,9 +1160,15 @@ enum Selection {
     Fail(AcquireError),
 }
 
+#[derive(Debug)]
 enum SpawnFailure {
     ShuttingDown,
-    Failed { tuner: String },
+    Failed {
+        tuner: String,
+    },
+    /// The takeover stopped being legal (a subscriber joined the victim); the
+    /// request is answered with this error and the victim is left running.
+    Aborted(AcquireError),
 }
 
 /// SPEC §6.1: may `requester` take over a session whose highest subscriber
@@ -987,6 +1196,7 @@ fn select(
     pin: Option<&str>,
     failed: &HashSet<String>,
     bypass_pipeline: bool,
+    scan: bool,
 ) -> Selection {
     // A pinned tuner must exist and support the type (SPEC §6.3).
     if let Some(name) = pin {
@@ -1007,7 +1217,7 @@ fn select(
     }
 
     // 1. Join an existing session for this (type, channel), if it suits.
-    if let Some(existing) = Inner::session_for_channel(state, type_name, channel, bypass_pipeline) {
+    if let Some(existing) = Inner::session_for_channel(state, type_name, channel) {
         let existing = Arc::clone(existing);
         // The channel already streams on another tuner. Joining it would
         // silently ignore the pin, and starting a second session for the same
@@ -1016,6 +1226,18 @@ fn select(
         // does not wait for a spawn it can never join.
         if pin.is_some_and(|name| name != existing.key.tuner) {
             return Selection::Fail(AcquireError::Busy);
+        }
+        // The decode mode is a session property. Joining would deliver the
+        // wrong bytes and taking over would make alternating clients fight
+        // over one channel, so a mismatch is a hard conflict while the session
+        // is live; a dying entry is waited for like any other.
+        if matches!(
+            existing.phase(),
+            SessionPhase::Starting | SessionPhase::Ready
+        ) && !existing.ended.load(Ordering::SeqCst)
+            && existing.pipeline_mode != PipelineMode::of(bypass_pipeline)
+        {
+            return Selection::Fail(AcquireError::DecodeModeConflict);
         }
         return match existing.phase() {
             SessionPhase::Starting => Selection::Wait(existing),
@@ -1065,6 +1287,9 @@ fn select(
         .values()
         .filter(|session| session.phase() == SessionPhase::Ready)
         .filter(|session| !session.takeover_pending.load(Ordering::SeqCst))
+        // Same `(type, channel)`: already handled by step 1, including the
+        // decode-mode conflict. Never a victim (one process tree per channel).
+        .filter(|session| !(session.key.type_name == type_name && session.key.channel == channel))
         .filter(|session| !failed.contains(&session.key.tuner))
         .filter(|session| match pin {
             Some(name) => session.key.tuner == name,
@@ -1078,8 +1303,10 @@ fn select(
         .filter(|session| match session.max_priority() {
             Some(victim_max) => can_grab(user.priority, victim_max),
             // A 0-user (idle) session can be reused for another channel by any
-            // non-negative request; negative priorities still cannot preempt.
-            None => user.priority >= 0,
+            // non-negative request; a labelled scan may also retire it (its
+            // priority can never win a takeover otherwise), but a plain
+            // negative priority still cannot.
+            None => user.priority >= 0 || scan,
         })
         .collect();
     // Weakest first; ties are broken by age so the oldest session goes.
@@ -1101,7 +1328,29 @@ fn select(
         );
     }
 
-    // 4. Nothing available.
+    // 4. A tuner is still being released: the process group is dying but the
+    //    device is not free yet (the `Stopping` slot is kept until it exits).
+    //    Wait for that to finish instead of reporting "busy": the tuner becomes
+    //    available as soon as the old tree is gone.
+    if let Some(stopping) = state
+        .sessions
+        .values()
+        .filter(|session| session.phase() == SessionPhase::Stopping)
+        .filter(|session| match pin {
+            Some(name) => session.key.tuner == name,
+            None => true,
+        })
+        .filter(|session| {
+            inner
+                .tuner(&session.key.tuner)
+                .is_some_and(|tuner| inner.supports(tuner, type_name))
+        })
+        .min_by_key(|session| session.started_at)
+    {
+        return Selection::Wait(Arc::clone(stopping));
+    }
+
+    // 5. Nothing available.
     Selection::Fail(AcquireError::Busy)
 }
 
@@ -1121,9 +1370,12 @@ fn reserve(
             tuner: tuner.to_string(),
             type_name: type_name.to_string(),
             channel: channel.to_string(),
-            bypass_pipeline,
         },
+        PipelineMode::of(bypass_pipeline),
     ));
+    session
+        .replay_byte_cap
+        .store(inner.replay_byte_cap(), Ordering::Relaxed);
     state
         .sessions
         .insert(session.key.clone(), Arc::clone(&session));
@@ -1147,12 +1399,24 @@ fn attach(
     user: &TunerUser,
     tap: SessionTap,
 ) -> Option<(Subscription, AttachedPump)> {
-    // The reservation must still be the registered session.
+    // The reservation must still be the registered session and be ready: the
+    // idle-release / takeover path re-checks the same conditions under this
+    // lock, so an attach either wins (and forces the takeover to fall back to
+    // spawn-first) or loses (and waits for the replacement).
+    //
+    // A session whose `takeover_pending` flag is set is about to be replaced, so
+    // a join must wait for the replacement instead of attaching to a stream that
+    // is going to be cut. (`select` normally turns such a request into a
+    // `Wait`; the flag is not under the registry lock, so this check closes the
+    // remaining window.)
     let registered = state
         .sessions
         .get(&session.key)
         .is_some_and(|registered| Arc::ptr_eq(registered, session));
-    if !registered || session.phase() != SessionPhase::Ready {
+    if !registered
+        || session.phase() != SessionPhase::Ready
+        || session.takeover_pending.load(Ordering::SeqCst)
+    {
         return None;
     }
 
@@ -1162,13 +1426,18 @@ fn attach(
     // Snapshot the replay window and subscribe under one lock: a chunk is
     // delivered either from the window or from the broadcast, never both.
     let (broadcast_rx, prelude) = {
-        let prelude_guard = lock(&session.prelude);
+        let mut replay = lock(&session.replay);
         let sender = lock(&session.broadcaster).clone()?;
         let broadcast_rx = sender.subscribe();
         // Replay at most one queue's worth, so the replay itself can never
         // overflow the subscriber's bounded mpsc (SPEC §7).
-        let skip = prelude_guard.len().saturating_sub(capacity);
-        let prelude = prelude_guard.iter().skip(skip).cloned().collect::<Vec<_>>();
+        let mut prelude = replay.chunks.iter().cloned().collect::<Vec<_>>();
+        let excess = prelude.len().saturating_sub(capacity);
+        if excess > 0 {
+            prelude.drain(..excess);
+        }
+        // From now on the window is the small "cover the readiness gap" one.
+        replay.first_attached = true;
         (broadcast_rx, prelude)
     };
 
@@ -1257,14 +1526,68 @@ async fn spawn_and_promote(
     // there is no stream to protect and an exclusive device must be released
     // before the replacement can open it. A session with subscribers keeps the
     // spawn-first ordering below.
-    let victim_stopped_early = match victim.as_ref() {
-        Some(victim) if victim.users_is_empty() => {
-            retire_victim(inner, victim, user);
-            victim.stop_process().await;
-            true
+    //
+    // The idle decision is re-made under the registry lock: a request that
+    // passed `select` earlier can have attached in the meantime, and retiring
+    // such a session would cut its stream after `[`RELEASE_TIMEOUT`]`'s grace.
+    let retired = match victim.as_ref() {
+        Some(victim) => {
+            let retire = {
+                // Holding the registry lock is what makes the re-check race-free:
+                // `attach` takes the same lock to add a subscriber.
+                let state = lock(&inner.state);
+                let registered = state
+                    .sessions
+                    .get(&victim.key)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, victim));
+                let still_idle = registered
+                    && victim.users_is_empty()
+                    && victim.takeover_pending.load(Ordering::SeqCst);
+                if still_idle {
+                    // Keep the slot as a `Stopping` reservation (see
+                    // `TunerStatus::is_free`): the device is not free until the
+                    // process group is gone.
+                    victim.set_phase(SessionPhase::Stopping);
+                }
+                still_idle
+            };
+            if retire {
+                tracing::info!(
+                    victim_session = victim.id,
+                    victim_tuner = %victim.key.tuner,
+                    victim_priority = victim.max_priority(),
+                    new_priority = user.priority,
+                    "reusing an idle tuner session for another channel"
+                );
+                victim.close_broadcast();
+                victim.stop_process().await;
+                unregister_stopped(inner, victim);
+                true
+            } else {
+                // A user appeared: the idle exception no longer applies. The
+                // takeover must still be legal for the *current* users (SPEC
+                // §6.1), otherwise it is abandoned and the victim keeps running.
+                let allowed = match victim.max_priority() {
+                    Some(victim_max) => can_grab(user.priority, victim_max),
+                    None => user.priority >= 0,
+                };
+                if !allowed {
+                    tracing::info!(
+                        session_id = session.id,
+                        victim_session = victim.id,
+                        victim_priority = victim.max_priority(),
+                        new_priority = user.priority,
+                        "takeover abandoned: a subscriber joined the victim"
+                    );
+                    release_reservation(inner, &session, Some(victim));
+                    return Err(SpawnFailure::Aborted(AcquireError::Busy));
+                }
+                false
+            }
         }
-        _ => false,
+        None => false,
     };
+    let victim_stopped_early = retired;
 
     let readiness = match start_process_tree(inner, &session, &label).await {
         Ok(readiness) => readiness,
@@ -1349,7 +1672,9 @@ async fn spawn_and_promote(
                     if let Some(victim) = &victim {
                         if !victim_stopped_early {
                             // Remove the victim atomically with the promotion
-                            // so no request can join it any more.
+                            // so no request can join it any more. The slot is
+                            // cleared right away: the new Ready session holds
+                            // the same tuner, so the device is not "free".
                             remove_and_stop_marking(&mut state, victim);
                             tracing::info!(
                                 session_id = session.id,
@@ -1396,7 +1721,6 @@ enum Readiness {
     TimedOut,
     ShuttingDown,
 }
-
 /// Waits for the first chunk, aborting promptly when shutdown starts so a slow
 /// tuner cannot delay `SessionManager::shutdown`.
 async fn await_readiness(
@@ -1426,6 +1750,10 @@ async fn await_readiness(
 
 /// Removes `victim` from the registry and marks it `Stopping` (under the state
 /// lock) so no request can join it any more.
+///
+/// A later takeover of the same time already keeps the slot until the tree is
+/// gone; the *promoted* victim keeps it too, so `is_free` does not flip while
+/// the old process group is still dying.
 fn remove_and_stop_marking(state: &mut State, victim: &Arc<Session>) {
     if state
         .sessions
@@ -1438,21 +1766,17 @@ fn remove_and_stop_marking(state: &mut State, victim: &Arc<Session>) {
     victim.set_phase(SessionPhase::Stopping);
 }
 
-/// Retires an idle victim before its replacement is spawned, logging the
-/// takeover with the old and new priority.
-fn retire_victim(inner: &Arc<Inner>, victim: &Arc<Session>, user: &TunerUser) {
+/// Removes a stopped session from the registry once its process group is gone.
+fn unregister_stopped(inner: &Arc<Inner>, session: &Arc<Session>) {
+    let mut state = lock(&inner.state);
+    if state
+        .sessions
+        .get(&session.key)
+        .is_some_and(|registered| Arc::ptr_eq(registered, session))
     {
-        let mut state = lock(&inner.state);
-        remove_and_stop_marking(&mut state, victim);
-        tracing::info!(
-            victim_session = victim.id,
-            victim_tuner = %victim.key.tuner,
-            victim_priority = victim.max_priority(),
-            new_priority = user.priority,
-            "reusing an idle tuner session for another channel"
-        );
+        state.sessions.remove(&session.key);
     }
-    victim.close_broadcast();
+    session.wake();
 }
 
 /// Removes a reservation that never became ready, leaving the victim alone
@@ -1525,7 +1849,7 @@ async fn start_process_tree(
     let vars = CommandVars::new(&session.key.channel, &session.key.type_name);
     // SPEC §4.1: `decode=0` bypasses every pipeline stage, so only the tuner
     // command runs and its (normalized) output is broadcast directly.
-    let bypass_pipeline = session.key.bypass_pipeline;
+    let bypass_pipeline = session.pipeline_mode == PipelineMode::Raw;
 
     let mut tuner = spawn_tuner_command(&tuner_config.command, &vars)
         .await
@@ -1704,6 +2028,7 @@ fn spawn_pump(
         };
         let mut buf = vec![0u8; chunk_size];
         let mut reason = None;
+        let mut had_data = false;
 
         loop {
             match source.read(&mut buf).await {
@@ -1722,6 +2047,7 @@ fn spawn_pump(
                     };
                     if let Some(chunk) = chunk {
                         for piece in split_chunks(chunk, chunk_size) {
+                            had_data = true;
                             if session.emit(&sender, piece) {
                                 if let Some(tx) = readiness.take() {
                                     let _ = tx.send(None);
@@ -1740,6 +2066,7 @@ fn spawn_pump(
         if let Some(mut normalizer) = normalizer {
             let tail = normalizer.finish();
             for piece in split_chunks(Bytes::from(tail), chunk_size) {
+                had_data = true;
                 if session.emit(&sender, piece) {
                     if let Some(tx) = readiness.take() {
                         let _ = tx.send(None);
@@ -1767,7 +2094,7 @@ fn spawn_pump(
         // process tree to finish stopping.
         drop(sender);
         inner
-            .stream_ended(Arc::clone(&session), reason.as_deref().unwrap_or("eof"))
+            .stream_ended(Arc::clone(&session), reason.as_deref(), had_data)
             .await;
     });
 }
@@ -1794,26 +2121,36 @@ fn split_chunks(data: Bytes, size: usize) -> impl Iterator<Item = Bytes> {
 impl Inner {
     /// Handles the end of a session's stream: unregister, close the broadcast
     /// (subscribers see EOF) and stop the process tree.
-    async fn stream_ended(self: &Arc<Self>, session: Arc<Session>, reason: &str) {
+    ///
+    /// `reason` is `Some` for a read error and `None` for a natural EOF.
+    /// `had_data` says whether any chunk was broadcast, so a clean EOF is only
+    /// considered benign when the stream actually delivered something: a tuner
+    /// that exits without a byte is still treated as failed for this request.
+    async fn stream_ended(
+        self: &Arc<Self>,
+        session: Arc<Session>,
+        reason: Option<&str>,
+        had_data: bool,
+    ) {
         // A `Starting` session is left to `spawn_and_promote`, which either
         // promotes it or releases the reservation. The flag tells the promoter
         // that the stream already ended so it does not leave a dead `Ready`
         // entry behind.
         session.ended.store(true, Ordering::SeqCst);
-        let removed = {
-            let mut state = lock(&self.state);
-            let registered = state
+        // A clean EOF (no read error, after delivering data) is not a broken
+        // tuner: a later request must be free to use it again.
+        session
+            .clean_eof
+            .store(reason.is_none() && had_data, Ordering::SeqCst);
+        let failed = {
+            let state = lock(&self.state);
+            state
                 .sessions
                 .get(&session.key)
-                .is_some_and(|registered| Arc::ptr_eq(registered, &session));
-            if registered && session.phase() == SessionPhase::Ready {
-                state.sessions.remove(&session.key);
-                true
-            } else {
-                false
-            }
+                .is_some_and(|registered| Arc::ptr_eq(registered, &session))
+                && session.phase() == SessionPhase::Ready
         };
-        if removed {
+        if failed {
             session.set_phase(SessionPhase::Failed);
             session.close_broadcast();
             tracing::info!(
@@ -1821,11 +2158,16 @@ impl Inner {
                 tuner = %session.key.tuner,
                 type_name = %session.key.type_name,
                 channel = %session.key.channel,
-                reason,
+                reason = reason.unwrap_or("eof"),
                 "session ended"
             );
         }
         session.stop_process().await;
+        if failed {
+            // Keep the slot until the process group is gone (the device is
+            // still held), then let waiters retry.
+            unregister_stopped(self, &session);
+        }
     }
 }
 
@@ -1922,7 +2264,7 @@ fn spawn_idle_timer(inner: Arc<Inner>, session: Arc<Session>, epoch: u64) {
             tokio::time::sleep(timeout).await;
         }
         let stop = {
-            let mut state = lock(&inner.state);
+            let state = lock(&inner.state);
             let registered = state
                 .sessions
                 .get(&session.key)
@@ -1935,7 +2277,9 @@ fn spawn_idle_timer(inner: Arc<Inner>, session: Arc<Session>, epoch: u64) {
             {
                 false
             } else {
-                state.sessions.remove(&session.key);
+                // Keep the registry slot as a `Stopping` reservation until the
+                // process group has exited: reporting the tuner free now would
+                // let a new request spawn onto a device still held.
                 session.set_phase(SessionPhase::Stopping);
                 true
             }
@@ -1950,6 +2294,7 @@ fn spawn_idle_timer(inner: Arc<Inner>, session: Arc<Session>, epoch: u64) {
             );
             session.close_broadcast();
             session.stop_process().await;
+            unregister_stopped(&inner, &session);
         }
     });
 }
@@ -2441,8 +2786,8 @@ mod tests {
                 tuner: "t0".to_string(),
                 type_name: "GR".to_string(),
                 channel: "27".to_string(),
-                bypass_pipeline: false,
             },
+            PipelineMode::Piped,
         ));
         session.set_phase(SessionPhase::Ready);
         let (sender, _) = broadcast::channel(BROADCAST_CAPACITY_CHUNKS);
@@ -3190,6 +3535,358 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(manager.tuners_snapshot()[0].is_free);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scan_release_stops_a_session_whose_pump_is_slow_to_detach() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            30,
+            188,
+            8,
+        );
+
+        // The subscription is kept alive, which models a subscriber pump that
+        // has not noticed the dropped receiver yet: the session still reports
+        // one (scan) user.
+        let lingering = manager
+            .acquire_scan(
+                "GR",
+                "27",
+                user("scan", SCAN_PRIORITY),
+                SessionTap::Raw,
+                false,
+            )
+            .await
+            .expect("scan acquire");
+
+        let started = std::time::Instant::now();
+        assert!(
+            manager
+                .release_session("GR", "27", lingering.subscriber_id)
+                .await,
+            "the scan's own lingering subscriber must not keep the tuner"
+        );
+        assert!(
+            started.elapsed() < RELEASE_TIMEOUT + Duration::from_secs(2),
+            "release took {:?}",
+            started.elapsed()
+        );
+        assert!(manager.sessions_snapshot().is_empty());
+
+        // The next channel gets the tuner even though the scan priority can
+        // never preempt a session (SPEC §6.1).
+        let next = manager
+            .acquire_scan(
+                "GR",
+                "28",
+                user("scan", SCAN_PRIORITY),
+                SessionTap::Raw,
+                false,
+            )
+            .await
+            .expect("the next channel gets the tuner");
+        assert_eq!(manager.sessions_snapshot()[0].channel, "28");
+        drop(next);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scan_acquire_reuses_an_idle_session_of_another_channel() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            30,
+            188,
+            8,
+        );
+
+        let first = manager
+            .acquire_scan(
+                "GR",
+                "27",
+                user("scan", SCAN_PRIORITY),
+                SessionTap::Raw,
+                false,
+            )
+            .await
+            .expect("scan acquire");
+        let first_id = first.session_id;
+        // Leave the session idle (0 users): a scan can then retire it even at
+        // -1000, which a plain acquire cannot.
+        drop(first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while manager.sessions_snapshot()[0].users != 0 {
+            assert!(std::time::Instant::now() < deadline, "never idle");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let second = manager
+            .acquire_scan(
+                "GR",
+                "28",
+                user("scan", SCAN_PRIORITY),
+                SessionTap::Raw,
+                false,
+            )
+            .await
+            .expect("the idle session is reused for the next channel");
+        assert_ne!(second.session_id, first_id);
+        assert_eq!(manager.sessions_snapshot()[0].channel, "28");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_different_decode_mode_for_the_same_channel_is_a_conflict() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("t0", &["GR"], &streaming_command(&path)),
+            tuner_yaml("t1", &["GR"], &streaming_command(&path))
+        );
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        // Normal first, then `decode=0` for the same channel: 409, no takeover.
+        let _normal = manager
+            .acquire("GR", "27", user("normal", 0), None, true)
+            .await
+            .expect("normal acquire");
+        let error = manager
+            .acquire_full("GR", "27", user("raw", 50), None, SessionTap::Raw, true)
+            .await
+            .expect_err("decode=0 must not join or preempt the piped session");
+        assert_eq!(error, AcquireError::DecodeModeConflict);
+        let sessions = manager.sessions_snapshot();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].channel, "27");
+        assert_eq!(sessions[0].users, 1);
+
+        // `decode=0` first, then normal for the same channel: same conflict.
+        let _raw = manager
+            .acquire_full("GR", "28", user("raw", 0), None, SessionTap::Raw, true)
+            .await
+            .expect("decode=0 acquire");
+        let error = manager
+            .acquire_full("GR", "28", user("normal", 50), None, SessionTap::Raw, false)
+            .await
+            .expect_err("a piped request must not preempt a decode=0 session");
+        assert_eq!(error, AcquireError::DecodeModeConflict);
+        assert_eq!(manager.sessions_snapshot().len(), 2);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn decode_zero_still_bypasses_the_whole_pipeline_when_it_is_first() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let subscription = manager
+            .acquire_full("GR", "27", user("raw", 0), None, SessionTap::Raw, true)
+            .await
+            .expect("decode=0 acquire");
+        // Only the tuner process: the pipeline stage is not spawned.
+        assert_eq!(manager.sessions_snapshot()[0].pids.len(), 1);
+        drop(subscription);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_join_that_loses_the_takeover_race_is_not_cut() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            30,
+            188,
+            8,
+        );
+
+        let held = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("victim acquire");
+        let victim = {
+            let state = lock(&manager.inner.state);
+            state.sessions.values().next().cloned().expect("victim")
+        };
+        // Model the race: the victim was selected as an idle target (the flag
+        // is set) and a request that passed its own `select` before the flag
+        // attached in the micro-window. Injecting the entry under the users
+        // lock is what `attach` does.
+        victim.takeover_pending.store(true, Ordering::SeqCst);
+        lock(&victim.users).push(subscriber(999, 0));
+
+        // The takeover re-checks idle-ness under the lock, finds the user and
+        // abandons instead of cutting that stream (priority 0 cannot preempt a
+        // session whose max user priority is 0).
+        let (reservation, selected_victim) = {
+            let mut state = lock(&manager.inner.state);
+            match reserve(
+                &mut state,
+                &manager.inner,
+                "t0",
+                "GR",
+                "28",
+                Some(Arc::clone(&victim)),
+                false,
+            ) {
+                Selection::Spawn { session, victim } => (session, victim.expect("victim")),
+                _ => panic!("expected a reservation"),
+            }
+        };
+        let result = spawn_and_promote(
+            &manager.inner,
+            reservation,
+            Some(Arc::clone(&selected_victim)),
+            &user("b", 0),
+            SessionTap::Raw,
+        )
+        .await;
+        match result {
+            Err(SpawnFailure::Aborted(AcquireError::Busy)) => {}
+            other => panic!("expected the takeover to be abandoned: {other:?}"),
+        }
+        assert_eq!(victim.phase(), SessionPhase::Ready);
+        // The injected joiner is still attached: its stream was not cut.
+        assert!(lock(&victim.users).iter().any(|entry| entry.id == 999));
+        assert!(!victim.takeover_pending.load(Ordering::SeqCst));
+        drop(held);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fast_source_does_not_lose_the_stream_head() {
+        let dir = TempDir::new().expect("tempdir");
+        // Eight packets emitted by one write (`cat` reads them in one go), with
+        // a replay cap of exactly eight chunks. Before the pre-attach window the
+        // broadcast ring only held `PRELUDE_CHUNKS` (2), so the first six
+        // packets — the PAT/PMT head — were lost.
+        let packets: Vec<Vec<u8>> = (0..8).map(|index| packet(index as u8)).collect();
+        let path = fixture(&dir, "burst.bin", &packets);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            PACKET,
+            8,
+        );
+
+        let mut subscription = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        let want = packets.len() * PACKET;
+        let received = read_at_least(&mut subscription.rx, want, Duration::from_secs(5)).await;
+        assert_eq!(received.len(), want, "the stream head was dropped");
+        assert_eq!(received, packets.concat());
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_natural_eof_marks_the_session_clean() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // `cat` then a pause: the stream ends by a natural EOF after delivering
+        // data, and the session is still registered when the test captures it.
+        let tuners = tuner_yaml(
+            "t0",
+            &["GR"],
+            &format!("sh -c \"cat {}; sleep 1\"", path.display()),
+        );
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let subscription = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        // The reservation is registered before the tree is spawned, so it is
+        // still there right after the acquire returns.
+        let session = {
+            let state = lock(&manager.inner.state);
+            state.sessions.values().next().cloned().expect("session")
+        };
+        drop(subscription);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !session.ended.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stream never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while manager
+            .sessions_snapshot()
+            .iter()
+            .any(|s| s.id == session.id)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ended session was not unregistered"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A clean EOF must not blacklist the tuner for a later request.
+        assert!(session.clean_eof.load(Ordering::SeqCst));
+
+        let again = manager
+            .acquire("GR", "27", user("b", 0), None, true)
+            .await
+            .expect("a clean EOF is not a broken tuner");
+        drop(again);
 
         manager.shutdown().await;
     }

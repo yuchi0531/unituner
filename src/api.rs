@@ -29,7 +29,13 @@
 //! interfere.
 //!
 //! `HEAD` is served by explicit handlers that return the stream headers and an
-//! empty body without acquiring a session, so a probe never tunes a device.
+//! empty body without acquiring a session, so a probe never tunes a device. A
+//! `HEAD` resolves and validates exactly like its `GET` (channel-scoped service
+//! lookup included), so both answer the same 404/400.
+//!
+//! A stream request whose `decode` value differs from the mode the channel is
+//! already streaming with is a **409** `{"code":409,…}`: one process tree per
+//! channel (SPEC §4, §6.2), so it can neither join nor preempt that session.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -48,7 +54,7 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use ipnet::IpNet;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
@@ -83,6 +89,9 @@ pub struct AppState {
     pub config_dir: PathBuf,
     /// Guards against concurrent scans (SPEC §8.1).
     pub scan_lock: ScanLock,
+    /// Fires when the process is shutting down; a running scan observes it so
+    /// shutdown is not held for `timeout × channels`.
+    shutdown: watch::Sender<bool>,
     allowed: Arc<Vec<IpNet>>,
 }
 
@@ -96,13 +105,25 @@ impl AppState {
             .iter()
             .filter_map(|cidr| cidr.parse::<IpNet>().ok())
             .collect();
+        let (shutdown, _) = watch::channel(false);
         Self {
             manager: SessionManager::new(Arc::clone(&config), services),
             config,
             config_dir,
             scan_lock: ScanLock::default(),
+            shutdown,
             allowed: Arc::new(allowed),
         }
+    }
+
+    /// A receiver for the process-wide shutdown signal.
+    pub fn shutdown_watch(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
+    /// Tells a running scan to stop before the caller tears the manager down.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     /// Whether `ip` is inside `server.allowed_cidrs` (SPEC §3.1). An empty list
@@ -110,9 +131,12 @@ impl AppState {
     ///
     /// An IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`, which is what a dual-stack
     /// listener reports) is matched as its IPv4 address, so the RFC1918
-    /// defaults keep working on a dual-stack socket.
+    /// defaults keep working on a dual-stack socket. The IPv6 loopback `::1` is
+    /// matched as `127.0.0.1`, so a v6 bind does not 403 a local probe when the
+    /// list only carries the IPv4 loopback.
     fn allows(&self, ip: IpAddr) -> bool {
         let ip = match ip {
+            IpAddr::V6(v6) if v6.is_loopback() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
             IpAddr::V4(_) => ip,
         };
@@ -533,20 +557,20 @@ async fn channel_service_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    // Service resolution (404) comes before tuner and URL validation (400),
-    // SPEC §6.3.
-    let record = match state.manager.services().resolve(&service) {
-        Ok(record) => record,
-        Err(error) => {
-            tracing::debug!(%error, id = %service, "service not found");
-            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-        }
-    };
-    if let Some((record_type, record_channel)) = &record.channel {
-        if record_type != &channel_type || record_channel != &channel {
-            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-        }
-    }
+    // The channel is in the path, so it disambiguates a sid present on two
+    // channels: resolve it channel-scoped, not through the global lookup.
+    let record =
+        match state
+            .manager
+            .services()
+            .resolve_raw_on_channel(&channel_type, &channel, &service)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::debug!(%error, id = %service, "service not found");
+                return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+            }
+        };
     if let Err(reason) = validate_path(&channel_type, &channel) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
@@ -628,16 +652,22 @@ async fn stream_service(
 }
 
 /// HEAD for the channel stream: the same headers, an empty body, and no
-/// session is acquired (a probe must not tune a device). The path is validated
-/// like the GET, so a malformed channel still yields the same 400.
+/// session is acquired (a probe must not tune a device). The path, the priority
+/// header and the pin are validated like the GET, so a malformed request still
+/// yields the same 400.
 async fn stream_head(
+    State(state): State<AppState>,
     UrlPath((channel_type, channel)): UrlPath<(String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(reason) = validate_path(&channel_type, &channel) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
-    empty_stream_head(peer)
+    match validate_stream_request(&state, &headers, peer, &channel_type) {
+        Ok(()) => empty_stream_head(peer),
+        Err(response) => response,
+    }
 }
 
 /// HEAD for `/api/services/{id}/stream`: resolves the service first, so an
@@ -646,23 +676,70 @@ async fn service_head(
     State(state): State<AppState>,
     UrlPath(service): UrlPath<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
-    match state.manager.services().resolve(&service) {
-        Ok(_) => empty_stream_head(peer),
-        Err(_) => error_response(StatusCode::NOT_FOUND, "Service Not Found"),
+    let record = match state.manager.services().resolve(&service) {
+        Ok(record) => record,
+        Err(_) => return error_response(StatusCode::NOT_FOUND, "Service Not Found"),
+    };
+    let Some((channel_type, channel)) = record.channel.clone() else {
+        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+    };
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    match validate_stream_request(&state, &headers, peer, &channel_type) {
+        Ok(()) => empty_stream_head(peer),
+        Err(response) => response,
     }
 }
 
-/// HEAD for `/api/channels/{type}/{channel}/services/{id}/stream`.
+/// HEAD for `/api/channels/{type}/{channel}/services/{id}/stream`: resolves the
+/// service on that channel (like the GET) and validates the path and headers,
+/// so the same 404/400 statuses come back without acquiring a session.
 async fn channel_service_head(
     State(state): State<AppState>,
-    UrlPath((_, _, service)): UrlPath<(String, String, String)>,
+    UrlPath((channel_type, channel, service)): UrlPath<(String, String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Response {
-    match state.manager.services().resolve(&service) {
-        Ok(_) => empty_stream_head(peer),
-        Err(_) => error_response(StatusCode::NOT_FOUND, "Service Not Found"),
+    match state
+        .manager
+        .services()
+        .resolve_raw_on_channel(&channel_type, &channel, &service)
+    {
+        Ok(_) => {}
+        Err(_) => return error_response(StatusCode::NOT_FOUND, "Service Not Found"),
     }
+    if let Err(reason) = validate_path(&channel_type, &channel) {
+        return error_response(StatusCode::BAD_REQUEST, reason);
+    }
+    match validate_stream_request(&state, &headers, peer, &channel_type) {
+        Ok(()) => empty_stream_head(peer),
+        Err(response) => response,
+    }
+}
+
+/// The GET-side validation a HEAD must repeat without acquiring a session:
+/// the priority header parses (400) and the pin names an enabled tuner of the
+/// right type (400). `Err` carries the already-shaped error response.
+#[allow(clippy::result_large_err)]
+fn validate_stream_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    channel_type: &str,
+) -> Result<(), Response> {
+    let request = match StreamRequest::new(headers, peer) {
+        Ok(request) => request,
+        Err(reason) => return Err(error_response(StatusCode::BAD_REQUEST, reason)),
+    };
+    if let Some(pin) = &request.pin {
+        if let Err(error) = state.manager.validate_pin(pin, channel_type) {
+            return Err(acquire_failure(&error));
+        }
+    }
+    Ok(())
 }
 
 fn empty_stream_head(peer: SocketAddr) -> Response {
@@ -743,6 +820,11 @@ fn is_decode_zero(params: &HashMap<String, String>) -> bool {
 fn acquire_failure(error: &AcquireError) -> Response {
     let status = match error {
         AcquireError::UnknownTuner(_) | AcquireError::UnsupportedType(_) => StatusCode::BAD_REQUEST,
+        // One process tree per channel: a request that wants the other decode
+        // mode cannot be satisfied without cutting the existing stream, so it
+        // is refused as a conflict rather than preempting (which would let two
+        // clients ping-pong the tuner).
+        AcquireError::DecodeModeConflict => StatusCode::CONFLICT,
         AcquireError::NoTuner
         | AcquireError::Unavailable
         | AcquireError::Busy
@@ -751,6 +833,12 @@ fn acquire_failure(error: &AcquireError) -> Response {
     if status == StatusCode::SERVICE_UNAVAILABLE {
         tracing::warn!(%error, "stream request rejected");
         error_response(status, "Tuner Resource Unavailable")
+    } else if status == StatusCode::CONFLICT {
+        tracing::debug!(%error, "stream request rejected");
+        error_response(
+            status,
+            format!("{error}: the channel is already streaming with the other decode mode"),
+        )
     } else {
         tracing::debug!(%error, "stream request rejected");
         error_response(status, error.to_string())
@@ -784,13 +872,22 @@ async fn scan_channels(
     let manager = state.manager.clone();
     let config = Arc::clone(&state.config);
     let config_dir = state.config_dir.clone();
+    let shutdown = state.shutdown_watch();
     tokio::spawn(async move {
         tracing::info!(
             type_name = %query.type_name,
             dry_run = query.dry_run,
             "channel scan started"
         );
-        let result = scan::run_scan(&manager, &config, &config_dir, &query, tx.clone()).await;
+        let result = scan::run_scan(
+            &manager,
+            &config,
+            &config_dir,
+            &query,
+            tx.clone(),
+            Some(shutdown),
+        )
+        .await;
         if let Err(error) = result {
             tracing::warn!(%error, "channel scan failed");
             let _ = tx.send(format!("error: {error}\n")).await;
