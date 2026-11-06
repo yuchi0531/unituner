@@ -229,9 +229,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(tuners: &str, channels: &str, pipelines: &str) -> Self {
+        Self::new_with_server(SERVER, tuners, channels, pipelines)
+    }
+
+    fn new_with_server(server: &str, tuners: &str, channels: &str, pipelines: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         for (name, body) in [
-            ("server.yml", SERVER.to_string()),
+            ("server.yml", server.to_string()),
             ("tuners.yml", tuners.to_string()),
             ("channels.yml", channels.to_string()),
             ("pipelines.yml", pipelines.to_string()),
@@ -572,6 +576,26 @@ fn stream_fixture() -> (Fixture, Vec<u8>) {
     (fixture, ts)
 }
 
+/// A fixture whose tuner writes `marker` before streaming, so a test can prove
+/// a request did (or did not) spawn a tuner process at all.
+fn marker_fixture_with(channels_yml: &str) -> (Fixture, PathBuf) {
+    let fixture = Fixture::new(&tuners("true"), channels_yml, PIPELINE_CAT);
+    let ts = [packet_bytes(0x11), packet_bytes(0x22)].concat();
+    let path = fixture.write_ts("stream.ts", &ts);
+    let marker = fixture.path.join("tuner-spawned");
+    let command = format!(
+        "sh -c \"touch {}; cat {}; sleep 30\"",
+        marker.display(),
+        path.display()
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command)).expect("rewrite tuners.yml");
+    (fixture, marker)
+}
+
+fn marker_fixture() -> (Fixture, PathBuf) {
+    marker_fixture_with(&channels(&[("NHK", "27")]))
+}
+
 #[tokio::test]
 async fn the_channel_stream_returns_the_post_pipeline_bytes() {
     let (fixture, ts) = stream_fixture();
@@ -659,6 +683,374 @@ async fn head_of_an_unknown_service_is_404() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
         assert_server_identity(response.headers());
     }
+}
+
+// ---------------------------------------------------------------------------
+// channels.yml is the allowlist for every tuner-backed stream
+// ---------------------------------------------------------------------------
+
+/// `channels(&[…])` plus one `disabled: true` entry.
+const CHANNELS_WITH_DISABLED: &str = "- name: NHK\n  type: GR\n  channel: \"27\"\n\
+     - name: Off\n  type: GR\n  channel: \"99\"\n  disabled: true\n";
+
+#[tokio::test]
+async fn an_unconfigured_channel_stream_is_404_on_get_and_head() {
+    let (fixture, marker) = marker_fixture();
+    let state = fixture.state();
+
+    // A HEAD response carries no body (axum strips it), so only its status is
+    // compared to the GET's JSON 404.
+    for method in [Method::GET, Method::HEAD] {
+        let (status, headers, body) = send_body(
+            &state,
+            PEER,
+            request(method.clone(), "/api/channels/GR/99/stream"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} unknown channel");
+        assert_server_identity(&headers);
+        if method == Method::GET {
+            assert_eq!(json(&body)["code"], 404);
+            assert_eq!(json(&body)["reason"], "Channel Not Found");
+        }
+    }
+
+    // The URL's `{channel}` is not a tuner selector: nothing may tune.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "an unknown channel must not spawn a tuner process"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_channel_stream_is_404_on_get_and_head() {
+    let (fixture, marker) = marker_fixture_with(CHANNELS_WITH_DISABLED);
+    let state = fixture.state();
+
+    for method in [Method::GET, Method::HEAD] {
+        let (status, _, body) = send_body(
+            &state,
+            PEER,
+            request(method.clone(), "/api/channels/GR/99/stream"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} disabled channel");
+        if method == Method::GET {
+            assert_eq!(json(&body)["code"], 404);
+        }
+    }
+
+    // A disabled channel is not streamable, so it is as absent as a typo.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "a disabled channel must not spawn a tuner process"
+    );
+
+    // The metadata endpoints still list it: only streaming is gated.
+    let (status, _, _) = send_body(&state, PEER, request(Method::GET, "/api/channels/GR/99")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_enabled_channel_still_streams() {
+    let (fixture, marker) = marker_fixture();
+    let state = fixture.state();
+
+    let response = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _held_body = response.into_body();
+    assert!(marker.exists(), "a configured channel must reach the tuner");
+}
+
+#[tokio::test]
+async fn a_service_on_an_unconfigured_channel_is_404_on_get_and_head() {
+    // A service table entry may name a channel that `channels.yml` no longer
+    // carries (a removed or disabled entry): tuning to it is not allowed.
+    let (fixture, marker) = marker_fixture();
+    let services = ServiceTable::new();
+    let mut record = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "Ghost");
+    record.channel = Some(("GR".to_string(), "98".to_string()));
+    services.upsert(record);
+    let state = fixture.state_with(services);
+
+    for method in [Method::GET, Method::HEAD] {
+        let (status, _, body) = send_body(
+            &state,
+            PEER,
+            request(
+                method.clone(),
+                &format!("/api/services/{TARGET_SID}/stream"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} ghost channel");
+        if method == Method::GET {
+            assert_eq!(json(&body)["code"], 404);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "a service bound to an unconfigured channel must not tune"
+    );
+}
+
+#[tokio::test]
+async fn a_service_on_a_disabled_channel_is_404_on_get_and_head() {
+    let (fixture, marker) = marker_fixture_with(CHANNELS_WITH_DISABLED);
+    let services = ServiceTable::new();
+    let mut record = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "Off");
+    record.channel = Some(("GR".to_string(), "99".to_string()));
+    services.upsert(record);
+    let state = fixture.state_with(services);
+
+    for method in [Method::GET, Method::HEAD] {
+        let (status, _, body) = send_body(
+            &state,
+            PEER,
+            request(
+                method.clone(),
+                &format!("/api/services/{TARGET_SID}/stream"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} disabled channel");
+        if method == Method::GET {
+            assert_eq!(json(&body)["code"], 404);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "a service bound to a disabled channel must not tune"
+    );
+}
+
+#[tokio::test]
+async fn a_service_stream_on_an_unconfigured_channel_path_is_404() {
+    // The channel-scoped service route must gate on the path channel before
+    // resolving (and before tuning), for GET and HEAD alike.
+    let (fixture, marker) = marker_fixture();
+    let services = ServiceTable::new();
+    for (sid, name) in [(TARGET_SID, "On 27"), (0x0400, "Also on 27")] {
+        let mut record = ServiceRecord::new(NETWORK_ID, TSID, sid, 0x01, name);
+        record.channel = Some(("GR".to_string(), "27".to_string()));
+        services.upsert(record);
+    }
+    let state = fixture.state_with(services);
+
+    for method in [Method::GET, Method::HEAD] {
+        let (status, _, body) = send_body(
+            &state,
+            PEER,
+            request(
+                method.clone(),
+                &format!("/api/channels/GR/99/services/{TARGET_SID}/stream"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} unknown path");
+        if method == Method::GET {
+            assert_eq!(json(&body)["code"], 404);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "an unknown channel path must not tune");
+}
+
+#[tokio::test]
+async fn head_reports_static_errors_like_get_and_never_tunes() {
+    let (fixture, marker) = marker_fixture();
+    let state = fixture.state();
+
+    // Unknown channel (404), unknown pin (400), malformed priority (400): HEAD
+    // and GET agree on each, and none of them reaches a tuner.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode);
+    let cases: [Case<'_>; 3] = [
+        ("/api/channels/GR/99/stream", &[], StatusCode::NOT_FOUND),
+        (
+            "/api/channels/GR/27/stream",
+            &[("x-mirakc-tuner", "nope")],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/channels/GR/27/stream",
+            &[("x-mirakurun-priority", "high")],
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (uri, headers, want) in cases {
+        let get = send(
+            &state,
+            PEER,
+            request_with_headers(Method::GET, uri, headers),
+        )
+        .await;
+        let head = send(
+            &state,
+            PEER,
+            request_with_headers(Method::HEAD, uri, headers),
+        )
+        .await;
+        assert_eq!(get.status(), want, "GET {uri} {headers:?}");
+        assert_eq!(head.status(), get.status(), "HEAD must match GET for {uri}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "a rejected request must not tune");
+
+    // A valid HEAD is a 200 that still does not tune.
+    let head = send(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::HEAD,
+            "/api/channels/GR/27/stream",
+            &[("x-mirakc-tuner", "t0")],
+        ),
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(read_all(head.into_body()).await.is_empty());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!marker.exists(), "a HEAD probe must never start a tuner");
+
+    // The same request as a GET does tune.
+    let get = send(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/channels/GR/27/stream",
+            &[("x-mirakc-tuner", "t0")],
+        ),
+    )
+    .await;
+    assert_eq!(get.status(), StatusCode::OK);
+    let _held_body = get.into_body();
+    assert!(marker.exists(), "the GET must reach the tuner");
+}
+
+// ---------------------------------------------------------------------------
+// Service table: one list entry per id
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_service_list_emits_each_id_once() {
+    let fixture = Fixture::new(
+        &tuners("true"),
+        &channels(&[("A", "27"), ("B", "28")]),
+        PIPELINE_CAT,
+    );
+    let services = ServiceTable::new();
+    // The same (nid, sid) received on two physical channels: one id, two rows.
+    for channel in ["27", "28"] {
+        let mut record = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "Shared");
+        record.channel = Some(("GR".to_string(), channel.to_string()));
+        services.upsert(record);
+    }
+    // A second, distinct service.
+    let mut other = ServiceRecord::new(NETWORK_ID, TSID, 0x0400, 0x01, "Other");
+    other.channel = Some(("GR".to_string(), "27".to_string()));
+    services.upsert(other);
+    let state = fixture.state_with(services);
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = json(&body);
+    let list = list.as_array().expect("array");
+    assert_eq!(list.len(), 2, "duplicate ids must collapse: {list:?}");
+    let ids: Vec<u64> = list
+        .iter()
+        .map(|entry| entry["id"].as_u64().expect("id"))
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&(NETWORK_ID as u64 * 100_000 + TARGET_SID as u64)));
+    assert!(ids.contains(&(NETWORK_ID as u64 * 100_000 + 0x0400)));
+
+    // The list keeps the table's stable order, and the duplicate that is kept
+    // is the one `/api/services/{id}` returns (the first in that order).
+    let shared = list
+        .iter()
+        .find(|entry| entry["serviceId"] == TARGET_SID)
+        .expect("shared service");
+    let first_channel = shared["channel"]["channel"].as_str().expect("channel");
+    let (status, _, detail) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::GET,
+            &format!(
+                "/api/services/{}",
+                NETWORK_ID as u64 * 100_000 + TARGET_SID as u64
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&detail)["channel"]["channel"], first_channel);
+}
+
+#[tokio::test]
+async fn a_unique_bare_sid_resolves_and_an_ambiguous_one_is_404() {
+    let fixture = Fixture::new(
+        &tuners("true"),
+        &channels(&[("A", "27"), ("B", "28")]),
+        PIPELINE_CAT,
+    );
+    let services = ServiceTable::new();
+    let mut unique = ServiceRecord::new(NETWORK_ID, TSID, 0x0500, 0x01, "Unique");
+    unique.channel = Some(("GR".to_string(), "27".to_string()));
+    services.upsert(unique);
+    for channel in ["27", "28"] {
+        let mut shared = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "Shared");
+        shared.channel = Some(("GR".to_string(), channel.to_string()));
+        services.upsert(shared);
+    }
+    let state = fixture.state_with(services);
+
+    let (status, _, body) =
+        send_body(&state, PEER, request(Method::GET, "/api/services/1280")).await;
+    assert_eq!(status, StatusCode::OK, "0x0500 is unique");
+    assert_eq!(json(&body)["serviceId"], 0x0500);
+
+    let (status, _, _) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, &format!("/api/services/{TARGET_SID}")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an ambiguous bare sid stays a 404 (SPEC §5)"
+    );
+
+    // An exact item id still resolves even when the sid alone is ambiguous.
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::GET,
+            &format!(
+                "/api/services/{}",
+                NETWORK_ID as u64 * 100_000 + TARGET_SID as u64
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["serviceId"], TARGET_SID);
 }
 
 #[tokio::test]
@@ -1428,6 +1820,64 @@ async fn an_invalid_scan_query_is_400() {
 }
 
 #[tokio::test]
+async fn a_corrupt_channels_yml_fails_the_scan_before_streaming() {
+    let (fixture, _) = scan_fixture();
+    // The running server already holds a valid config; the scan re-reads the
+    // file from disk, so a later corruption must not be hidden in a 200 body.
+    let state = fixture.state();
+    std::fs::write(fixture.path.join("channels.yml"), "name: [oops\n").expect("corrupt");
+
+    let (status, headers, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_server_identity(&headers);
+    let error = json(&body);
+    assert_eq!(error["code"], 500);
+    assert!(
+        error["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("channels.yml"),
+        "{error}"
+    );
+    // The header arrived as JSON, so the response never started streaming and
+    // the corrupt file is untouched.
+    assert_eq!(
+        std::fs::read_to_string(fixture.path.join("channels.yml")).expect("read"),
+        "name: [oops\n"
+    );
+    // No lease was taken, so the next scan is not a 409.
+    assert!(!state.scan_lock.is_running());
+}
+
+#[tokio::test]
+async fn a_scan_with_an_empty_channels_yml_still_streams_progress() {
+    let (fixture, _) = scan_fixture();
+    let state = fixture.state();
+    std::fs::write(fixture.path.join("channels.yml"), "").expect("blank channels.yml");
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}&dryRun=true"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(text.contains("channel scanning..."), "{text}");
+}
+
+#[tokio::test]
 async fn a_huge_scan_range_is_400_without_allocating() {
     let (fixture, _) = scan_fixture();
     let state = fixture.state();
@@ -1553,9 +2003,9 @@ async fn a_sid_on_two_channels_resolves_on_the_channel_path() {
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    // A malformed channel is validated like the GET: resolution is
-    // channel-scoped, so no service can be bound to an invalid channel and both
-    // methods answer the same way.
+    // A syntactically invalid channel is a 400 on both methods: path validation
+    // comes before service resolution, and no service can be bound to an
+    // invalid channel, so both answer the same way.
     let mut statuses = Vec::new();
     for method in [Method::GET, Method::HEAD] {
         let response = send(
@@ -1570,7 +2020,7 @@ async fn a_sid_on_two_channels_resolves_on_the_channel_path() {
         statuses.push(response.status());
     }
     assert_eq!(statuses[0], statuses[1], "HEAD must match GET");
-    assert_eq!(statuses[0], StatusCode::NOT_FOUND);
+    assert_eq!(statuses[0], StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1585,6 +2035,74 @@ async fn the_ipv6_loopback_is_allowed_by_the_ipv4_loopback_entry() {
         StatusCode::OK,
         "a v6 loopback peer must not be forbidden by 127.0.0.0/8"
     );
+}
+
+const SERVER_V6_LOOPBACK: &str = r#"
+addr: ":0"
+allowed_cidrs:
+  - "::1/128"
+"#;
+
+const SERVER_V4_LOOPBACK: &str = r#"
+addr: ":0"
+allowed_cidrs:
+  - 127.0.0.0/8
+"#;
+
+#[tokio::test]
+async fn an_explicit_ipv6_loopback_cidr_matches_the_v6_loopback_peer() {
+    let fixture = Fixture::new_with_server(
+        SERVER_V6_LOOPBACK,
+        &tuners("true"),
+        &channels(&[]),
+        PIPELINE_CAT,
+    );
+    let state = fixture.state();
+    let v6_loopback = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1);
+    let v4_loopback = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
+
+    let (status, _, _) = send_body(&state, v6_loopback, request(Method::GET, "/api/version")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "::1/128 must admit the v6 loopback as given, not only as 127.0.0.1"
+    );
+
+    // Deny-by-default is unchanged: the v4 loopback is a different address.
+    let (status, _, _) = send_body(&state, v4_loopback, request(Method::GET, "/api/version")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_v6_mapped_peer_matches_the_ipv4_cidr_list() {
+    let fixture = Fixture::new_with_server(
+        SERVER_V4_LOOPBACK,
+        &tuners("true"),
+        &channels(&[]),
+        PIPELINE_CAT,
+    );
+    let state = fixture.state();
+    // What a dual-stack listener reports for a local connection.
+    let mapped = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        1,
+    );
+
+    let (status, _, _) = send_body(&state, mapped, request(Method::GET, "/api/version")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "::ffff:127.0.0.1 must match 127.0.0.0/8"
+    );
+
+    // A mapped non-loopback address is still outside the list.
+    let mapped_outside = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv4Addr::new(203, 0, 113, 5).to_ipv6_mapped()),
+        1,
+    );
+    let (status, _, _) =
+        send_body(&state, mapped_outside, request(Method::GET, "/api/version")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

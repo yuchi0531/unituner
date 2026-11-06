@@ -28,19 +28,45 @@
 //! per-subscriber [`ServiceFilter`] (SPEC §4, §5) so subscribers never
 //! interfere.
 //!
+//! Every tuner-backed stream route resolves `(type, channel)` against
+//! `channels.yml` before touching a tuner, so the configured list is the
+//! allowlist and the URL's `{channel}` is not an arbitrary tuner selector. An
+//! unknown pair and a `disabled: true` entry are both a **404** `Channel Not
+//! Found`: a disabled channel is treated as *not present* rather than
+//! forbidden, because the URL is not a stream endpoint at all (and that keeps
+//! the response shape identical to a typo). `/api/services/{id}/stream` checks
+//! the channel the service table resolves to the same way.
+//!
+//! The validation order is fixed for `GET` and `HEAD`:
+//!
+//! 1. path syntax ([`validate_path`]): 400;
+//! 2. channel allowlist (`channels.yml`, enabled): 404;
+//! 3. service resolution: 404;
+//! 4. header parse (priority): 400;
+//! 5. pinned tuner existence / type support: 400;
+//! 6. tuner scheduling and resource errors: 409/503.
+//!
+//! `/api/services/{id}/stream` has no `(type, channel)` in its path, so it must
+//! resolve the service first to learn one; step 3 runs before step 2 there (an
+//! unknown service and a service bound to an unknown/disabled channel are both
+//! a 404 anyway).
+//!
 //! `HEAD` is served by explicit handlers that return the stream headers and an
 //! empty body without acquiring a session, so a probe never tunes a device. A
-//! `HEAD` resolves and validates exactly like its `GET` (channel-scoped service
-//! lookup included), so both answer the same 404/400.
+//! `HEAD` runs steps 1–5 (via the same `validate_*` functions as its `GET`), so
+//! both answer the same 400/404. Steps 6 need a session and are not simulated:
+//! `HEAD` reports only statically decidable errors, so a request that `GET`
+//! would refuse with 503 (all tuners busy) or 409 (decode-mode conflict) can
+//! still answer 200, but a static error is never a 200.
 //!
 //! A stream request whose `decode` value differs from the mode the channel is
 //! already streaming with is a **409** `{"code":409,…}`: one process tree per
 //! channel (SPEC §4, §6.2), so it can neither join nor preempt that session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -129,18 +155,34 @@ impl AppState {
     /// Whether `ip` is inside `server.allowed_cidrs` (SPEC §3.1). An empty list
     /// denies everything, which is the safe reading of "no allowed network".
     ///
-    /// An IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`, which is what a dual-stack
-    /// listener reports) is matched as its IPv4 address, so the RFC1918
-    /// defaults keep working on a dual-stack socket. The IPv6 loopback `::1` is
-    /// matched as `127.0.0.1`, so a v6 bind does not 403 a local probe when the
-    /// list only carries the IPv4 loopback.
+    /// The original peer address is matched first, then the IPv4 forms of it:
+    /// an IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`, which is what a dual-stack
+    /// listener reports) is matched as its IPv4 address so the RFC1918 defaults
+    /// keep working, and the IPv6 loopback `::1` is also matched as
+    /// `127.0.0.1` so a v6 bind does not 403 a local probe when the list only
+    /// carries the IPv4 loopback. Matching the original address first means an
+    /// explicit `::1/128` (or `::ffff:0:0/96`) entry works too. Deny-by-default
+    /// is unchanged: no candidate form inside any CIDR is still a 403.
     fn allows(&self, ip: IpAddr) -> bool {
-        let ip = match ip {
-            IpAddr::V6(v6) if v6.is_loopback() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-            IpAddr::V4(_) => ip,
-        };
-        self.allowed.iter().any(|net| net.contains(&ip))
+        let mut candidates = vec![ip];
+        match ip {
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    candidates.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                }
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    candidates.push(IpAddr::V4(v4));
+                }
+            }
+            IpAddr::V4(v4) => {
+                // A v4 peer may arrive from a v4-mapped listener, so accept an
+                // explicit v4-mapped CIDR as well.
+                candidates.push(IpAddr::V6(v4.to_ipv6_mapped()));
+            }
+        }
+        candidates
+            .iter()
+            .any(|candidate| self.allowed.iter().any(|net| net.contains(candidate)))
     }
 }
 
@@ -338,13 +380,21 @@ fn find_channel<'a>(
 // Services
 // ---------------------------------------------------------------------------
 
+/// The service table as mirakurun clients consume it.
+///
+/// The same `(nid, sid)` can be received on two physical channels, which would
+/// otherwise repeat one `id` in the list. Clients key on `id`, so each id is
+/// emitted once: the first record in the stable table order (network, tsid,
+/// service id, then channel) wins and later duplicates are skipped. That is
+/// also the record `/api/services/{id}` returns, so list and detail agree.
 async fn services_list(State(state): State<AppState>) -> Json<Value> {
+    let services = state.manager.services();
+    let mut seen = HashSet::new();
     Json(Value::Array(
-        state
-            .manager
-            .services()
+        services
             .list()
             .iter()
+            .filter(|record| seen.insert(record.item_id()))
             .map(service_json)
             .collect(),
     ))
@@ -525,12 +575,9 @@ async fn channel_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    let request = match StreamRequest::new(&headers, peer) {
+    let request = match validate_channel_stream(&state, &channel_type, &channel, &headers, peer) {
         Ok(request) => request,
-        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
+        Err(response) => return response,
     };
     let decode = is_decode_zero(&params);
     let subscription = state
@@ -557,32 +604,18 @@ async fn channel_service_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    // The channel is in the path, so it disambiguates a sid present on two
-    // channels: resolve it channel-scoped, not through the global lookup.
-    let record =
-        match state
-            .manager
-            .services()
-            .resolve_raw_on_channel(&channel_type, &channel, &service)
-        {
-            Ok(record) => record,
-            Err(error) => {
-                tracing::debug!(%error, id = %service, "service not found");
-                return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-            }
-        };
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    stream_service(
+    let (record, request) = match validate_channel_service_stream(
         &state,
-        &record,
+        &channel_type,
+        &channel,
+        &service,
         &headers,
         peer,
-        &params,
-        Some((channel_type, channel)),
-    )
-    .await
+    ) {
+        Ok(validated) => validated,
+        Err(response) => return response,
+    };
+    stream_service(&state, &record, &channel_type, &channel, request, &params).await
 }
 
 async fn service_stream(
@@ -592,47 +625,29 @@ async fn service_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let record = match state.manager.services().resolve(&service) {
-        Ok(record) => record,
-        Err(error) => {
-            tracing::debug!(%error, id = %service, "service not found");
-            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-        }
-    };
-    let Some((channel_type, channel)) = record.channel.clone() else {
-        // Without a channel binding there is no way to tune to this service.
-        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-    };
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    stream_service(&state, &record, &headers, peer, &params, None).await
+    let (record, channel_type, channel, request) =
+        match validate_service_stream(&state, &service, &headers, peer) {
+            Ok(validated) => validated,
+            Err(response) => return response,
+        };
+    stream_service(&state, &record, &channel_type, &channel, request, &params).await
 }
 
-/// Shared body of the two service-stream endpoints.
+/// Shared acquisition of the two service-stream routes.
 async fn stream_service(
     state: &AppState,
     record: &ServiceRecord,
-    headers: &HeaderMap,
-    peer: SocketAddr,
+    channel_type: &str,
+    channel: &str,
+    request: StreamRequest,
     params: &HashMap<String, String>,
-    channel_from_path: Option<(String, String)>,
 ) -> Response {
-    let request = match StreamRequest::new(headers, peer) {
-        Ok(request) => request,
-        Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
-    };
-    // The channel comes from the service table; the `/api/channels/...` form
-    // falls back to its own path segments when the table has no binding yet.
-    let Some((channel_type, channel)) = record.channel.clone().or(channel_from_path) else {
-        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-    };
     let decode = is_decode_zero(params);
     let subscription = state
         .manager
         .acquire_full(
-            &channel_type,
-            &channel,
+            channel_type,
+            channel,
             request.user(),
             request.pin.clone(),
             SessionTap::Filtered {
@@ -652,94 +667,151 @@ async fn stream_service(
 }
 
 /// HEAD for the channel stream: the same headers, an empty body, and no
-/// session is acquired (a probe must not tune a device). The path, the priority
-/// header and the pin are validated like the GET, so a malformed request still
-/// yields the same 400.
+/// session is acquired (a probe must not tune a device). It runs the same
+/// [`validate_channel_stream`] as the GET, so both answer the same 400/404.
 async fn stream_head(
     State(state): State<AppState>,
     UrlPath((channel_type, channel)): UrlPath<(String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    match validate_stream_request(&state, &headers, peer, &channel_type) {
-        Ok(()) => empty_stream_head(peer),
+    match validate_channel_stream(&state, &channel_type, &channel, &headers, peer) {
+        Ok(_) => empty_stream_head(peer),
         Err(response) => response,
     }
 }
 
-/// HEAD for `/api/services/{id}/stream`: resolves the service first, so an
-/// unknown id is a 404 like the GET.
+/// HEAD for `/api/services/{id}/stream`: resolves the service and its channel
+/// first, so an unknown id or an unconfigured channel is a 404 like the GET.
 async fn service_head(
     State(state): State<AppState>,
     UrlPath(service): UrlPath<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let record = match state.manager.services().resolve(&service) {
-        Ok(record) => record,
-        Err(_) => return error_response(StatusCode::NOT_FOUND, "Service Not Found"),
-    };
-    let Some((channel_type, channel)) = record.channel.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "Service Not Found");
-    };
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    match validate_stream_request(&state, &headers, peer, &channel_type) {
-        Ok(()) => empty_stream_head(peer),
+    match validate_service_stream(&state, &service, &headers, peer) {
+        Ok(_) => empty_stream_head(peer),
         Err(response) => response,
     }
 }
 
 /// HEAD for `/api/channels/{type}/{channel}/services/{id}/stream`: resolves the
-/// service on that channel (like the GET) and validates the path and headers,
-/// so the same 404/400 statuses come back without acquiring a session.
+/// service on that channel (like the GET) and validates the path, the channel
+/// allowlist and the headers, so the same 400/404 statuses come back without
+/// acquiring a session.
 async fn channel_service_head(
     State(state): State<AppState>,
     UrlPath((channel_type, channel, service)): UrlPath<(String, String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    match state
-        .manager
-        .services()
-        .resolve_raw_on_channel(&channel_type, &channel, &service)
+    match validate_channel_service_stream(&state, &channel_type, &channel, &service, &headers, peer)
     {
-        Ok(_) => {}
-        Err(_) => return error_response(StatusCode::NOT_FOUND, "Service Not Found"),
-    }
-    if let Err(reason) = validate_path(&channel_type, &channel) {
-        return error_response(StatusCode::BAD_REQUEST, reason);
-    }
-    match validate_stream_request(&state, &headers, peer, &channel_type) {
-        Ok(()) => empty_stream_head(peer),
+        Ok(_) => empty_stream_head(peer),
         Err(response) => response,
     }
 }
 
-/// The GET-side validation a HEAD must repeat without acquiring a session:
-/// the priority header parses (400) and the pin names an enabled tuner of the
-/// right type (400). `Err` carries the already-shaped error response.
+/// The statically decidable validation `GET` and `HEAD` share, in order:
+/// path syntax (400), channel allowlist (404), header parse (400), pinned tuner
+/// (400). Resource errors (409/503) need a session and are left to the GET.
 #[allow(clippy::result_large_err)]
-fn validate_stream_request(
+fn validate_channel_stream(
+    state: &AppState,
+    channel_type: &str,
+    channel: &str,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<StreamRequest, Response> {
+    validate_path(channel_type, channel)
+        .map_err(|reason| error_response(StatusCode::BAD_REQUEST, reason))?;
+    require_channel(&state.config, channel_type, channel)?;
+    finish_stream_request(state, headers, peer, channel_type)
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_channel_service_stream(
+    state: &AppState,
+    channel_type: &str,
+    channel: &str,
+    service: &str,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(ServiceRecord, StreamRequest), Response> {
+    validate_path(channel_type, channel)
+        .map_err(|reason| error_response(StatusCode::BAD_REQUEST, reason))?;
+    require_channel(&state.config, channel_type, channel)?;
+    // The channel is in the path, so it disambiguates a sid present on two
+    // channels: resolve it channel-scoped, not through the global lookup.
+    let record = state
+        .manager
+        .services()
+        .resolve_raw_on_channel(channel_type, channel, service)
+        .map_err(|error| {
+            tracing::debug!(%error, id = %service, "service not found");
+            error_response(StatusCode::NOT_FOUND, "Service Not Found")
+        })?;
+    let request = finish_stream_request(state, headers, peer, channel_type)?;
+    Ok((record, request))
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_service_stream(
+    state: &AppState,
+    service: &str,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(ServiceRecord, String, String, StreamRequest), Response> {
+    let record = state.manager.services().resolve(service).map_err(|error| {
+        tracing::debug!(%error, id = %service, "service not found");
+        error_response(StatusCode::NOT_FOUND, "Service Not Found")
+    })?;
+    let Some((channel_type, channel)) = record.channel.clone() else {
+        // Without a channel binding there is no way to tune to this service.
+        return Err(error_response(StatusCode::NOT_FOUND, "Service Not Found"));
+    };
+    validate_path(&channel_type, &channel)
+        .map_err(|reason| error_response(StatusCode::BAD_REQUEST, reason))?;
+    // A service whose channel is no longer in `channels.yml` (or is disabled)
+    // is not tuneable, so it is as absent as an unknown service.
+    require_channel(&state.config, &channel_type, &channel)?;
+    let request = finish_stream_request(state, headers, peer, &channel_type)?;
+    Ok((record, channel_type, channel, request))
+}
+
+/// The configured, **enabled** `(type, channel)`, or the 404 every stream route
+/// answers for an unknown one. `disabled: true` is treated as absent: the
+/// channel is not a streamable resource, and a 404 keeps a disabled entry
+/// indistinguishable from a typo.
+#[allow(clippy::result_large_err)]
+fn require_channel<'a>(
+    config: &'a Config,
+    channel_type: &str,
+    channel: &str,
+) -> Result<&'a ChannelConfig, Response> {
+    match find_channel(config, channel_type, channel) {
+        Some(entry) if !entry.disabled => Ok(entry),
+        _ => Err(error_response(StatusCode::NOT_FOUND, "Channel Not Found")),
+    }
+}
+
+/// Parses the priority header (400) and validates the pin against `type_name`
+/// (400), the two values `HEAD` needs but cannot defer to the session layer.
+#[allow(clippy::result_large_err)]
+fn finish_stream_request(
     state: &AppState,
     headers: &HeaderMap,
     peer: SocketAddr,
-    channel_type: &str,
-) -> Result<(), Response> {
-    let request = match StreamRequest::new(headers, peer) {
-        Ok(request) => request,
-        Err(reason) => return Err(error_response(StatusCode::BAD_REQUEST, reason)),
-    };
+    type_name: &str,
+) -> Result<StreamRequest, Response> {
+    let request = StreamRequest::new(headers, peer)
+        .map_err(|reason| error_response(StatusCode::BAD_REQUEST, reason))?;
     if let Some(pin) = &request.pin {
-        if let Err(error) = state.manager.validate_pin(pin, channel_type) {
+        if let Err(error) = state.manager.validate_pin(pin, type_name) {
             return Err(acquire_failure(&error));
         }
     }
-    Ok(())
+    Ok(request)
 }
 
 fn empty_stream_head(peer: SocketAddr) -> Response {
@@ -863,6 +935,13 @@ async fn scan_channels(
         Ok(query) => query,
         Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
     };
+    // The scan reads and rewrites channels.yml, so a corrupt file must fail the
+    // request before the response starts streaming: once the body is a stream
+    // the status is already 200 and an error can only be a progress line.
+    if let Err(reason) = check_scan_config(&state.config_dir) {
+        tracing::warn!(%reason, "channel scan rejected");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, reason);
+    }
     let scan_lease = match state.scan_lock.acquire() {
         Some(lease) => lease,
         None => return error_response(StatusCode::CONFLICT, "Already Scanning"),
@@ -902,6 +981,27 @@ async fn scan_channels(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
     response
+}
+
+/// Checks the on-disk `channels.yml` the scan is about to read and rewrite.
+///
+/// A missing or blank file is the normal "nothing configured yet" case (the
+/// scan creates it). Anything unreadable or unparseable is an error the caller
+/// must surface *before* streaming, so it becomes a real 500 instead of a
+/// `error:` progress line inside a 200 body.
+fn check_scan_config(config_dir: &Path) -> Result<(), String> {
+    let path = config_dir.join("channels.yml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    serde_yaml_ng::from_str::<Vec<scan::ChannelEntry>>(&text)
+        .map(|_| ())
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
 }
 
 async fn scan_not_found() -> Response {
