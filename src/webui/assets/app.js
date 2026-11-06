@@ -113,10 +113,17 @@ function badge(text, kind) {
   return el('span', { class: kind ? 'badge ' + kind : 'badge', text });
 }
 
+/** How long a message stays in the snackbar before auto-dismissing. */
+const MESSAGE_TIMEOUT_MS = 5000;
+
+let messageTimer = null;
+
 function message(text, kind) {
   const node = $('#message');
+  clearTimeout(messageTimer);
   node.textContent = text || '';
   node.className = 'message' + (kind ? ' ' + kind : '');
+  if (text) messageTimer = setTimeout(() => message(''), MESSAGE_TIMEOUT_MS);
 }
 
 function formatTime(millis) {
@@ -147,7 +154,9 @@ const loaders = {
 
 function showTab(name) {
   $$('#tabs button').forEach((button) => {
-    button.classList.toggle('active', button.dataset.tab === name);
+    const active = button.dataset.tab === name;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
   });
   $$('main .tab').forEach((section) => {
     section.classList.toggle('active', section.id === 'tab-' + name);
@@ -393,7 +402,7 @@ function renderTuners() {
         'command',
         textInput(tuner.command, (value) => (tuner.command = value), 'recpt1 --device /dev/pt3video0 {channel} -'),
       ),
-      el('label', {}, [checkbox(tuner.disabled, (value) => (tuner.disabled = value)), ' disabled']),
+      el('label', { class: 'checkbox' }, [checkbox(tuner.disabled, (value) => (tuner.disabled = value)), ' disabled']),
     ]);
   });
   $('#tuners-list').replaceChildren(...cards);

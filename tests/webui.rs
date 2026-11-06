@@ -271,6 +271,17 @@ async fn embedded_assets_have_their_content_types() {
         css.contains(".subtabs"),
         "the sub-tab bar reuses the tab styling"
     );
+    // Material Design 2 tokens: the palette, the app-bar elevation shadow and
+    // the snackbar binding for `#message`.
+    assert!(css.contains("--md-primary: #6200ee"), "{css}");
+    assert!(css.contains("--md-error: #b00020"), "{css}");
+    assert!(css.contains("--md-elevation-4"), "app bar elevation token");
+    assert!(css.contains(".message"), "the snackbar styles #message");
+    assert!(
+        css.contains("#323232"),
+        "the snackbar uses the MD2 dark surface"
+    );
+    assert!(css.contains("prefers-reduced-motion"), "{css}");
 }
 
 #[tokio::test]

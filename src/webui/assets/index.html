@@ -8,18 +8,21 @@
 </head>
 <body>
 <header class="topbar">
-  <h1>unituner</h1>
-  <span class="version" id="version"></span>
-  <nav class="tabs" id="tabs">
-    <button data-tab="status" class="active">Status</button>
-    <button data-tab="services">Services</button>
-    <button data-tab="channels">Channels</button>
-    <button data-tab="tuners">Tuners</button>
-    <button data-tab="pipelines">Pipelines</button>
-    <button data-tab="server">Server</button>
+  <div class="app-bar">
+    <h1>unituner</h1>
+    <span class="version" id="version"></span>
+  </div>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Sections">
+    <button data-tab="status" class="active" role="tab" aria-selected="true">Status</button>
+    <button data-tab="services" role="tab" aria-selected="false">Services</button>
+    <button data-tab="channels" role="tab" aria-selected="false">Channels</button>
+    <button data-tab="tuners" role="tab" aria-selected="false">Tuners</button>
+    <button data-tab="pipelines" role="tab" aria-selected="false">Pipelines</button>
+    <button data-tab="server" role="tab" aria-selected="false">Server</button>
   </nav>
-  <button id="restart" class="danger">Restart</button>
 </header>
+
+<button id="restart" class="fab" type="button">Restart</button>
 
 <main>
   <section id="tab-status" class="tab active">
