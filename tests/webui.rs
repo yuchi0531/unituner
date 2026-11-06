@@ -235,6 +235,36 @@ async fn index_is_served_at_the_root_as_html() {
         !html.contains("Mirakurun"),
         "SPEC §2 keeps the name out of bodies"
     );
+    // Theme bootstrap: an inline script in <head> sets [data-theme] before the
+    // stylesheet is applied, so the first paint already matches the choice.
+    assert!(
+        html.contains("document.documentElement.dataset.theme"),
+        "{html}"
+    );
+    assert!(
+        html.contains("localStorage.getItem('unituner-theme')"),
+        "{html}"
+    );
+    assert!(html.contains("prefers-color-scheme: light"), "{html}");
+    // The toggle itself: an icon button in the app bar.
+    assert!(html.contains("id=\"theme-toggle\""), "{html}");
+    assert!(html.contains("Switch to light theme"), "{html}");
+    // Restart is an app-bar action now: inside <header>, no floating FAB.
+    let header_start = html.find("<header").expect("header opens");
+    let header_end = html.find("</header>").expect("header closes");
+    let restart = html.find("id=\"restart\"").expect("restart button present");
+    assert!(
+        header_start < restart && restart < header_end,
+        "Restart must live inside <header>"
+    );
+    assert!(html.contains("class=\"appbar-action restart\""), "{html}");
+    assert!(
+        html.contains("<span class=\"restart-label\">Restart</span>"),
+        "{html}"
+    );
+    assert!(!html.contains("class=\"fab\""), "the extended FAB is gone");
+    // It keeps its icon + accessible label.
+    assert!(html.contains("aria-label=\"Restart\""), "{html}");
 }
 
 #[tokio::test]
@@ -258,6 +288,11 @@ async fn embedded_assets_have_their_content_types() {
     assert!(script.contains("channel-subtabs"), "{script}");
     assert!(script.contains("channelType"), "{script}");
     assert!(script.contains("aria-selected"), "{script}");
+    // Theme wiring: the toggle persists the choice and keeps its label in sync.
+    assert!(script.contains("unituner-theme"), "{script}");
+    assert!(script.contains("theme-toggle"), "{script}");
+    assert!(script.contains("applyTheme"), "{script}");
+    assert!(script.contains("localStorage.setItem"), "{script}");
 
     let (status, headers, body) = get(&state, "/assets/style.css").await;
     assert_eq!(status, StatusCode::OK);
@@ -271,8 +306,8 @@ async fn embedded_assets_have_their_content_types() {
         css.contains(".subtabs"),
         "the sub-tab bar reuses the tab styling"
     );
-    // Material Design 2 dark-theme tokens: the palette, the surface overlays and
-    // the snackbar binding for `#message`. The UI is dark unconditionally.
+    // Material Design 2 tokens: dark stays the default in `:root`, and the
+    // light palette scopes the same names to [data-theme="light"].
     assert!(css.contains("--md-primary: #bb86fc"), "{css}");
     assert!(css.contains("--md-surface: #121212"), "{css}");
     assert!(css.contains("--md-on-primary: #000000"), "{css}");
@@ -280,11 +315,53 @@ async fn embedded_assets_have_their_content_types() {
     assert!(css.contains("--md-surface-1: #1e1e1e"), "{css}");
     assert!(css.contains("--md-elevation-4"), "app bar elevation token");
     assert!(css.contains(".message"), "the snackbar styles #message");
-    assert!(css.contains("#333"), "the snackbar surface on dark");
     assert!(css.contains("prefers-reduced-motion"), "{css}");
-    // The light-theme values are gone: this is a dark-only stylesheet.
-    assert!(!css.contains("--md-primary: #6200ee"), "{css}");
-    assert!(!css.contains("--md-surface: #ffffff"), "{css}");
+
+    // The light theme ships as a scoped token block with the full MD2 light
+    // palette, not as a dead comment.
+    assert!(css.contains("[data-theme=\"light\"]"), "{css}");
+    assert!(css.contains("--md-primary: #6200ee"), "{css}");
+    assert!(css.contains("--md-on-primary: #ffffff"), "{css}");
+    assert!(css.contains("--md-surface: #ffffff"), "{css}");
+    assert!(css.contains("--md-background: #fafafa"), "{css}");
+    assert!(css.contains("--md-divider: rgba(0, 0, 0, 0.12)"), "{css}");
+    assert!(css.contains("--md-appbar: #6200ee"), "{css}");
+    // Tokens that keep both themes correct: chips, snackbars, inputs, ripple.
+    for token in [
+        "--md-ripple",
+        "--md-chip-ok-bg",
+        "--md-chip-ok-fg",
+        "--md-chip-warn-bg",
+        "--md-chip-warn-fg",
+        "--md-chip-bad-bg",
+        "--md-chip-bad-fg",
+        "--md-snackbar-bg",
+        "--md-snackbar-fg",
+        "--md-snackbar-error-bg",
+        "--md-snackbar-error-fg",
+        "--md-scrollbar-thumb",
+        "--md-code-bg",
+        "--md-input-fill",
+        "--md-input-fill-hover",
+        "--md-focus-ring",
+        "--md-appbar-focus-ring",
+        "--md-appbar-fg",
+        "--md-appbar-hover",
+    ] {
+        assert!(css.contains(token), "missing token {token}");
+    }
+    // The rules reference tokens rather than literal dark-only colors.
+    assert!(css.contains("background: var(--md-snackbar-bg)"), "{css}");
+    assert!(css.contains("background: var(--md-chip-ok-bg)"), "{css}");
+    assert!(
+        css.contains("border-bottom: 1px solid var(--md-input-underline)"),
+        "{css}"
+    );
+    assert!(!css.contains("background: #333;"), "snackbar uses a token");
+    assert!(
+        !css.contains(".fab"),
+        "Restart is a header action, not a FAB"
+    );
 }
 
 #[tokio::test]

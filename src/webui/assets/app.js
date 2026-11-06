@@ -635,10 +635,60 @@ async function waitForServer() {
 }
 
 // ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+const THEME_KEY = 'unituner-theme';
+
+/** Current theme, read from the attribute the inline bootstrap already set. */
+function currentTheme() {
+  return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+}
+
+/**
+ * Applies a theme to the document and remembers it. The page paints from
+ * `[data-theme]` alone; this only writes the attribute, persists the choice
+ * and refreshes the toggle's accessible label.
+ */
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch {
+    // Storage can be blocked; the in-memory attribute still works.
+  }
+  syncThemeToggle(next);
+}
+
+/** Mirrors the theme into the toggle's icon label (the icon itself is CSS). */
+function syncThemeToggle(theme) {
+  const toggle = $('#theme-toggle');
+  if (!toggle) return;
+  // The button's name states the action, not the state, so it is a plain
+  // button: no aria-pressed (that would double up with the changing label).
+  const label = theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+  toggle.setAttribute('aria-label', label);
+  toggle.setAttribute('title', label);
+}
+
+/** Flips the theme and persists the result. */
+function toggleTheme() {
+  applyTheme(currentTheme() === 'light' ? 'dark' : 'light');
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
 function init() {
+  const themeToggle = $('#theme-toggle');
+  if (themeToggle) {
+    // Keep the label honest even when the bootstrap picked the theme from the
+    // OS preference rather than a stored value (that value is not persisted).
+    syncThemeToggle(currentTheme());
+    themeToggle.addEventListener('click', toggleTheme);
+  }
   $$('#tabs button').forEach((button) => {
     button.addEventListener('click', () => showTab(button.dataset.tab));
   });
