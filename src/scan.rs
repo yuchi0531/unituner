@@ -1919,6 +1919,7 @@ mod tests {
             original_network_id,
             transport_stream_id: tsid,
             services: vec![(service_id, 0x01, "Service".to_string())],
+            is_actual: true,
             version_number: 0,
             current_next: true,
             section_number: 0,

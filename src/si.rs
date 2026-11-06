@@ -230,6 +230,14 @@ pub struct SdtInfo {
     /// `(service_id, service_type, name)` for every service in the section.
     /// The name is already ARIB-decoded.
     pub services: Vec<(u16, u8, String)>,
+    /// Whether this is the SDT *actual* (table id `0x42`, describes the
+    /// multiplex being received) rather than the SDT *other* (`0x46`, describes
+    /// another transport stream).
+    ///
+    /// Both are parsed and reported, but only the SDT-actual describes the
+    /// services of the multiplex a scan is tuned to; a service table built from
+    /// SDT-other would contain another multiplex's services.
+    pub is_actual: bool,
     /// Table `version_number` (0-31).
     pub version_number: u8,
     /// `current_next_indicator`: `false` means the table is not yet applicable.
@@ -282,6 +290,96 @@ pub enum SiEvent {
     Sdt(SdtInfo),
     /// A Network Information Table section.
     Nit(NitInfo),
+}
+
+/// Identity of one SDT across its sections: table id (actual/other), transport
+/// stream and original network. The version is tracked alongside the sections,
+/// so a new version resets the set instead of needing a new key.
+///
+/// Including both `transport_stream_id` and `original_network_id` keeps two
+/// multiplexes that happen to share a TSID apart.
+type SdtTableKey = (u8, u16, u16);
+
+/// Tracks whether all sections of an SDT have been seen.
+///
+/// A multi-section SDT (or any PSI/SI table) is only complete once every
+/// `section_number` from `0` through `last_section_number` of the same table
+/// version has arrived. A caller that applies a service table section by
+/// section would otherwise report a truncated service list whenever only some
+/// sections of the table came through, or when a version switch tore the table
+/// apart mid-way.
+///
+/// The tracker is keyed by `(table_id, transport_stream_id,
+/// original_network_id)`, so the SDT-actual and SDT-other of the same multiplex
+/// are tracked independently, and it needs no caller-side bookkeeping: parse
+/// each section, call [`observe`](Self::observe), and act once it returns
+/// `true`.
+///
+/// The rules:
+///
+/// * sections may arrive in any order;
+/// * a section already seen is ignored (a retransmission cannot make a table
+///   complete that was missing another section);
+/// * a new `version_number` discards everything seen for the previous version,
+///   so a half-seen old table cannot complete a new one;
+/// * a missing section means `observe` never returns `true`.
+#[derive(Debug, Default)]
+pub struct TableCompleteness {
+    /// One entry per table: its current version, `last_section_number` and the
+    /// set of `section_number`s seen so far.
+    tables: HashMap<SdtTableKey, (u8, u8, HashSet<u8>)>,
+}
+
+impl TableCompleteness {
+    /// Creates a tracker with no state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one SDT section and reports whether its table is now complete.
+    ///
+    /// `info.section_number` and `info.last_section_number` must be the values
+    /// from the same section header (they are, for a value from [`parse_sdt`]).
+    pub fn observe(&mut self, info: &SdtInfo) -> bool {
+        let table_id = if info.is_actual {
+            TABLE_ID_SDT_ACTUAL
+        } else {
+            TABLE_ID_SDT_OTHER
+        };
+        let key = (table_id, info.transport_stream_id, info.original_network_id);
+        let (version, last_section, seen) = self.tables.entry(key).or_insert_with(|| {
+            (
+                info.version_number,
+                info.last_section_number,
+                HashSet::new(),
+            )
+        });
+
+        if *version != info.version_number {
+            // A new version replaces the old table entirely: sections of the
+            // previous version must not count towards this one.
+            *version = info.version_number;
+            *last_section = info.last_section_number;
+            seen.clear();
+        } else if *last_section != info.last_section_number {
+            // The same version cannot change its section count; treat it as a
+            // fresh (truncated) table rather than completing over a stale bound.
+            *last_section = info.last_section_number;
+            seen.clear();
+        }
+
+        // A duplicate is harmless: the set stays as it was.
+        seen.insert(info.section_number);
+        (0..=*last_section).all(|number| seen.contains(&number))
+    }
+
+    /// Forgets every table.
+    ///
+    /// Call this when the stream is (re)tuned or otherwise restarted: sections
+    /// from before the restart must not complete a table from after it.
+    pub fn reset(&mut self) {
+        self.tables.clear();
+    }
 }
 
 /// Why a section could not be parsed.
@@ -379,8 +477,15 @@ pub fn parse_pmt(section: &[u8]) -> Result<PmtInfo, SiError> {
 }
 
 /// Parses a complete SDT section.
+///
+/// Both the SDT *actual* (`0x42`, describes the multiplex being received) and
+/// the SDT *other* (`0x46`, describes another transport stream) are accepted;
+/// [`SdtInfo::is_actual`] records which one this is. A scan that builds a
+/// service table must ignore SDT-other services, exactly like it ignores
+/// NIT-other.
 pub fn parse_sdt(section: &[u8]) -> Result<SdtInfo, SiError> {
     expect_table_id(section, &[TABLE_ID_SDT_ACTUAL, TABLE_ID_SDT_OTHER])?;
+    let table_id = section[0];
     let Table::Sdt(sdt) = read_table(section)? else {
         return Err(SiError::Parse("not an SDT".to_owned()));
     };
@@ -404,6 +509,7 @@ pub fn parse_sdt(section: &[u8]) -> Result<SdtInfo, SiError> {
         original_network_id: sdt.original_network_id,
         transport_stream_id: sdt.transport_stream_id,
         services,
+        is_actual: table_id == TABLE_ID_SDT_ACTUAL,
         version_number: sdt.version_number,
         current_next: sdt.current_next_indicator,
         section_number: sdt.section_number,
@@ -1313,6 +1419,45 @@ mod tests {
         section_packets(pid, section, 0)
     }
 
+    /// SDT body: original_network_id, reserved byte and a one-service loop.
+    fn sdt_body(original_network_id: u16, service_id: u16) -> Vec<u8> {
+        let mut services = vec![
+            (service_id >> 8) as u8,
+            service_id as u8, // service_id
+            0xFD,             // EIT flags
+        ];
+        let descriptor = vec![0x01, 0x00, 0x00]; // digital TV, empty names
+        let loop_length = 2 + descriptor.len();
+        services.extend_from_slice(&[0x80 | ((loop_length >> 8) as u8 & 0x0F), loop_length as u8]);
+        services.extend_from_slice(&[0x48, descriptor.len() as u8]);
+        services.extend_from_slice(&descriptor);
+
+        let mut rest = vec![
+            (original_network_id >> 8) as u8,
+            original_network_id as u8,
+            0xFF,
+        ];
+        rest.extend_from_slice(&services);
+        rest
+    }
+
+    /// SDT with an explicit table id, version and section numbering.
+    fn sdt_section_header(
+        table_id: u8,
+        version: u8,
+        section_number: u8,
+        last_section_number: u8,
+    ) -> Vec<u8> {
+        section_header(
+            table_id,
+            0x7FE0,
+            0xC0 | ((version & 0x1F) << 1) | 1,
+            section_number,
+            last_section_number,
+            sdt_body(0x7FE0, 0x0408),
+        )
+    }
+
     #[test]
     fn crc32_matches_the_mpeg2_check_vector() {
         assert_eq!(crc32_mpeg2(b"123456789"), 0x0376_E6E7);
@@ -1416,6 +1561,87 @@ mod tests {
         assert!(info.current_next);
         assert_eq!(info.section_number, 0);
         assert_eq!(info.last_section_number, 0);
+        assert!(info.is_actual, "table id 0x42 is the SDT-actual");
+    }
+
+    #[test]
+    fn sdt_other_is_reported_as_not_actual() {
+        // The same section under table id 0x46: the SDT *other*, which
+        // describes a different transport stream.
+        let section = section_header(0x46, 0x7FE0, 0xC1, 0, 0, sdt_body(0x7FE0, 0x0408));
+        let info = parse_sdt(&section).expect("SDT-other must parse");
+        assert!(
+            !info.is_actual,
+            "table id 0x46 must not be mistaken for the SDT-actual"
+        );
+        assert_eq!(info.services.len(), 1);
+        assert_eq!(info.services[0].0, 0x0408);
+        assert_eq!(info.version_number, 0);
+        assert!(info.current_next);
+    }
+
+    #[test]
+    fn table_completeness_handles_out_of_order_sections() {
+        let mut tracker = TableCompleteness::new();
+        let last = sdt_section_header(0x42, 0, 2, 2);
+        let middle = sdt_section_header(0x42, 0, 1, 2);
+        let first = sdt_section_header(0x42, 0, 0, 2);
+
+        assert!(!tracker.observe(&parse_sdt(&last).unwrap()));
+        assert!(!tracker.observe(&parse_sdt(&middle).unwrap()));
+        assert!(tracker.observe(&parse_sdt(&first).unwrap()));
+    }
+
+    #[test]
+    fn table_completeness_resets_on_a_new_version() {
+        let mut tracker = TableCompleteness::new();
+        // Sections 0 of 1 of version 0, then version 1 starts from scratch.
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 0, 1)).unwrap()));
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 1, 0, 1)).unwrap()));
+        assert!(
+            tracker.observe(&parse_sdt(&sdt_section_header(0x42, 1, 1, 1)).unwrap()),
+            "the version-1 table must complete on its own, not with version-0 sections"
+        );
+    }
+
+    #[test]
+    fn table_completeness_ignores_duplicates() {
+        let mut tracker = TableCompleteness::new();
+        let first = parse_sdt(&sdt_section_header(0x42, 0, 0, 1)).unwrap();
+        let second = parse_sdt(&sdt_section_header(0x42, 0, 1, 1)).unwrap();
+
+        assert!(!tracker.observe(&first));
+        assert!(
+            !tracker.observe(&first),
+            "a retransmission cannot complete a table that misses a section"
+        );
+        assert!(tracker.observe(&second));
+        assert!(
+            tracker.observe(&second),
+            "a duplicate of the last section leaves the table complete"
+        );
+    }
+
+    #[test]
+    fn table_completeness_never_reports_a_missing_section_as_complete() {
+        let mut tracker = TableCompleteness::new();
+        // Sections 0 and 2 of 2 arrive; section 1 never does.
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 0, 2)).unwrap()));
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 2, 2)).unwrap()));
+
+        // SDT-actual and SDT-other of the same multiplex are tracked apart.
+        let mut tracker = TableCompleteness::new();
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 0, 1)).unwrap()));
+        assert!(tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 1, 1)).unwrap()));
+        assert!(
+            !tracker.observe(&parse_sdt(&sdt_section_header(0x46, 0, 0, 1)).unwrap()),
+            "the SDT-other's section 0 must not complete the SDT-actual"
+        );
+        assert!(tracker.observe(&parse_sdt(&sdt_section_header(0x46, 0, 1, 1)).unwrap()));
+
+        // reset forgets everything.
+        tracker.reset();
+        assert!(!tracker.observe(&parse_sdt(&sdt_section_header(0x42, 0, 0, 1)).unwrap()));
     }
 
     #[test]

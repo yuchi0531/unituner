@@ -6,7 +6,7 @@
 //! packets interleaved and the SDT split over several packets.
 
 use unituner::services::{ServiceItemId, ServiceRecord, ServiceTable};
-use unituner::si::{crc32_mpeg2, SiEvent, SiParser};
+use unituner::si::{crc32_mpeg2, SiEvent, SiParser, TableCompleteness};
 use unituner::tsframe::{TsNormalizer, TS_PACKET_SIZE, TS_PACKET_SIZE_204};
 
 const PAT_PID: u16 = 0x0000;
@@ -480,6 +480,104 @@ fn pat_and_pmt_agree_on_the_programme_and_pids() {
     assert_eq!(pmt.program_number, SERVICE_ID);
     assert_eq!(pmt.pcr_pid, 0x1F1);
     assert_eq!(pmt.streams, vec![(0x1B, 0x1F1), (0x0F, 0x1F2)]);
+}
+
+#[test]
+fn a_multi_section_sdt_is_tracked_to_completion() {
+    // Two SDT sections of the same table version: section 0 carries the
+    // service, section 1 carries another one. Completeness must only be
+    // reported once both have arrived, in any order.
+    let mut first_rest = Vec::new();
+    first_rest.extend_from_slice(&[(NETWORK_ID >> 8) as u8, NETWORK_ID as u8, 0xFF]);
+    first_rest.extend_from_slice(&sdt_service_loop(SERVICE_ID, "one"));
+
+    let mut second_rest = Vec::new();
+    second_rest.extend_from_slice(&[(NETWORK_ID >> 8) as u8, NETWORK_ID as u8, 0xFF]);
+    second_rest.extend_from_slice(&sdt_service_loop(0x0409, "two"));
+
+    let first = sdt_section_with(0x42, 0, 0, 1, &first_rest);
+    let second = sdt_section_with(0x42, 0, 1, 1, &second_rest);
+
+    let mut parser = SiParser::new();
+    let mut tracker = TableCompleteness::new();
+
+    let events = parser.push_packets(&section_packets(SDT_PID, &second, 0));
+    let SiEvent::Sdt(info) = &events[0] else {
+        panic!("expected an SDT");
+    };
+    assert!(
+        !tracker.observe(info),
+        "section 1 of 1 alone is not complete"
+    );
+
+    let events = parser.push_packets(&section_packets(SDT_PID, &first, 2));
+    let SiEvent::Sdt(info) = &events[0] else {
+        panic!("expected an SDT");
+    };
+    assert!(
+        tracker.observe(info),
+        "sections 0 and 1 of 1 complete the table"
+    );
+}
+
+#[test]
+fn sdt_other_is_parsed_but_marked_as_not_actual() {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&[(NETWORK_ID >> 8) as u8, NETWORK_ID as u8, 0xFF]);
+    rest.extend_from_slice(&sdt_service_loop(SERVICE_ID, "other"));
+    let other = sdt_section_with(0x46, 0, 0, 0, &rest);
+
+    let mut parser = SiParser::new();
+    let events = parser.push_packets(&section_packets(SDT_PID, &other, 0));
+    let SiEvent::Sdt(info) = &events[0] else {
+        panic!("expected an SDT");
+    };
+    assert!(
+        !info.is_actual,
+        "table id 0x46 is the SDT-other and must be distinguishable"
+    );
+    // The parser still reports it; only the consumer decides to ignore it.
+    assert_eq!(info.services.len(), 1);
+}
+
+/// One-service SDT service loop (service_descriptor with a plain ASCII name).
+fn sdt_service_loop(service_id: u16, name: &str) -> Vec<u8> {
+    let mut descriptor = vec![SERVICE_TYPE, 0x00]; // provider name length 0
+    let encoded = format!("\u{1B}(J{name}").into_bytes();
+    descriptor.push(encoded.len() as u8);
+    descriptor.extend_from_slice(&encoded);
+
+    let mut services = vec![(service_id >> 8) as u8, service_id as u8, 0xFD];
+    let loop_length = 2 + descriptor.len();
+    services.extend_from_slice(&[0x80 | ((loop_length >> 8) as u8 & 0x0F), loop_length as u8]);
+    services.extend_from_slice(&[0x48, descriptor.len() as u8]);
+    services.extend_from_slice(&descriptor);
+    services
+}
+
+/// SDT section with explicit version and section numbering.
+fn sdt_section_with(
+    table_id: u8,
+    version: u8,
+    section_number: u8,
+    last_section_number: u8,
+    rest: &[u8],
+) -> Vec<u8> {
+    let section_length = 5 + rest.len() + 4;
+    let mut bytes = vec![
+        table_id,
+        0xB0 | ((section_length >> 8) as u8 & 0x0F),
+        section_length as u8,
+        (TSID >> 8) as u8,
+        TSID as u8,
+        0xC0 | ((version & 0x1F) << 1) | 1,
+        section_number,
+        last_section_number,
+    ];
+    bytes.extend_from_slice(rest);
+    let crc = crc32_mpeg2(&bytes);
+    bytes.extend_from_slice(&crc.to_be_bytes());
+    bytes
 }
 
 #[test]
