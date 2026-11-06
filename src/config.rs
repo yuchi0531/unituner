@@ -9,9 +9,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use ipnet::IpNet;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -44,6 +46,16 @@ pub struct ServerConfig {
     pub addr: String,
     #[serde(default = "default_allowed_cidrs")]
     pub allowed_cidrs: Vec<String>,
+    /// Additional `Host` header values the webui accepts, besides any host in
+    /// `allowed_cidrs` and `localhost` (SPEC §3.1).
+    ///
+    /// The webui rejects a request whose `Host` is neither an IP inside
+    /// `allowed_cidrs` nor `localhost` nor one of these names, which is what
+    /// stops a DNS-rebinding page from being treated as same-origin. A real
+    /// reverse proxy or a mDNS name therefore has to be listed here. Entries
+    /// are host names (no port, no scheme); matching ignores ASCII case.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
     #[serde(default = "default_subscriber_buffer_chunks")]
@@ -57,6 +69,7 @@ impl Default for ServerConfig {
         Self {
             addr: default_addr(),
             allowed_cidrs: default_allowed_cidrs(),
+            allowed_hosts: Vec::new(),
             idle_timeout_secs: default_idle_timeout_secs(),
             subscriber_buffer_chunks: default_subscriber_buffer_chunks(),
             chunk_size_bytes: default_chunk_size_bytes(),
@@ -114,6 +127,9 @@ pub struct ChannelConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelinesConfig {
+    /// Pipeline name -> argv stages. An empty map is valid: every type then
+    /// streams raw TS (SPEC §3.4).
+    #[serde(default)]
     pub pipelines: HashMap<String, Vec<String>>,
     /// Channel type -> pipeline binding. Types without a binding are delivered
     /// as raw TS (SPEC §3.4).
@@ -246,6 +262,15 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             ));
         }
     }
+    for (index, host) in server.allowed_hosts.iter().enumerate() {
+        if let Err(message) = validate_allowed_host(host) {
+            issues.push(Issue::new(
+                "server.yml",
+                format!("allowed_hosts[{index}]"),
+                message,
+            ));
+        }
+    }
     if server.subscriber_buffer_chunks == 0 {
         issues.push(Issue::new(
             "server.yml",
@@ -260,6 +285,128 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             "must be greater than 0",
         ));
     }
+}
+
+/// A `server.yml` `allowed_hosts` entry must be a bare host name or IP literal:
+/// no scheme, no port, no brackets, no path (SPEC §3.1).
+fn validate_allowed_host(host: &str) -> Result<(), String> {
+    if host.trim().is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    match normalize_host(host) {
+        // `normalize_host` strips a port, brackets and a trailing dot, so
+        // comparing with the ASCII-lowercased entry itself rejects
+        // `example.com:40772`, `http://example.com` and `[::1]` while still
+        // allowing an uppercase host name.
+        Some(normalized) if normalized == host.to_ascii_lowercase() => Ok(()),
+        Some(_) => Err(format!(
+            "{host:?} must be a bare host name or IP literal (no scheme, port or brackets)"
+        )),
+        None => Err(format!("{host:?} is not a valid host name or IP literal")),
+    }
+}
+
+/// The host part of a `Host` / `Origin` authority, lowercased.
+///
+/// Accepts `host`, `host:port`, `[::1]` and `[::1]:port`; a bare IPv6 literal
+/// (which is not valid in a `Host` header, but tolerated) is accepted too. A
+/// trailing dot is dropped, so `localhost.` normalises to `localhost`. Returns
+/// `None` for an empty host or anything containing a character a host cannot
+/// have (whitespace, `/`, `@`, `\`, …).
+pub fn normalize_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        if !(after.is_empty() || after.strip_prefix(':').is_some_and(is_port)) {
+            return None;
+        }
+        inside.parse::<Ipv6Addr>().ok()?.to_string()
+    } else if value.matches(':').count() > 1 {
+        // A bare IPv6 literal (`::1`): no port can be attached without brackets.
+        value.parse::<Ipv6Addr>().ok()?.to_string()
+    } else {
+        let (host, port) = match value.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (value, None),
+        };
+        if port.is_some_and(|port| !is_port(port)) {
+            return None;
+        }
+        host.to_string()
+    };
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.is_empty() || !host.chars().all(is_host_char) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn is_port(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':')
+}
+
+/// Whether a request `Host` header may be served (SPEC §3.1, SPEC §10).
+///
+/// `host` is a raw `Host` header value (`host[:port]`, `[::1]:port`). It is
+/// accepted when its host part is
+///
+/// * listed in `allowed_hosts` (exact, ASCII-case-insensitive), or
+/// * `localhost`, or
+/// * an IP literal inside one of `allowed_cidrs` (with the same IPv4/IPv6
+///   equivalences as the peer guard: `::1` matches the IPv4 loopback list and a
+///   v4-mapped peer matches its IPv4 form).
+///
+/// Anything else — including a missing or malformed `Host` — is rejected, which
+/// is what stops a DNS-rebinding page (whose `Host` is its own name) from being
+/// treated as same-origin with this server.
+pub fn host_is_allowed(host: &str, allowed_hosts: &[String], allowed_cidrs: &[String]) -> bool {
+    let Some(host) = normalize_host(host) else {
+        return false;
+    };
+    if host == "localhost" {
+        return true;
+    }
+    if allowed_hosts
+        .iter()
+        .any(|allowed| allowed.trim().to_ascii_lowercase() == host)
+    {
+        return true;
+    }
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    allowed_cidrs.iter().any(|cidr| {
+        cidr.parse::<IpNet>().is_ok_and(|net| {
+            ip_candidates(ip)
+                .iter()
+                .any(|candidate| net.contains(candidate))
+        })
+    })
+}
+
+/// The address forms an IP is matched in: its own, plus the IPv4/IPv6 spellings
+/// an operator may have written for it.
+fn ip_candidates(ip: IpAddr) -> Vec<IpAddr> {
+    let mut candidates = vec![ip];
+    match ip {
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                candidates.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                candidates.push(IpAddr::V4(v4));
+            }
+        }
+        IpAddr::V4(v4) => candidates.push(IpAddr::V6(v4.to_ipv6_mapped())),
+    }
+    candidates
 }
 
 fn validate_addr(addr: &str) -> Result<(), String> {
@@ -365,14 +512,10 @@ fn validate_channels(channels: &[ChannelConfig], issues: &mut Vec<Issue>) {
 }
 
 fn validate_pipelines(pipelines: &PipelinesConfig, issues: &mut Vec<Issue>) {
-    if pipelines.pipelines.is_empty() {
-        issues.push(Issue::new(
-            "pipelines.yml",
-            "pipelines",
-            "must contain at least one pipeline",
-        ));
-    }
-
+    // An empty `pipelines` map is valid: raw TS (no descrambling/transcoding) is
+    // a legitimate deployment, and every type without a binding streams the
+    // unfiltered multiplex (SPEC §3.4). A pipeline that *is* declared must have
+    // at least one non-empty command, which the loop below checks.
     for (name, commands) in sorted_entries(&pipelines.pipelines) {
         let label = format!("pipelines.{name}");
         if commands.is_empty() {
@@ -736,13 +879,38 @@ types: {}
     }
 
     #[test]
-    fn empty_pipelines_map_is_rejected() {
+    fn empty_pipelines_map_is_accepted_as_raw_ts() {
+        // No pipelines at all: every type streams raw TS (SPEC §3.4).
         let pipelines = r#"
 pipelines: {}
 types: {}
 "#;
+        let config = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines)
+            .load()
+            .expect("raw-TS operation needs no pipeline");
+        assert!(config.pipelines.pipelines.is_empty());
+        assert!(config.pipelines.types.is_empty());
+    }
+
+    #[test]
+    fn omitted_pipelines_and_types_maps_are_accepted() {
+        let config = Fixture::new(SERVER, TUNERS, CHANNELS, "{}\n")
+            .load()
+            .expect("both maps default to empty");
+        assert!(config.pipelines.pipelines.is_empty());
+        assert!(config.pipelines.types.is_empty());
+    }
+
+    #[test]
+    fn empty_server_pipelines_section_is_accepted() {
+        let pipelines = r#"
+pipelines: {}
+types:
+  GR: { pipeline: soft }
+"#;
+        // A binding to a pipeline that does not exist is still rejected.
         let issues = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines).issues();
-        assert_issue_contains(&issues, "at least one pipeline");
+        assert_issue_contains(&issues, "references unknown pipeline");
     }
 
     #[test]
@@ -914,6 +1082,113 @@ types: {}
                 "{bad:?} should be invalid"
             );
         }
+    }
+
+    #[test]
+    fn allowed_hosts_defaults_to_empty_and_is_parsed_when_present() {
+        let config = Fixture::valid().load().expect("valid config");
+        assert!(config.server.allowed_hosts.is_empty());
+
+        let server = "addr: \":40772\"\nallowed_hosts:\n  - tv.example.lan\n  - living-room\n";
+        let config = Fixture::new(server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("allowed_hosts is accepted");
+        assert_eq!(
+            config.server.allowed_hosts,
+            vec!["tv.example.lan".to_string(), "living-room".to_string()]
+        );
+    }
+
+    #[test]
+    fn bad_allowed_hosts_entries_are_rejected() {
+        for bad in [
+            "\"\"",
+            "\"   \"",
+            "tv.example.lan:40772",
+            "\"http://tv.example.lan\"",
+            "\"[::1]\"",
+            "\"tv example\"",
+            "\"tv/example\"",
+        ] {
+            let server = format!("addr: \":40772\"\nallowed_hosts: [{bad}]\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, "allowed_hosts[0]");
+        }
+    }
+
+    #[test]
+    fn host_allowlist_accepts_loopback_private_and_listed_names() {
+        let cidrs: Vec<String> = DEFAULT_ALLOWED_CIDRS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let listed = vec!["tv.example.lan".to_string()];
+
+        for ok in [
+            "localhost",
+            "localhost:40772",
+            "LOCALHOST:40772",
+            "127.0.0.1:40772",
+            "192.168.1.5:40772",
+            "10.1.2.3",
+            "[::1]:40772",
+            "[::1]",
+            "::1",
+            "tv.example.lan",
+            "TV.Example.LAN:40772",
+            "localhost.",
+        ] {
+            assert!(
+                host_is_allowed(ok, &listed, &cidrs),
+                "{ok:?} should be allowed"
+            );
+        }
+
+        for bad in [
+            "evil.example",
+            "evil.example:40772",
+            "203.0.113.9:40772",
+            "[2001:db8::1]:40772",
+            "",
+            "   ",
+            "localhost:not-a-port",
+        ] {
+            assert!(
+                !host_is_allowed(bad, &listed, &cidrs),
+                "{bad:?} should be rejected"
+            );
+        }
+
+        // Without `allowed_hosts` a name is rejected, which is the default.
+        assert!(!host_is_allowed("tv.example.lan", &[], &cidrs));
+    }
+
+    #[test]
+    fn allowed_hosts_adds_names_and_private_ips_outside_the_cidrs() {
+        let listed = vec!["tv.example.lan".to_string(), "203.0.113.9".to_string()];
+        let cidrs = vec!["127.0.0.0/8".to_string()];
+        assert!(host_is_allowed("tv.example.lan", &listed, &cidrs));
+        assert!(host_is_allowed("203.0.113.9:40772", &listed, &cidrs));
+        assert!(!host_is_allowed("192.168.1.5", &listed, &cidrs));
+    }
+
+    #[test]
+    fn normalize_host_strips_ports_brackets_and_case() {
+        assert_eq!(
+            normalize_host("LocalHost:40772").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(normalize_host("[::1]:40772").as_deref(), Some("::1"));
+        assert_eq!(normalize_host("[::1]").as_deref(), Some("::1"));
+        assert_eq!(
+            normalize_host("192.168.1.5").as_deref(),
+            Some("192.168.1.5")
+        );
+        assert_eq!(normalize_host("host:bad"), None);
+        assert_eq!(normalize_host("[::1]:bad"), None);
+        assert_eq!(normalize_host(""), None);
+        assert_eq!(normalize_host("a b"), None);
+        assert_eq!(normalize_host("host/path"), None);
     }
 
     #[test]
