@@ -35,6 +35,17 @@
 //! EOF (correct bytes, wrong framing), so a caller that flushes mid-stream
 //! should use [`TsNormalizer::finish_and_reset`] rather than leaving that
 //! framing locked in.
+//!
+//! # Resynchronisation
+//!
+//! Once the framing is known, a lost sync byte is recovered by searching for a
+//! *confirmed* packet start: a `0x47` at some position **and** another `0x47`
+//! one packet size after it. A single `0x47` is not enough: about half of all
+//! TS packets carry `0x47` somewhere in their payload, so accepting the first
+//! one would lock the stream onto a false boundary and keep it there. When the
+//! confirming byte is not buffered yet, the normalizer waits for more input
+//! instead of committing. Only at [`TsNormalizer::finish`], where no more input
+//! can arrive, does the last unconfirmed candidate win.
 
 /// Size of a normalized TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -139,6 +150,23 @@ pub struct TsNormalizer {
     /// Bytes dropped: leading junk, resynchronisation skips, unsupported-192
     /// input and an incomplete packet left at [`finish`](Self::finish).
     pub bytes_discarded: u64,
+    /// Whether the sync error at the current resynchronisation point has
+    /// already been counted. A resync may span several `push` calls (the
+    /// confirming sync byte has not arrived yet), and the error must be counted
+    /// once, not once per call.
+    sync_error_pending: bool,
+}
+
+/// The outcome of searching for a confirmed packet start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Resync {
+    /// A packet start confirmed by the next packet's sync byte at this offset.
+    At(usize),
+    /// A `0x47` was seen but the byte one packet later is not buffered yet, so
+    /// the candidate cannot be confirmed. Wait for more input.
+    NeedMore,
+    /// No position in the buffer can start a packet.
+    NotFound,
 }
 
 impl TsNormalizer {
@@ -169,7 +197,7 @@ impl TsNormalizer {
             self.detect(false);
         }
         let mut out = Vec::new();
-        self.drain_packets(&mut out);
+        self.drain_packets(&mut out, false);
         out
     }
 
@@ -189,11 +217,15 @@ impl TsNormalizer {
         if self.framing.is_none() {
             self.detect(true);
         }
-        self.drain_packets(&mut out);
+        self.drain_packets(&mut out, true);
         if !self.buf.is_empty() {
             self.bytes_discarded += self.buf.len() as u64;
             self.buf.clear();
         }
+        // End of stream terminates any resynchronisation: a later `push` on
+        // this normalizer is a new stream segment, so its first bad sync byte
+        // is a new error.
+        self.sync_error_pending = false;
         out
     }
 
@@ -296,11 +328,46 @@ impl TsNormalizer {
         self.buf.drain(..len);
     }
 
+    /// Searches for a *confirmed* packet start at or after `from`.
+    ///
+    /// A candidate `0x47` is only confirmed when the byte one packet later is
+    /// also `0x47`; a lone `0x47` in a payload would otherwise lock the stream
+    /// onto a false boundary permanently. When the confirming byte is past the
+    /// end of the buffer, the caller must wait for more input — unless `eof`
+    /// says no more can arrive, in which case the first candidate with a whole
+    /// packet buffered is taken.
+    fn find_resync(&self, from: usize, packet_len: usize, eof: bool) -> Resync {
+        let mut candidate = from;
+        while let Some(rel) = self.buf[candidate..].iter().position(|&b| b == SYNC_BYTE) {
+            candidate += rel;
+            if candidate + packet_len < self.buf.len() {
+                if self.buf[candidate + packet_len] == SYNC_BYTE {
+                    return Resync::At(candidate);
+                }
+                // A false sync inside a payload: try the next candidate.
+                candidate += 1;
+                continue;
+            }
+            if eof {
+                // No more input can confirm or refute this candidate.
+                return if self.buf.len() - candidate >= packet_len {
+                    Resync::At(candidate)
+                } else {
+                    Resync::NotFound
+                };
+            }
+            // The confirming byte is not buffered yet: wait for more data.
+            return Resync::NeedMore;
+        }
+        Resync::NotFound
+    }
+
     /// Emits complete packets from the buffer at the detected framing.
     ///
     /// The buffer is compacted once at the end, so a large chunk costs one
-    /// memmove rather than one per packet.
-    fn drain_packets(&mut self, out: &mut Vec<u8>) {
+    /// memmove rather than one per packet. `eof` allows the last, unconfirmed
+    /// resynchronisation candidate to be used; see [`find_resync`](Self::find_resync).
+    fn drain_packets(&mut self, out: &mut Vec<u8>, eof: bool) {
         let Some(framing) = self.framing else {
             return;
         };
@@ -312,15 +379,32 @@ impl TsNormalizer {
         };
 
         let mut pos = 0usize;
+        // One physical sync loss may span several `push` calls (the confirming
+        // byte has not arrived yet), so the error is counted once.
+        let mut resyncing = self.sync_error_pending;
         while pos < self.buf.len() {
-            if self.buf[pos] != SYNC_BYTE {
-                self.sync_errors += 1;
-                match self.buf[pos..].iter().position(|&b| b == SYNC_BYTE) {
-                    Some(next) => {
-                        self.bytes_discarded += next as u64;
-                        pos += next;
+            // While resyncing, even a byte that *is* 0x47 is only a candidate:
+            // it must be confirmed by the next packet's sync byte. Skipping
+            // that check is exactly how a 0x47 in a payload becomes a
+            // permanent misalignment.
+            if resyncing || self.buf[pos] != SYNC_BYTE {
+                if !resyncing {
+                    self.sync_errors += 1;
+                    resyncing = true;
+                }
+                match self.find_resync(pos, packet_len, eof) {
+                    Resync::At(next) => {
+                        self.bytes_discarded += (next - pos) as u64;
+                        pos = next;
+                        resyncing = false;
                     }
-                    None => {
+                    Resync::NeedMore => break,
+                    Resync::NotFound => {
+                        // No position in the buffer can start a confirmed
+                        // packet: all of it is junk. The sync loss is not over
+                        // yet (the stream has not resumed), so keep the event
+                        // open to avoid counting the rest of this same loss as
+                        // further errors.
                         self.bytes_discarded += (self.buf.len() - pos) as u64;
                         pos = self.buf.len();
                     }
@@ -334,6 +418,7 @@ impl TsNormalizer {
             self.packets_out += 1;
             pos += packet_len;
         }
+        self.sync_error_pending = resyncing;
         self.buf.drain(..pos);
     }
 }
@@ -352,6 +437,17 @@ mod tests {
         let mut framed = packet.to_vec();
         framed.extend_from_slice(&[0x5A; 16]);
         framed
+    }
+
+    /// A packet filled with `fill` whose payload also carries a `0x47` at each
+    /// given absolute packet offset (payload starts at byte 4).
+    fn packet_with_syncs(fill: u8, sync_offsets: &[usize]) -> Vec<u8> {
+        let mut packet = packet(fill);
+        for &offset in sync_offsets {
+            assert!((4..TS_PACKET_SIZE).contains(&offset));
+            packet[offset] = SYNC_BYTE;
+        }
+        packet
     }
 
     fn stream(packets: &[Vec<u8>]) -> Vec<u8> {
@@ -435,6 +531,104 @@ mod tests {
         assert_eq!(normalizer.packets_out, 2);
         assert_eq!(normalizer.sync_errors, 1);
         assert_eq!(normalizer.bytes_discarded, TS_PACKET_SIZE as u64);
+    }
+
+    #[test]
+    fn resynchronises_to_the_true_boundary_when_payloads_contain_0x47() {
+        // Every payload carries a 0x47, so a naive "first 0x47 wins" resync
+        // would lock onto one of them. Only the true packet boundary is
+        // confirmed by the next packet's sync byte.
+        let packets = [
+            packet_with_syncs(0x10, &[60, 150]),
+            packet_with_syncs(0x11, &[40]),
+            packet_with_syncs(0x12, &[100]),
+            packet_with_syncs(0x13, &[120]),
+            packet_with_syncs(0x14, &[80]),
+        ];
+        let mut input = stream(&packets);
+        input[2 * TS_PACKET_SIZE] = 0x00; // break the sync byte of packet 3
+
+        let mut normalizer = TsNormalizer::new();
+        let mut out = normalizer.push(&input);
+        out.extend(normalizer.finish());
+
+        let expected = stream(&[
+            packets[0].clone(),
+            packets[1].clone(),
+            packets[3].clone(),
+            packets[4].clone(),
+        ]);
+        assert_eq!(out, expected);
+        assert_eq!(normalizer.packets_out, 4);
+        assert_eq!(normalizer.sync_errors, 1);
+        assert_eq!(normalizer.bytes_discarded, TS_PACKET_SIZE as u64);
+    }
+
+    #[test]
+    fn a_false_0x47_in_a_payload_is_not_adopted() {
+        // Packet 3's payload contains a lone 0x47 (offset 50). One packet later
+        // that offset holds ordinary payload, so the candidate is rejected and
+        // the true boundary of packet 4 is used instead. (The broken packet is
+        // late enough that the framing is still detected from clean packets.)
+        let packets = [
+            packet_with_syncs(0x21, &[]),
+            packet_with_syncs(0x22, &[]),
+            packet_with_syncs(0x23, &[]),
+            packet_with_syncs(0x24, &[50]),
+            packet_with_syncs(0x25, &[]),
+            packet_with_syncs(0x26, &[]),
+        ];
+        let mut input = stream(&packets);
+        input[3 * TS_PACKET_SIZE] = 0x00; // break the sync byte of packet 4
+
+        let mut normalizer = TsNormalizer::new();
+        let mut out = normalizer.push(&input);
+        out.extend(normalizer.finish());
+
+        let expected = stream(&[
+            packets[0].clone(),
+            packets[1].clone(),
+            packets[2].clone(),
+            packets[4].clone(),
+            packets[5].clone(),
+        ]);
+        assert_eq!(out, expected);
+        assert_eq!(normalizer.sync_errors, 1);
+        assert_eq!(normalizer.bytes_discarded, TS_PACKET_SIZE as u64);
+    }
+
+    #[test]
+    fn one_byte_chunks_still_resynchronise_past_payload_sync_bytes() {
+        let packets = [
+            packet_with_syncs(0x31, &[60, 150]),
+            packet_with_syncs(0x32, &[40]),
+            packet_with_syncs(0x33, &[100]),
+            packet_with_syncs(0x34, &[120]),
+            packet_with_syncs(0x35, &[80]),
+            packet_with_syncs(0x36, &[]),
+        ];
+        let mut input = stream(&packets);
+        input[3 * TS_PACKET_SIZE] = 0x00;
+
+        let mut whole = TsNormalizer::new();
+        let mut expected = whole.push(&input);
+        expected.extend(whole.finish());
+
+        let mut chunked = TsNormalizer::new();
+        let mut actual = Vec::new();
+        for byte in &input {
+            actual.extend(chunked.push(std::slice::from_ref(byte)));
+        }
+        actual.extend(chunked.finish());
+
+        assert_eq!(actual, expected);
+        assert_eq!(chunked.packets_out, 5);
+        assert_eq!(chunked.sync_errors, 1);
+        assert_eq!(chunked.bytes_discarded, TS_PACKET_SIZE as u64);
+        // The output must be whole, packet-aligned source packets.
+        for (index, packet) in actual.chunks_exact(TS_PACKET_SIZE).enumerate() {
+            assert_eq!(packet[0], SYNC_BYTE, "packet {index} lost alignment");
+        }
     }
 
     #[test]
