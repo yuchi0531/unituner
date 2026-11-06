@@ -8,12 +8,39 @@
 //! The write itself is `copy to .bak` → write `<file>.tmp` → `fsync` →
 //! `rename`, which is atomic for a reader on the same filesystem: a request
 //! either sees the old file or the new one, never a half-written document.
+//!
+//! # Blocking work and locking
+//!
+//! Staging, `fsync` and `rename` are synchronous filesystem calls; on a slow
+//! medium (USB stick, NFS) they can block for a long time. The async handlers
+//! therefore run them through [`tokio::task::spawn_blocking`], and the per-file
+//! mutex is a [`tokio::sync::Mutex`]:
+//!
+//! * the guard is acquired in async code with [`lock_async`], so waiting for a
+//!   busy file yields to the runtime instead of parking a worker;
+//! * the guard is then *moved into* the blocking closure, so it is held for the
+//!   whole read-validate-write sequence and released when that closure returns.
+//!
+//! Holding the guard inside the blocking closure cannot deadlock: the runtime's
+//! blocking pool is only used for work that does not need the async reactor,
+//! and no other lock is taken while waiting for this one. Tasks that want the
+//! same file wait on the mutex (asynchronously); tasks on other files take other
+//! mutexes and proceed in parallel on the blocking pool.
+//!
+//! The scan layer ([`crate::scan`]) still calls the synchronous [`lock`], which
+//! spins on the same mutex with `try_lock`. That keeps scan and webui saves
+//! mutually exclusive, but the scan owner should switch to
+//! `lock_async(..).await` (and run its write inside `spawn_blocking`) so a slow
+//! `fsync` does not park a worker there.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::config::{Config, ConfigError};
 
@@ -55,36 +82,83 @@ pub struct FileLocks {
 }
 
 impl FileLocks {
-    /// Takes the lock belonging to `file` (one of the `*_FILE` constants).
-    pub fn lock(&self, file: &str) -> MutexGuard<'_, ()> {
-        let mutex = match file {
+    fn mutex(&self, file: &str) -> &Mutex<()> {
+        match file {
             TUNERS_FILE => &self.tuners,
             CHANNELS_FILE => &self.channels,
             PIPELINES_FILE => &self.pipelines,
             other => unreachable!("{other:?} is not an editable config file"),
-        };
-        // The critical section only touches the filesystem, so a panic inside
-        // it leaves no in-memory state that a poisoned lock would protect.
-        mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
     }
 }
 
 /// The process-wide locks. One instance, so every router built in this process
 /// serialises against the same mutexes.
-static LOCKS: std::sync::OnceLock<FileLocks> = std::sync::OnceLock::new();
+static LOCKS: OnceLock<FileLocks> = OnceLock::new();
 
-/// Locks `file` for the duration of its save sequence.
+fn file_mutex(file: &str) -> &'static Mutex<()> {
+    LOCKS.get_or_init(FileLocks::default).mutex(file)
+}
+
+/// Locks `file` for the duration of its save sequence, asynchronously.
+///
+/// The returned guard is `'static` (the mutexes live in a `OnceLock`), so it can
+/// be moved into a `spawn_blocking` closure and held across the blocking body.
+/// See the module docs for why that is safe.
+pub async fn lock_async(file: &str) -> MutexGuard<'static, ()> {
+    file_mutex(file).lock().await
+}
+
+/// Locks `file` for a synchronous caller (the channel scan).
+///
+/// Tokio's `blocking_lock` panics inside a runtime, and the scan calls this from
+/// an async task, so this spins with `try_lock` instead. It shares the same
+/// mutex as [`lock_async`], which keeps scan writes and webui saves mutually
+/// exclusive. The critical section in the scan is a short read-merge-write; a
+/// webui save holding the lock during a slow `fsync` makes the scan's worker
+/// thread wait, which is why the scan should move to [`lock_async`].
 pub fn lock(file: &str) -> MutexGuard<'static, ()> {
-    LOCKS.get_or_init(FileLocks::default).lock(file)
+    let mutex = file_mutex(file);
+    loop {
+        if let Ok(guard) = mutex.try_lock() {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Validates `yaml` as the new content of `file` and, when the whole
 /// configuration is valid, writes it to `dir`.
+///
+/// This is the blocking body of a save: call it inside
+/// [`tokio::task::spawn_blocking`] while holding [`lock_async`]'s guard (see the
+/// module docs). The scan layer calls it directly, from its own blocking
+/// section.
 pub fn save(dir: &Path, file: &'static str, yaml: &str) -> Result<(), SaveError> {
     validate_document(dir, file, yaml)?;
     write_atomic(&dir.join(file), yaml).map_err(SaveError::Internal)
+}
+
+/// [`save`] on the blocking pool, serialised per file by [`lock_async`].
+///
+/// The guard is acquired in async code and moved into the blocking closure, so
+/// the file is held for the whole validate-and-write sequence with no guard
+/// held across an `await` by a runtime worker. The webui handler inlines the
+/// same pattern (it also has to check `If-Match` inside the lock); this wrapper
+/// keeps the "same file serialises, other files do not" property testable.
+#[cfg(test)]
+pub async fn save_blocking_async(
+    dir: PathBuf,
+    file: &'static str,
+    yaml: String,
+) -> Result<(), SaveError> {
+    let guard = lock_async(file).await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        save(&dir, file, &yaml)
+    })
+    .await
+    .map_err(|error| SaveError::internal(format!("save task failed: {error}")))?
 }
 
 /// Re-parses the candidate through [`Config::load`] in a scratch directory.
@@ -128,6 +202,11 @@ fn stage_and_load(
 }
 
 /// Writes `contents` to `path` atomically, keeping one `.bak` generation.
+///
+/// The replacement is created with mode `0600` (on Unix) and, when the file
+/// already exists, the original mode is applied again after the rename: a
+/// `chmod 600 tuners.yml` survives a webui save instead of being loosened to the
+/// umask default. Both the tuner command lines and key paths are sensitive.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let name = path
         .file_name()
@@ -136,6 +215,14 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let tmp = path.with_file_name(format!("{name}.tmp"));
     let bak = path.with_file_name(format!("{name}.bak"));
 
+    // Read the mode before writing: `rename` replaces the inode, so the mode of
+    // the file being replaced would otherwise be lost.
+    #[cfg(unix)]
+    let original_mode = path
+        .metadata()
+        .ok()
+        .map(|metadata| std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()));
+
     // SPEC §10 order: back up the previous file, then write the replacement.
     if path.exists() {
         fs::copy(path, &bak)
@@ -143,7 +230,25 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     }
 
     let written = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The mode is set explicitly below; `mode` only covers the case
+            // where the handle is created here.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        // A leftover `.tmp` from a crashed save may already exist with another
+        // mode, and `create(true)` does not change it, so the mode is applied
+        // to the open handle. It is also immune to the umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = original_mode.unwrap_or(0o600);
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -281,6 +386,94 @@ mod tests {
             Err(SaveError::Invalid(issues)) => assert!(!issues.is_empty()),
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_preserves_a_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = fixture();
+        let path = dir.path().join(TUNERS_FILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        save(
+            dir.path(),
+            TUNERS_FILE,
+            "- name: t0\n  types: [GR]\n  command: \"cat {channel}\"\n",
+        )
+        .expect("save");
+        assert_eq!(mode_of(&path), 0o600, "a chmod 600 must survive the save");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_preserves_the_original_mode_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = fixture();
+        let path = dir.path().join(CHANNELS_FILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+        save(
+            dir.path(),
+            CHANNELS_FILE,
+            "- name: NHK\n  type: GR\n  channel: \"27\"\n  disabled: true\n",
+        )
+        .expect("save");
+        assert_eq!(mode_of(&path), 0o640, "the operator's mode is preserved");
+        // The backup keeps the mode `fs::copy` gave it; it is not the file the
+        // server serves.
+        assert_eq!(mode_of(&dir.path().join("channels.yml.bak")), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_created_with_mode_600() {
+        let dir = fixture();
+        let path = dir.path().join(CHANNELS_FILE);
+        fs::remove_file(&path).expect("remove");
+        save(dir.path(), CHANNELS_FILE, "[]\n").expect("save");
+        assert_eq!(mode_of(&path), 0o600, "a new file must be private");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_saves_of_the_same_file_serialise() {
+        let dir = fixture();
+        let path = dir.path().join(CHANNELS_FILE);
+
+        // Hold the file lock, then start a save: it must wait for the guard.
+        let guard = lock_async(CHANNELS_FILE).await;
+        let waiter = tokio::spawn(save_blocking_async(
+            dir.path().to_path_buf(),
+            CHANNELS_FILE,
+            "- name: B\n  type: GR\n  channel: \"2\"\n".to_string(),
+        ));
+        // A save of a *different* file is not blocked by the guard.
+        save_blocking_async(
+            dir.path().to_path_buf(),
+            TUNERS_FILE,
+            "- name: t0\n  types: [GR]\n  command: \"cat {channel}\"\n".to_string(),
+        )
+        .await
+        .expect("the other file is independent");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the same-file save must wait");
+
+        drop(guard);
+        waiter
+            .await
+            .expect("join")
+            .expect("the queued save succeeds");
+        assert!(
+            fs::read_to_string(&path).expect("read").contains("name: B"),
+            "the queued save won the race"
+        );
     }
 
     #[test]
