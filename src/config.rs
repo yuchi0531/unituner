@@ -38,6 +38,24 @@ pub const DEFAULT_SUBSCRIBER_BUFFER_CHUNKS: usize = 1024;
 /// Default chunk size handed to subscribers (SPEC §7).
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 65_536;
 
+/// Default maximum subscribers attached to one session (SPEC §7).
+pub const DEFAULT_MAX_SUBSCRIBERS_PER_SESSION: usize = 32;
+
+/// Default maximum subscribers from one client IP across all sessions
+/// (SPEC §7).
+pub const DEFAULT_MAX_SUBSCRIBERS_PER_IP: usize = 16;
+
+/// Default maximum number of concurrent sessions (SPEC §7).
+pub const DEFAULT_MAX_SESSIONS: usize = 16;
+
+/// Default total subscriber buffer budget, in bytes (SPEC §7).
+///
+/// One default subscriber queue costs `65536 × 1024 = 64 MiB`, so 256 MiB fits
+/// four of them at once. The per-session cap bounds a single session; this
+/// budget bounds the whole process, so 32 × 64 MiB can never happen. Raise it
+/// (or lower `subscriber_buffer_chunks`) to serve more concurrent viewers.
+pub const DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+
 /// `server.yml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +80,33 @@ pub struct ServerConfig {
     pub subscriber_buffer_chunks: usize,
     #[serde(default = "default_chunk_size_bytes")]
     pub chunk_size_bytes: usize,
+    /// Maximum subscribers attached to one session; a further request is
+    /// refused with HTTP 429 (SPEC §7).
+    #[serde(default = "default_max_subscribers_per_session")]
+    pub max_subscribers_per_session: usize,
+    /// Maximum subscribers from one client IP across every session; a further
+    /// request from that IP is refused with HTTP 429 (SPEC §7).
+    ///
+    /// The peer address of the TCP connection is used; `X-Forwarded-For` is
+    /// deliberately ignored, because a client can forge it and a reverse proxy
+    /// would otherwise let every client share one bucket.
+    #[serde(default = "default_max_subscribers_per_ip")]
+    pub max_subscribers_per_ip: usize,
+    /// Maximum number of concurrent session objects, including `Starting` and
+    /// `Stopping` ones; a request that would exceed it is refused with HTTP 429
+    /// (SPEC §7).
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// Total budget for all subscriber queues, in bytes (SPEC §7).
+    ///
+    /// A subscriber costs up to `chunk_size_bytes × subscriber_buffer_chunks`
+    /// (64 KiB × 1024 ≈ 64 MiB with the defaults), so
+    /// `max_subscribers_per_session: 32` alone would allow ≈2 GiB per session.
+    /// This budget caps the sum across every session: a request that would
+    /// exceed it is refused with HTTP 429. With the default 256 MiB, at most
+    /// four default-sized subscriber queues fit at once.
+    #[serde(default = "default_max_subscriber_buffer_bytes")]
+    pub max_subscriber_buffer_bytes: usize,
 }
 
 impl Default for ServerConfig {
@@ -73,6 +118,10 @@ impl Default for ServerConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             subscriber_buffer_chunks: default_subscriber_buffer_chunks(),
             chunk_size_bytes: default_chunk_size_bytes(),
+            max_subscribers_per_session: default_max_subscribers_per_session(),
+            max_subscribers_per_ip: default_max_subscribers_per_ip(),
+            max_sessions: default_max_sessions(),
+            max_subscriber_buffer_bytes: default_max_subscriber_buffer_bytes(),
         }
     }
 }
@@ -98,6 +147,22 @@ fn default_subscriber_buffer_chunks() -> usize {
 
 fn default_chunk_size_bytes() -> usize {
     DEFAULT_CHUNK_SIZE_BYTES
+}
+
+fn default_max_subscribers_per_session() -> usize {
+    DEFAULT_MAX_SUBSCRIBERS_PER_SESSION
+}
+
+fn default_max_subscribers_per_ip() -> usize {
+    DEFAULT_MAX_SUBSCRIBERS_PER_IP
+}
+
+fn default_max_sessions() -> usize {
+    DEFAULT_MAX_SESSIONS
+}
+
+fn default_max_subscriber_buffer_bytes() -> usize {
+    DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
 }
 
 /// One entry of `tuners.yml`.
@@ -284,6 +349,22 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             "chunk_size_bytes",
             "must be greater than 0",
         ));
+    }
+    for (field, value) in [
+        (
+            "max_subscribers_per_session",
+            server.max_subscribers_per_session,
+        ),
+        ("max_subscribers_per_ip", server.max_subscribers_per_ip),
+        ("max_sessions", server.max_sessions),
+        (
+            "max_subscriber_buffer_bytes",
+            server.max_subscriber_buffer_bytes,
+        ),
+    ] {
+        if value == 0 {
+            issues.push(Issue::new("server.yml", field, "must be greater than 0"));
+        }
     }
 }
 
@@ -741,6 +822,35 @@ types:
             DEFAULT_SUBSCRIBER_BUFFER_CHUNKS
         );
         assert_eq!(config.server.chunk_size_bytes, DEFAULT_CHUNK_SIZE_BYTES);
+        assert_eq!(
+            config.server.max_subscribers_per_session,
+            DEFAULT_MAX_SUBSCRIBERS_PER_SESSION
+        );
+        assert_eq!(
+            config.server.max_subscribers_per_ip,
+            DEFAULT_MAX_SUBSCRIBERS_PER_IP
+        );
+        assert_eq!(config.server.max_sessions, DEFAULT_MAX_SESSIONS);
+        assert_eq!(
+            config.server.max_subscriber_buffer_bytes,
+            DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn zero_caps_are_rejected() {
+        // Every cap is "greater than 0"; 0 is not an "unlimited" spelling.
+        for field in [
+            "max_subscribers_per_session",
+            "max_subscribers_per_ip",
+            "max_sessions",
+            "max_subscriber_buffer_bytes",
+        ] {
+            let server = format!("{SERVER}\n{field}: 0\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, field);
+            assert_issue_contains(&issues, "must be greater than 0");
+        }
     }
 
     #[test]

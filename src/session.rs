@@ -139,8 +139,38 @@
 //! `server.idle_timeout_secs` and then stopped. A new subscriber invalidates
 //! the pending timer through a per-session epoch counter, so a cancelled timer
 //! can never kill a session that has users again (SPEC §7).
+//!
+//! # Subscriber and session caps
+//!
+//! SPEC §7's DoS caps are enforced at acquire time, under the registry lock, so
+//! two concurrent requests cannot both pass the last slot:
+//!
+//! * `server.max_subscribers_per_session` — subscribers attached to one
+//!   session (checked in [`attach`]);
+//! * `server.max_subscribers_per_ip` — subscribers from one client IP across
+//!   every session, counted from the socket peer ([`TunerUser::peer`]);
+//!   `X-Forwarded-For` is never consulted;
+//! * `server.max_sessions` — session objects, including `Starting` and
+//!   `Stopping` ones (checked in [`reserve`]);
+//! * `server.max_subscriber_buffer_bytes` — the sum of every subscriber queue's
+//!   worst-case size (`chunk_size_bytes × subscriber_buffer_chunks`), so
+//!   `max_subscribers_per_session` queues cannot add up past the budget.
+//!
+//! A rejection is [`AcquireError::TooManySubscribers`],
+//! [`AcquireError::TooManySubscribersForIp`] or
+//! [`AcquireError::TooManySessions`] (HTTP 429), and it happens **before** a
+//! tuner is spawned: [`reserve`] checks the caps and, if they fail, returns a
+//! `Selection::Fail` without inserting a session.
+//!
+//! The counts are not separate counters but derived from the subscriber lists,
+//! so a subscriber is released exactly once, by the same code ([`detach`]) that
+//! removes its entry — whether it left by dropping the receiver, a closed HTTP
+//! body, a full queue, a `Lagged` broadcast, EOF or a takeover. A `Starting`
+//! reservation also counts as one subscriber until it attaches or is released,
+//! so concurrent acquires cannot overshoot a cap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -220,6 +250,12 @@ pub struct TunerUser {
     pub provider: Option<String>,
     /// `X-Mirakurun-Tuner-User-Agent`, if any.
     pub agent: Option<String>,
+    /// Peer address of the TCP connection (SPEC §7: per-IP subscriber cap).
+    ///
+    /// Deliberately the socket peer, never `X-Forwarded-For`: the header is
+    /// client-controlled, and honouring it would let one client claim many
+    /// addresses (or make every client behind a proxy share one bucket).
+    pub peer: Option<IpAddr>,
 }
 
 impl TunerUser {
@@ -230,6 +266,7 @@ impl TunerUser {
             priority,
             provider: None,
             agent: None,
+            peer: None,
         }
     }
 
@@ -242,6 +279,12 @@ impl TunerUser {
     /// Sets the user-agent header value.
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
+        self
+    }
+
+    /// Sets the peer IP the per-IP subscriber cap is counted against.
+    pub fn with_peer(mut self, peer: IpAddr) -> Self {
+        self.peer = Some(peer);
         self
     }
 }
@@ -271,6 +314,16 @@ pub enum AcquireError {
     /// All suitable tuners are busy and preemption is not allowed.
     #[error("all tuners are busy")]
     Busy,
+    /// A subscriber cap (`server.max_subscribers_per_session`,
+    /// `server.max_subscriber_buffer_bytes`) would be exceeded. HTTP 429.
+    #[error("session subscriber limit reached")]
+    TooManySubscribers,
+    /// `server.max_subscribers_per_ip` would be exceeded. HTTP 429.
+    #[error("per-IP subscriber limit reached")]
+    TooManySubscribersForIp,
+    /// `server.max_sessions` would be exceeded. HTTP 429.
+    #[error("session limit reached")]
+    TooManySessions,
     /// The channel is already streaming with the other decode mode
     /// (`decode=0` versus the pipeline). Joining would deliver the wrong bytes
     /// and taking over would make two clients fight over one channel, so the
@@ -552,6 +605,11 @@ struct Session {
     next_subscriber_id: AtomicU64,
     /// Invalidates a pending idle timer; bumped on every new subscriber.
     idle_epoch: AtomicU64,
+    /// Peer of the request that reserved this session. While the phase is
+    /// `Starting` the reservation counts as one subscriber for the caps, so
+    /// concurrent acquires cannot all pass the last slot before any subscriber
+    /// exists (SPEC §7). `None` for a request without a peer (the channel scan).
+    reservation_peer: Mutex<Option<IpAddr>>,
     /// A takeover is being prepared for this session; new joins wait.
     takeover_pending: AtomicBool,
     /// The stream ended before the session was promoted to `Ready`; the
@@ -583,6 +641,7 @@ impl Session {
             replay_byte_cap: AtomicUsize::new(PRELUDE_CHUNKS),
             next_subscriber_id: AtomicU64::new(0),
             idle_epoch: AtomicU64::new(0),
+            reservation_peer: Mutex::new(None),
             takeover_pending: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             clean_eof: AtomicBool::new(false),
@@ -622,6 +681,36 @@ impl Session {
 
     fn users_len(&self) -> usize {
         lock(&self.users).len()
+    }
+
+    /// Number of subscribers whose peer is `ip` (SPEC §7 per-IP cap).
+    fn users_from_ip(&self, ip: IpAddr) -> usize {
+        lock(&self.users)
+            .iter()
+            .filter(|entry| entry.user.peer == Some(ip))
+            .count()
+    }
+
+    /// Subscribers counted against the caps, including the one implied by a
+    /// `Starting` reservation that has not attached yet (so concurrent acquires
+    /// cannot all pass the last slot). With `ip`, only that peer's entries.
+    fn counted_subscribers(&self, ip: Option<IpAddr>) -> usize {
+        let attached = match ip {
+            Some(ip) => self.users_from_ip(ip),
+            None => self.users_len(),
+        };
+        if attached > 0 || self.phase() != SessionPhase::Starting {
+            return attached;
+        }
+        match ip {
+            None => 1,
+            Some(ip) => usize::from(*lock(&self.reservation_peer) == Some(ip)),
+        }
+    }
+
+    /// Records the peer of the request that reserved this session.
+    fn set_reservation_peer(&self, peer: Option<IpAddr>) {
+        *lock(&self.reservation_peer) = peer;
     }
 
     fn users_is_empty(&self) -> bool {
@@ -827,6 +916,100 @@ impl Inner {
     fn supports(&self, tuner: &TunerConfig, type_name: &str) -> bool {
         !tuner.disabled && tuner.types.iter().any(|name| name == type_name)
     }
+
+    /// Bytes a subscriber reserves for its bounded queue: the packet-aligned
+    /// chunk size times `subscriber_buffer_chunks`.
+    fn subscriber_buffer_bytes(&self) -> usize {
+        packet_aligned_chunk_size(self.config.server.chunk_size_bytes.max(1))
+            .saturating_mul(self.config.server.subscriber_buffer_chunks.max(1))
+    }
+
+    /// Counts session objects in the registry, including `Starting` and
+    /// `Stopping` ones (SPEC §7 `max_sessions`). A `Starting` reservation is
+    /// registered before the spawn, so it is counted too — two concurrent
+    /// acquires cannot both pass the last slot.
+    fn count_sessions(&self, state: &State) -> usize {
+        state.sessions.len()
+    }
+
+    /// Counts live subscribers, optionally only those from `ip`, across every
+    /// registered session.
+    ///
+    /// Sessions already removed from the registry (a takeover victim, a stopped
+    /// session) are **not** counted: their broadcast is closed and their
+    /// subscribers are on their way out, so counting them would refuse the
+    /// takeover's own promotion with the very subscribers it is retiring. The
+    /// transient overshoot is one retiring session's worth, and its buffers are
+    /// freed as the pumps exit.
+    ///
+    /// A takeover subtracts its victim explicitly
+    /// ([`Self::check_subscriber_caps`] `replacing`), because at reservation
+    /// time the victim is still registered.
+    fn count_subscribers(&self, state: &State, ip: Option<IpAddr>) -> usize {
+        state
+            .sessions
+            .values()
+            .map(|session| session.counted_subscribers(ip))
+            .sum()
+    }
+
+    /// Checks the SPEC §7 subscriber caps for one more subscriber.
+    ///
+    /// `session` is the session the subscriber is about to join (`None` when a
+    /// new session is being reserved). `replacing` is a victim that is about to
+    /// be retired by a takeover: its subscribers are leaving, so they are
+    /// subtracted from the totals instead of blocking the takeover. The check
+    /// is `count >= cap`, because the new subscriber is not counted yet.
+    fn check_subscriber_caps(
+        &self,
+        state: &State,
+        user: &TunerUser,
+        session: Option<&Arc<Session>>,
+        replacing: Option<&Arc<Session>>,
+    ) -> Result<(), AcquireError> {
+        let server = &self.config.server;
+        if let Some(session) = session {
+            if session.users_len() >= server.max_subscribers_per_session {
+                return Err(AcquireError::TooManySubscribers);
+            }
+        }
+        if let Some(ip) = user.peer {
+            let leaving = replacing.map_or(0, |victim| victim.users_from_ip(ip));
+            let current = self
+                .count_subscribers(state, Some(ip))
+                .saturating_sub(leaving);
+            if current >= server.max_subscribers_per_ip {
+                return Err(AcquireError::TooManySubscribersForIp);
+            }
+        }
+        // Reserve the worst-case queue for every subscriber, so
+        // `max_subscribers_per_session` queues can never sum past the budget.
+        let cost = self.subscriber_buffer_bytes();
+        let leaving = replacing.map_or(0, |victim| victim.users_len());
+        let reserved = self
+            .count_subscribers(state, None)
+            .saturating_sub(leaving)
+            .saturating_add(1);
+        if reserved.saturating_mul(cost) > server.max_subscriber_buffer_bytes {
+            return Err(AcquireError::TooManySubscribers);
+        }
+        Ok(())
+    }
+}
+
+/// Live session and subscriber counts (SPEC §7), exposed for diagnostics and
+/// tests so a cap can be checked without guessing.
+///
+/// The counts are derived from the registry and the subscriber lists, not from
+/// separate counters, so a subscriber that leaves (EOF, drop, timeout, takeover)
+/// is subtracted exactly once by the same code that removes its entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionCounts {
+    /// Session objects, including `Starting` / `Stopping` ones whose process
+    /// tree is still being torn down.
+    pub sessions: usize,
+    /// Attached subscribers across every session.
+    pub subscribers: usize,
 }
 
 /// Tuner sessions for one server.
@@ -1005,11 +1188,15 @@ impl SessionManager {
 
             match selection {
                 Selection::Join(session) => {
-                    if let Some(subscription) = join(&inner, &session, &user, tap) {
-                        return Ok(subscription);
+                    match join(&inner, &session, &user, tap) {
+                        Ok(subscription) => return Ok(subscription),
+                        // A SPEC §7 cap: answer 429 instead of waiting.
+                        Err(AttachError::Rejected(error)) => return Err(error),
+                        // The session changed between selection and join. Wait
+                        // for the next change instead of spinning on a repeated
+                        // miss.
+                        Err(AttachError::Gone) => {}
                     }
-                    // The session changed between selection and join. Wait for
-                    // the next change instead of spinning on a repeated miss.
                     if !wait_before_retry(&session, wait_deadline, type_name, channel).await {
                         return Err(AcquireError::Unavailable);
                     }
@@ -1084,6 +1271,22 @@ impl SessionManager {
             return Err(AcquireError::UnsupportedType(type_name.to_string()));
         }
         Ok(())
+    }
+
+    /// Live session and subscriber counts (SPEC §7).
+    ///
+    /// `subscribers` counts attached subscribers across every **registered**
+    /// session (so a session kept only as a `Stopping` slot until its process
+    /// tree exits still counts its subscribers). A takeover victim is removed
+    /// from the registry before its subscribers see EOF, so its departing
+    /// subscribers are not counted and cannot block the promotion that retires
+    /// them. The count returns to zero once every subscriber has left.
+    pub fn counts(&self) -> SessionCounts {
+        let state = lock(&self.inner.state);
+        SessionCounts {
+            sessions: self.inner.count_sessions(&state),
+            subscribers: self.inner.count_subscribers(&state, None),
+        }
     }
 
     /// Status of every configured tuner (SPEC §9 `/api/tuners`).
@@ -1448,6 +1651,7 @@ fn select(
             &tuner.name,
             type_name,
             channel,
+            user,
             None,
             bypass_pipeline,
         );
@@ -1495,6 +1699,7 @@ fn select(
             &tuner,
             type_name,
             channel,
+            user,
             Some(victim),
             bypass_pipeline,
         );
@@ -1527,15 +1732,43 @@ fn select(
 }
 
 /// Inserts the `Starting` reservation under the lock (pick → reserve atomically).
+///
+/// The SPEC §7 caps are re-checked here, under the registry lock, so a request
+/// that would exceed them is refused **before** a tuner is spawned (429,
+/// [`AcquireError::TooManySessions`] / [`AcquireError::TooManySubscribers`] /
+/// [`AcquireError::TooManySubscribersForIp`]).
+#[allow(clippy::too_many_arguments)]
 fn reserve(
     state: &mut State,
     inner: &Arc<Inner>,
     tuner: &str,
     type_name: &str,
     channel: &str,
+    user: &TunerUser,
     victim: Option<Arc<Session>>,
     bypass_pipeline: bool,
 ) -> Selection {
+    let rejected = if let Err(error) =
+        inner.check_subscriber_caps(state, user, None, victim.as_ref())
+    {
+        Some(error)
+    } else if victim.is_none() && inner.count_sessions(state) >= inner.config.server.max_sessions {
+        // A takeover keeps the session count unchanged (the victim's slot is
+        // reused), so only a fresh reservation can exceed the cap.
+        Some(AcquireError::TooManySessions)
+    } else {
+        None
+    };
+    if let Some(error) = rejected {
+        // `select` may already have flagged the victim as being taken over;
+        // the victim keeps running, so undo the flag and its wakeup.
+        if let Some(victim) = victim.as_ref() {
+            victim.takeover_pending.store(false, Ordering::SeqCst);
+            victim.wake();
+        }
+        return Selection::Fail(error);
+    }
+
     let session = Arc::new(Session::new(
         inner.session_id(),
         SessionKey {
@@ -1548,6 +1781,9 @@ fn reserve(
     session
         .replay_byte_cap
         .store(inner.replay_byte_cap(), Ordering::Relaxed);
+    // The reservation counts as one subscriber for the caps until it attaches,
+    // so concurrent acquires cannot overshoot a limit they both passed.
+    session.set_reservation_peer(user.peer);
     state
         .sessions
         .insert(session.key.clone(), Arc::clone(&session));
@@ -1562,6 +1798,15 @@ fn reserve(
     Selection::Spawn { session, victim }
 }
 
+/// Why a subscriber could not attach.
+enum AttachError {
+    /// The session changed (stopped, taken over, unregistered) between
+    /// selection and attach; the caller waits and retries.
+    Gone,
+    /// A SPEC §7 cap would be exceeded; the caller gets HTTP 429.
+    Rejected(AcquireError),
+}
+
 /// Attaches `user` to a ready `session` while the registry lock is held, so the
 /// idle timer cannot remove the session between the phase check and the insert.
 fn attach(
@@ -1570,7 +1815,7 @@ fn attach(
     session: &Arc<Session>,
     user: &TunerUser,
     tap: SessionTap,
-) -> Option<(Subscription, AttachedPump)> {
+) -> Result<(Subscription, AttachedPump), AttachError> {
     // The reservation must still be the registered session and be ready: the
     // idle-release / takeover path re-checks the same conditions under this
     // lock, so an attach either wins (and forces the takeover to fall back to
@@ -1589,8 +1834,17 @@ fn attach(
         || session.phase() != SessionPhase::Ready
         || session.takeover_pending.load(Ordering::SeqCst)
     {
-        return None;
+        return Err(AttachError::Gone);
     }
+
+    // SPEC §7 caps, checked under the registry lock so two concurrent attaches
+    // cannot both pass the last slot. Everything is derived from the subscriber
+    // lists, so the "counter" is released exactly once, by `detach`. The
+    // session is `Ready` here, so its `Starting` reservation placeholder is no
+    // longer counted and this subscriber is not counted twice.
+    inner
+        .check_subscriber_caps(state, user, Some(session), None)
+        .map_err(AttachError::Rejected)?;
 
     let capacity = inner.config.server.subscriber_buffer_chunks.max(1);
     let (tx, rx) = mpsc::channel(capacity);
@@ -1599,7 +1853,9 @@ fn attach(
     // delivered either from the window or from the broadcast, never both.
     let (broadcast_rx, prelude) = {
         let mut replay = lock(&session.replay);
-        let sender = lock(&session.broadcaster).clone()?;
+        let Some(sender) = lock(&session.broadcaster).clone() else {
+            return Err(AttachError::Gone);
+        };
         let broadcast_rx = sender.subscribe();
         // Replay at most one queue's worth, so the replay itself can never
         // overflow the subscriber's bounded mpsc (SPEC §7).
@@ -1642,7 +1898,7 @@ fn attach(
         tap,
         preempted: session.preemption_flag(),
     };
-    Some((
+    Ok((
         subscription,
         AttachedPump {
             broadcast_rx,
@@ -1661,19 +1917,22 @@ struct AttachedPump {
     subscriber_id: u64,
 }
 
-/// Joins a ready session; `None` means it disappeared and the caller retries.
+/// Joins a ready session.
+///
+/// `Err(AttachError::Gone)` means it disappeared and the caller retries;
+/// `Err(AttachError::Rejected)` is a SPEC §7 cap and becomes HTTP 429.
 fn join(
     inner: &Arc<Inner>,
     session: &Arc<Session>,
     user: &TunerUser,
     tap: SessionTap,
-) -> Option<Subscription> {
+) -> Result<Subscription, AttachError> {
     let (subscription, pump) = {
         let state = lock(&inner.state);
         attach(inner, &state, session, user, tap)?
     };
     spawn_subscriber_pump(Arc::clone(inner), Arc::clone(session), pump);
-    Some(subscription)
+    Ok(subscription)
 }
 
 /// Spawns the tree for a reservation, waits for readiness and promotes it.
@@ -1956,10 +2215,11 @@ async fn spawn_and_promote(
         } else {
             session.set_phase(SessionPhase::Ready);
             match attach(inner, &state, &session, &user, tap) {
-                None => Err(SpawnFailure::Failed {
+                Err(AttachError::Gone) => Err(SpawnFailure::Failed {
                     tuner: tuner_name.clone(),
                 }),
-                Some(pump) => {
+                Err(AttachError::Rejected(error)) => Err(SpawnFailure::Aborted(error)),
+                Ok(pump) => {
                     // The stream can end between the first chunk and the
                     // promotion (a short recording). Promote, then remove the
                     // session right away so the subscriber sees the replay
@@ -2784,8 +3044,20 @@ mod tests {
         let server = format!(
             "addr: \":40772\"\nidle_timeout_secs: {idle_secs}\nchunk_size_bytes: {chunk_size}\nsubscriber_buffer_chunks: {buffer_chunks}\n"
         );
+        manager_with_server(dir, &server, tuners, channels, pipelines)
+    }
+
+    /// Like [`manager`] but with a caller-supplied `server.yml`, so a test can
+    /// tune the SPEC §7 caps.
+    fn manager_with_server(
+        dir: &TempDir,
+        server: &str,
+        tuners: &str,
+        channels: &str,
+        pipelines: &str,
+    ) -> SessionManager {
         for (name, body) in [
-            ("server.yml", server),
+            ("server.yml", server.to_string()),
             ("tuners.yml", tuners.to_string()),
             ("channels.yml", channels.to_string()),
             ("pipelines.yml", pipelines.to_string()),
@@ -2812,6 +3084,26 @@ mod tests {
 
     fn user(id: &str, priority: i32) -> TunerUser {
         TunerUser::new(id, priority)
+    }
+
+    fn peer(id: &str, ip: [u8; 4]) -> TunerUser {
+        TunerUser::new(id, 0).with_peer(std::net::IpAddr::from(ip))
+    }
+
+    /// Waits until `manager.counts()` reports `want` subscribers.
+    async fn wait_for_subscribers(manager: &SessionManager, want: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let counts = manager.counts();
+            if counts.subscribers == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected {want} subscribers, got {counts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn process_exists(pid: u32) -> bool {
@@ -4704,6 +4996,7 @@ mod tests {
                 "t0",
                 "GR",
                 "28",
+                &user("b", 0),
                 Some(Arc::clone(&victim)),
                 false,
             ) {
@@ -4826,6 +5119,267 @@ mod tests {
             .expect("a clean EOF is not a broken tuner");
         drop(again);
 
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_33rd_subscriber_on_one_session_is_rejected_and_the_existing_ones_stream() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        // A per-IP cap high enough not to interfere; the session cap is the
+        // default 32.
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\nmax_subscribers_per_ip: 1000\n";
+        let manager = manager_with_server(
+            &dir,
+            server,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+        );
+
+        let mut existing = Vec::new();
+        for index in 0..32u8 {
+            let subscription = manager
+                .acquire(
+                    "GR",
+                    "27",
+                    peer(&format!("u{index}"), [127, 0, 0, index + 1]),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("subscriber {index} must be accepted: {error}"));
+            existing.push(subscription);
+        }
+        wait_for_subscribers(&manager, 32).await;
+
+        // The cap is per session: the 33rd is 429 (TooManySubscribers).
+        let rejected = manager
+            .acquire("GR", "27", peer("overflow", [127, 0, 1, 1]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySubscribers);
+        assert_eq!(manager.counts().subscribers, 32);
+
+        // The 32 accepted subscribers are still streaming after the rejection.
+        for subscription in existing.iter_mut() {
+            let bytes =
+                read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+            assert_eq!(bytes.len(), 2 * PACKET);
+        }
+
+        drop(existing);
+        wait_for_subscribers(&manager, 0).await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_17th_subscriber_from_one_ip_is_rejected_while_another_ip_is_fine() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        // Only the per-IP cap is interesting here.
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\nmax_subscribers_per_session: 100\n";
+        let manager = manager_with_server(
+            &dir,
+            server,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+        );
+
+        let mut same_ip = Vec::new();
+        for index in 0..16u8 {
+            let subscription = manager
+                .acquire(
+                    "GR",
+                    "27",
+                    peer(&format!("a{index}"), [192, 168, 1, 10]),
+                    None,
+                    true,
+                )
+                .await
+                .expect("16 subscribers from one IP are allowed");
+            same_ip.push(subscription);
+        }
+        wait_for_subscribers(&manager, 16).await;
+
+        let rejected = manager
+            .acquire("GR", "27", peer("a16", [192, 168, 1, 10]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySubscribersForIp);
+
+        // Another IP is unaffected, and the counters did not drift.
+        let other = manager
+            .acquire("GR", "27", peer("b0", [192, 168, 1, 11]), None, true)
+            .await
+            .expect("a different IP is still accepted");
+        wait_for_subscribers(&manager, 17).await;
+
+        drop(other);
+        drop(same_ip);
+        wait_for_subscribers(&manager, 0).await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_total_buffer_budget_caps_concurrent_subscribers() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        // One queue costs 188 × 8 = 1504 bytes; a 3008-byte budget fits two.
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\nmax_subscriber_buffer_bytes: 3008\n";
+        let manager = manager_with_server(
+            &dir,
+            server,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+        );
+
+        let mut first = manager
+            .acquire("GR", "27", peer("a", [10, 0, 0, 1]), None, true)
+            .await
+            .expect("first subscriber fits the budget");
+        let second = manager
+            .acquire("GR", "27", peer("b", [10, 0, 0, 2]), None, true)
+            .await
+            .expect("second subscriber fits the budget");
+        wait_for_subscribers(&manager, 2).await;
+
+        let rejected = manager
+            .acquire("GR", "27", peer("c", [10, 0, 0, 3]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySubscribers);
+
+        // The first subscriber still streams after the rejection.
+        let bytes = read_at_least(&mut first.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        drop(second);
+        wait_for_subscribers(&manager, 1).await;
+        drop(first);
+
+        // The budget is released with the subscriptions, not with the session
+        // (an idle session may still hold the tuner).
+        let third = manager
+            .acquire("GR", "27", peer("d", [10, 0, 0, 4]), None, true)
+            .await
+            .expect("the budget is free again");
+        wait_for_subscribers(&manager, 1).await;
+        drop(third);
+        wait_for_subscribers(&manager, 0).await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eof_releases_the_subscriber_count() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // The tuner exits right after the two packets: the session reaches EOF
+        // on its own, which must release the subscriber exactly once.
+        let tuners = tuner_yaml("t0", &["GR"], &format!("cat {}", path.display()));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let mut subscription = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        wait_for_subscribers(&manager, 1).await;
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+        // The stream ended, so the pump detaches without waiting for the drop.
+        wait_for_subscribers(&manager, 0).await;
+        drop(subscription);
+        assert_eq!(manager.counts().subscribers, 0);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_cap_rejection_never_spawns_a_tuner() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let spawns = dir.path().join("spawns");
+        let command = format!(
+            "sh -c \"echo spawn >> {}; cat {}; sleep 30\"",
+            spawns.display(),
+            path.display()
+        );
+        let tuners = tuner_yaml("t0", &["GR"], &command);
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\nmax_subscribers_per_session: 1\n";
+        let manager = manager_with_server(
+            &dir,
+            server,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+        );
+
+        let first = manager
+            .acquire("GR", "27", peer("a", [10, 0, 0, 1]), None, true)
+            .await
+            .expect("first subscriber");
+        wait_for_subscribers(&manager, 1).await;
+        let rejected = manager
+            .acquire("GR", "27", peer("b", [10, 0, 0, 2]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySubscribers);
+
+        let content = std::fs::read_to_string(&spawns).expect("spawn log");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "the rejected request must not spawn a tuner"
+        );
+
+        drop(first);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_global_session_cap_refuses_a_second_channel_without_spawning() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // Two tuners, so a second channel would normally get a free one: only
+        // `max_sessions` can refuse it.
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("t0", &["GR"], &streaming_command(&path)),
+            tuner_yaml("t1", &["GR"], &streaming_command(&path)),
+        );
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\nmax_sessions: 1\n";
+        let manager = manager_with_server(
+            &dir,
+            server,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+        );
+
+        let first = manager
+            .acquire("GR", "27", peer("a", [10, 0, 0, 1]), None, true)
+            .await
+            .expect("first session");
+        assert_eq!(manager.counts().sessions, 1);
+
+        // A different channel would need a second session object, even though
+        // this tuner has no second frontend: the cap is checked first.
+        let rejected = manager
+            .acquire("GR", "28", peer("b", [10, 0, 0, 2]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySessions);
+        assert_eq!(manager.counts().sessions, 1);
+
+        drop(first);
         manager.shutdown().await;
     }
 }

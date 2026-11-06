@@ -2236,3 +2236,78 @@ async fn a_service_mode_refresh_replaces_every_per_service_entry() {
     // Both produced entries are present as per-service channels.
     assert_eq!(written.matches("channel: BS13_").count(), 2, "{written}");
 }
+
+/// Peer on `127.0.0.n`, so tests can exercise the per-IP cap (127.0.0.0/8 is
+/// in the fixture's `allowed_cidrs`).
+fn loopback_ip(last: u8) -> SocketAddr {
+    SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, last)),
+        0,
+    )
+}
+
+#[tokio::test]
+async fn subscriber_caps_answer_429_and_ignore_forwarded_for() {
+    let log_dir = tempfile::TempDir::new().expect("spawn log dir");
+    let spawn_log = log_dir.path().join("spawns");
+    let ts27 = [packet_bytes(0x27), packet_bytes(0xA7)].concat();
+    let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), PIPELINE_CAT);
+    let path = fixture.write_ts("27.ts", &ts27);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&format!(
+            "sh -c \"echo spawn >> {}; cat {}; sleep 30\"",
+            spawn_log.display(),
+            path.display()
+        )),
+    )
+    .expect("rewrite tuners.yml");
+
+    // Per-IP cap 1 and per-session cap 2: the second request from one IP is
+    // the per-IP rejection, the request from a second IP is fine, and the
+    // third IP exceeds the per-session cap.
+    let server = r#"
+addr: ":0"
+allowed_cidrs:
+  - 127.0.0.0/8
+idle_timeout_secs: 30
+max_subscribers_per_session: 2
+max_subscribers_per_ip: 1
+"#;
+    std::fs::write(fixture.path.join("server.yml"), server).expect("rewrite server.yml");
+    let state = fixture.state();
+    let uri = "/api/channels/GR/27/stream";
+
+    let first = send(&state, loopback_ip(1), request(Method::GET, uri)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    // Holding the body keeps the subscription (and its subscriber slot) alive.
+    let _first_body = first.into_body();
+
+    // `X-Forwarded-For` is client-controlled and must not move the request out
+    // of its peer's bucket.
+    let (status, headers, body) = send_body(
+        &state,
+        loopback_ip(1),
+        request_with_headers(Method::GET, uri, &[("x-forwarded-for", "198.51.100.7")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_server_identity(&headers);
+    let error = json(&body);
+    assert_eq!(error["code"], 429);
+    assert_eq!(error["reason"], "Too Many Requests");
+
+    // A different IP is not affected by the first IP's bucket.
+    let second = send(&state, loopback_ip(2), request(Method::GET, uri)).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let _second_body = second.into_body();
+
+    // A third IP would exceed the per-session cap.
+    let (status, _, body) = send_body(&state, loopback_ip(3), request(Method::GET, uri)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json(&body)["code"], 429);
+
+    // Both rejections happened before a tuner was spawned: exactly one spawn.
+    let log = std::fs::read_to_string(&spawn_log).expect("spawn log");
+    assert_eq!(log.lines().count(), 1, "spawn log: {log:?}");
+}

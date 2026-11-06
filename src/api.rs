@@ -44,7 +44,7 @@
 //! 3. service resolution: 404;
 //! 4. header parse (priority): 400;
 //! 5. pinned tuner existence / type support: 400;
-//! 6. tuner scheduling and resource errors: 409/503.
+//! 6. tuner scheduling and resource errors: 409/429/503.
 //!
 //! `/api/services/{id}/stream` has no `(type, channel)` in its path, so it must
 //! resolve the service first to learn one; step 3 runs before step 2 there (an
@@ -62,6 +62,12 @@
 //! A stream request whose `decode` value differs from the mode the channel is
 //! already streaming with is a **409** `{"code":409,…}`: one process tree per
 //! channel (SPEC §4, §6.2), so it can neither join nor preempt that session.
+//!
+//! A request that would exceed a SPEC §7 subscriber / session cap is a **429**
+//! `{"code":429,"reason":"Too Many Requests"}`. The cap is enforced in
+//! [`SessionManager`](crate::session::SessionManager) under the registry lock,
+//! using the socket peer ([`ConnectInfo`]) for the per-IP bucket; a header is
+//! never trusted for that.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -516,6 +522,9 @@ struct StreamRequest {
     provider: Option<String>,
     agent: Option<String>,
     user_id: String,
+    /// Socket peer the request came from, used by the per-IP subscriber cap
+    /// (SPEC §7). `X-Forwarded-For` is deliberately never consulted.
+    peer: IpAddr,
 }
 
 impl StreamRequest {
@@ -541,6 +550,7 @@ impl StreamRequest {
             provider: last_header(headers, "x-mirakurun-tuner-user-provider"),
             agent: last_header(headers, "x-mirakurun-tuner-user-agent"),
             user_id: peer.to_string(),
+            peer: peer.ip(),
         })
     }
 
@@ -552,7 +562,7 @@ impl StreamRequest {
         if let Some(agent) = &self.agent {
             user = user.with_agent(agent.clone());
         }
-        user
+        user.with_peer(self.peer)
     }
 }
 
@@ -897,6 +907,12 @@ fn acquire_failure(error: &AcquireError) -> Response {
         // is refused as a conflict rather than preempting (which would let two
         // clients ping-pong the tuner).
         AcquireError::DecodeModeConflict => StatusCode::CONFLICT,
+        // SPEC §7 caps: a client that is over the limit is rate-limited (429),
+        // not told the tuner is broken (503). The existing subscribers keep
+        // streaming.
+        AcquireError::TooManySubscribers
+        | AcquireError::TooManySubscribersForIp
+        | AcquireError::TooManySessions => StatusCode::TOO_MANY_REQUESTS,
         AcquireError::NoTuner
         | AcquireError::Unavailable
         | AcquireError::Busy
@@ -911,6 +927,9 @@ fn acquire_failure(error: &AcquireError) -> Response {
             status,
             format!("{error}: the channel is already streaming with the other decode mode"),
         )
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        tracing::debug!(%error, "stream request rejected");
+        error_response(status, "Too Many Requests")
     } else {
         tracing::debug!(%error, "stream request rejected");
         error_response(status, error.to_string())
