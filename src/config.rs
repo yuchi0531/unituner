@@ -50,11 +50,13 @@ pub const DEFAULT_MAX_SESSIONS: usize = 16;
 
 /// Default total subscriber buffer budget, in bytes (SPEC §7).
 ///
-/// One default subscriber queue costs `65536 × 1024 = 64 MiB`, so 256 MiB fits
-/// four of them at once. The per-session cap bounds a single session; this
-/// budget bounds the whole process, so 32 × 64 MiB can never happen. Raise it
-/// (or lower `subscriber_buffer_chunks`) to serve more concurrent viewers.
-pub const DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+/// One default subscriber queue costs `65536 × 1024 = 64 MiB` worst case, so
+/// 2 GiB fits 32 of them — the same as `max_subscribers_per_session`, which
+/// therefore normally binds before this budget does. The budget is a
+/// worst-case reservation, not typical usage: a real queue only holds what the
+/// client is actually being fed. It still bounds process-wide growth. Raise it
+/// further (or lower `subscriber_buffer_chunks`) on memory-constrained hosts.
+pub const DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// `server.yml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -103,8 +105,9 @@ pub struct ServerConfig {
     /// (64 KiB × 1024 ≈ 64 MiB with the defaults), so
     /// `max_subscribers_per_session: 32` alone would allow ≈2 GiB per session.
     /// This budget caps the sum across every session: a request that would
-    /// exceed it is refused with HTTP 429. With the default 256 MiB, at most
-    /// four default-sized subscriber queues fit at once.
+    /// exceed it is refused with HTTP 429. The default 2 GiB fits 32
+    /// default-sized queues, so the per-session cap normally binds first; the
+    /// budget is a worst-case reservation and still prevents unbounded growth.
     #[serde(default = "default_max_subscriber_buffer_bytes")]
     pub max_subscriber_buffer_bytes: usize,
 }
@@ -834,6 +837,18 @@ types:
         assert_eq!(
             config.server.max_subscriber_buffer_bytes,
             DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
+        );
+    }
+
+    #[test]
+    fn default_subscriber_buffer_budget_is_2_gib() {
+        // 2 GiB = 32 default-sized queues (64 MiB each), matching
+        // max_subscribers_per_session.
+        assert_eq!(DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
+                / (DEFAULT_CHUNK_SIZE_BYTES * DEFAULT_SUBSCRIBER_BUFFER_CHUNKS),
+            32
         );
     }
 

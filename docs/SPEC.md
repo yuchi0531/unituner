@@ -42,7 +42,7 @@ chunk_size_bytes: 65536              # 既定 65536。購読者へ渡す chunk �
 max_subscribers_per_session: 32      # 既定 32。1 セッションの購読者上限。超過は 429
 max_subscribers_per_ip: 16           # 既定 16。1 クライアント IP の全セッション合計上限。超過は 429
 max_sessions: 16                     # 既定 16。同時セッション数（Starting/Stopping 含む）。超過は 429
-max_subscriber_buffer_bytes: 268435456   # 既定 256MiB。全購読者キューの合計上限。超過は 429
+max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キューの合計上限。超過は 429
 ```
 
 - `addr` の既定値（loopback か全インタフェースか）は実装時に確定し、本書と README に記す。
@@ -55,7 +55,7 @@ max_subscriber_buffer_bytes: 268435456   # 既定 256MiB。全購読者キュー
   - `max_subscribers_per_session` は 1 セッションあたりの同時購読者数。
   - `max_subscribers_per_ip` は 1 クライアント IP が**全セッション合計**で持てる購読者数。TCP 接続元 IP で数え、`X-Forwarded-For` は無視する（クライアントが詐称できるため）。
   - `max_sessions` は同時に存在するセッションオブジェクト数（登録中の `Starting` / `Stopping` も含む）。奪取で退避した victim はレジストリから外れた時点で数えない（その購読者は EOF に向かう途中であり、置換の予約を妨げないため）。
-  - `max_subscriber_buffer_bytes` は全購読者キューの合計バイト上限。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約するため、既定 256 MiB では同時 4 購読者まで。`max_subscribers_per_session: 32` の 32 × 64 MiB = 2 GiB を防ぐための予算である。
+  - `max_subscriber_buffer_bytes` は全購読者キューの合計バイト上限。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約する。既定 2 GiB は 32 購読者分にあたり、`max_subscribers_per_session: 32` と同じなので通常は per-session 上限の方が先に効く。この予算は「最悪ケースの予約」であり実使用量ではない（実際のキューはクライアントに配信中の分しか持たない）ため、2 GiB の予約は一般的なホストで許容できる。より多くの同時視聴が必要なら `max_subscriber_buffer_bytes` を上げ、メモリが制約されたホストでは `subscriber_buffer_chunks` を下げる。
   - 上限を超えたストリーム要求は **429**（`{"code":429,"reason":"Too Many Requests"}`）。既存の購読者・セッションには影響しない。判定はチューナー選定より前（新規セッションは予約時、既存セッションへの参加は attach 時）に行うため、通常はチューナーを起動しない。
 - webui では **閲覧のみ**（編集不可。意図的に誤設定でロックアウトすることを防ぐ）。
 
@@ -230,9 +230,9 @@ types:                                # チャンネルタイプ → pipeline �
     | `max_subscribers_per_session` | `32` | 1 セッションあたりの同時購読者数 |
     | `max_subscribers_per_ip` | `16` | 1 クライアント IP が全セッション合計で持てる購読者数（TCP 接続元で数え、`X-Forwarded-For` は無視） |
     | `max_sessions` | `16` | 同時に存在するセッション数（登録中の `Starting` / `Stopping` も含む） |
-    | `max_subscriber_buffer_bytes` | `268435456`（256 MiB） | 全購読者キューの合計バイト上限 |
+    | `max_subscriber_buffer_bytes` | `2147483648`（2 GiB） | 全購読者キューの合計バイト上限 |
   - `max_sessions: 1` 相当の「1 チューナー 1 セッション」は既存の不変条件（`(tuner, type, channel)` ごとに 1 プロセス木、1 チャンネル 1 セッション）で保証されているため、`max_sessions_per_tuner` という独立フィールドは設けない。
-  - 購読者 1 人は `chunk_size_bytes × subscriber_buffer_chunks`（既定 65536 × 1024 ≈ 64 MiB）を worst-case で予約する。`max_subscribers_per_session: 32` をそのまま許すと 1 セッションで 2 GiB になるため、`max_subscriber_buffer_bytes` で合計を抑える。既定 256 MiB では同時 4 購読者まで。
+  - 購読者 1 人は `chunk_size_bytes × subscriber_buffer_chunks`（既定 65536 × 1024 ≈ 64 MiB）を worst-case で予約する。既定 2 GiB は 32 購読者分にあたり、`max_subscribers_per_session: 32` と同じなので通常は per-session 上限の方が先に効く。この予算は「最悪ケースの予約」であり実使用量ではない（実際のキューはクライアントに配信中の分しか持たない）ため、2 GiB の予約は一般的なホストで許容できる。メモリが制約されたホストでは `max_subscriber_buffer_bytes` をさらに上げるか `subscriber_buffer_chunks` を下げる。
   - 上限は acquire 時にセッションレジストリのロック下で判定する（新規セッションは `reserve`、既存セッションへの参加は `attach`）。超過した要求は **429** `{"code":429,"reason":"Too Many Requests"}` を返し、既存の購読者はそのまま配信を続ける。参加の拒否は spawn 前に決まるため、拒否された要求がチューナーを起動することはない。
   - カウンタは別カウンタではなく購読者リストから導出する。購読解除（クライアントの切断 / EOF / idle / 奪取による停止）は購読者エントリを消す同じ経路で行われるため、二重減算も取りこぼしもない。
   - 予約中（`Starting`）のセッションは、まだ購読者がいなくても 1 人分として数える。これにより並行 acquire が同じ最後の 1 枠を同時に通過できない。
@@ -388,7 +388,7 @@ unituner/
 - スキャンの定期 re-scan の要否・間隔
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` 同時指定時の優先規則
 - per-IP/per-session cap の既定値
-  - 確定: `max_subscribers_per_session: 32` / `max_subscribers_per_ip: 16` / `max_sessions: 16` / `max_subscriber_buffer_bytes: 268435456`（256 MiB）。超過は 429。詳細は §7。
+  - 確定: `max_subscribers_per_session: 32` / `max_subscribers_per_ip: 16` / `max_sessions: 16` / `max_subscriber_buffer_bytes: 2147483648`（2 GiB）。超過は 429。2 GiB は 32 購読者分（64 MiB × 32）にあたるため、通常は per-session 上限の方が先に効く。詳細は §7。
 - `.bak` の世代管理方針
 - `PUT /api/config/channels/scan` の `skipCh` / `minSubCh` / `maxSubCh` のカンマ区切り入力の正規化
 

@@ -48,7 +48,7 @@ chunk_size_bytes: 65536
 max_subscribers_per_session: 32
 max_subscribers_per_ip: 16
 max_sessions: 16
-max_subscriber_buffer_bytes: 268435456
+max_subscriber_buffer_bytes: 2147483648
 ```
 
 | フィールド | 既定値 | 検証・挙動 |
@@ -62,7 +62,7 @@ max_subscriber_buffer_bytes: 268435456
 | `max_subscribers_per_session` | `32` | 1 以上。1 セッションに同時接続できる購読者数。超えた要求は 429 |
 | `max_subscribers_per_ip` | `16` | 1 以上。1 クライアント IP が全セッション合計で持てる購読者数。超えた要求は 429 |
 | `max_sessions` | `16` | 1 以上。同時に存在できるセッション数（登録中の `Starting` / `Stopping` も含む）。超えた要求は 429。チューナー数が 16 を超える構成ではこの値も上げる |
-| `max_subscriber_buffer_bytes` | `268435456`（256 MiB） | 1 以上。全購読者キューの合計上限バイト数。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約するため、既定では同時 4 購読者まで。32 × 64 MiB を防ぐための予算 |
+| `max_subscriber_buffer_bytes` | `2147483648`（2 GiB） | 1 以上。全購読者キューの合計上限バイト数。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約する。既定 2 GiB は 32 購読者分にあたり `max_subscribers_per_session: 32` と同じなので、通常は per-session 上限の方が先に効く。この予算は「最悪ケースの予約」であり実使用量ではない（実際のキューは配信中の分しか持たない）ため、2 GiB の予約は一般的なホストで許容できる。メモリが制約されたホストでは `max_subscriber_buffer_bytes` をさらに上げるか `subscriber_buffer_chunks` を下げる |
 
 `allowed_cidrs` はネットワーク制御であり認証ではない。API と web UI の両方に効く。
 
