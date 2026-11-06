@@ -21,6 +21,20 @@ const TSID: u16 = 0x7FE0;
 /// Long-form section with a CRC32, parameterised by table id, table id
 /// extension and version.
 fn section(table_id: u8, id: u16, version: u8, rest: &[u8]) -> Vec<u8> {
+    section_with(table_id, id, version, true, 0, 0, rest)
+}
+
+/// Long-form section with explicit `current_next_indicator`, `section_number`
+/// and `last_section_number`.
+fn section_with(
+    table_id: u8,
+    id: u16,
+    version: u8,
+    current_next: bool,
+    section_number: u8,
+    last_section_number: u8,
+    rest: &[u8],
+) -> Vec<u8> {
     let section_length = 5 + rest.len() + 4;
     let mut bytes = vec![
         table_id,
@@ -28,9 +42,9 @@ fn section(table_id: u8, id: u16, version: u8, rest: &[u8]) -> Vec<u8> {
         section_length as u8,
         (id >> 8) as u8,
         id as u8,
-        0xC1 | ((version & 0x1F) << 1),
-        0x00,
-        0x00,
+        0xC0 | ((version & 0x1F) << 1) | u8::from(current_next),
+        section_number,
+        last_section_number,
     ];
     bytes.extend_from_slice(rest);
     let crc = crc32_mpeg2(&bytes);
@@ -746,4 +760,195 @@ fn malformed_input_is_counted_not_forwarded() {
     let out = filter.push(&broken);
     assert!(out.is_empty());
     assert_eq!(filter.packets_dropped_malformed, 1);
+}
+
+// ---------------------------------------------------------------------------
+// current_next_indicator and PAT section/CC handling
+// ---------------------------------------------------------------------------
+
+/// Body of a PMT: PCR PID, empty program info, one ES per PID.
+fn pmt_body(pcr_pid: u16, es_pids: &[u16]) -> Vec<u8> {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+    rest.extend_from_slice(&[0xF0, 0x00]); // program_info_length 0
+    for &pid in es_pids {
+        rest.extend_from_slice(&[0x1B, (0xE0 | (pid >> 8)) as u8, pid as u8, 0xF0, 0x00]);
+    }
+    rest
+}
+
+/// PMT with explicit `current_next_indicator`.
+fn pmt_section_with(
+    program_number: u16,
+    version: u8,
+    current_next: bool,
+    pcr_pid: u16,
+    es_pids: &[u16],
+) -> Vec<u8> {
+    section_with(
+        0x02,
+        program_number,
+        version,
+        current_next,
+        0,
+        0,
+        &pmt_body(pcr_pid, es_pids),
+    )
+}
+
+#[test]
+fn a_next_version_pmt_does_not_swap_the_pid_set_early() {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&section_packets(PAT_PID, &three_program_pat(), 0));
+    // Current PMT: only TARGET_ES[0].
+    stream.extend_from_slice(&section_packets(
+        TARGET_PMT,
+        &pmt_section_with(TARGET, 0, true, TARGET_PCR, &[TARGET_ES[0]]),
+        0,
+    ));
+    // Next-version PMT (current_next = 0) that adds TARGET_ES[1].
+    stream.extend_from_slice(&section_packets(
+        TARGET_PMT,
+        &pmt_section_with(TARGET, 1, false, TARGET_PCR, &TARGET_ES),
+        1,
+    ));
+    stream.extend_from_slice(&es_packet(TARGET_ES[1], 0, 0x90));
+
+    let mut filter = ServiceFilter::new(TARGET);
+    let out = filter.push(&stream);
+    let out_pids = pids(&out);
+
+    assert!(
+        !out_pids.contains(&TARGET_ES[1]),
+        "the next-version PMT's ES PID must not be forwarded before it is current"
+    );
+    assert_eq!(filter.ignored_next_version_pmt_sections, 1);
+    // The current PMT (version 0) was applied exactly once.
+    assert_eq!(filter.pmt_updates, 1);
+    assert_eq!(filter.pmt_version(), Some(0));
+
+    // The current version of the same change applies it.
+    let later = filter.push(&section_packets(
+        TARGET_PMT,
+        &pmt_section_with(TARGET, 1, true, TARGET_PCR, &TARGET_ES),
+        2,
+    ));
+    assert!(pids(&later).contains(&TARGET_PMT));
+    let es = filter.push(&es_packet(TARGET_ES[1], 1, 0x91));
+    assert_eq!(pids(&es), vec![TARGET_ES[1]]);
+    assert_eq!(filter.pmt_updates, 2);
+}
+
+#[test]
+fn a_second_pat_section_in_one_packet_is_not_lost() {
+    // Section 1 announces another programme; section 2 carries the target.
+    // A filter that only looks at the first section would never learn the
+    // target's PMT PID.
+    let first = pat_section(&[(OTHER_A, OTHER_A_PMT)]);
+    let second = pat_section(&[(OTHER_B, OTHER_B_PMT), (TARGET, TARGET_PMT)]);
+
+    let mut payload = vec![0x00]; // pointer_field
+    payload.extend_from_slice(&first);
+    payload.extend_from_slice(&second);
+
+    let mut stream = packet(PAT_PID, true, 0, &payload);
+    stream.extend_from_slice(&section_packets(
+        TARGET_PMT,
+        &pmt_section_with(TARGET, 0, true, TARGET_PCR, &TARGET_ES),
+        0,
+    ));
+    stream.extend_from_slice(&es_packet(TARGET_ES[0], 0, 0xA0));
+
+    let mut filter = ServiceFilter::new(TARGET);
+    let out = filter.push(&stream);
+    let out_pids = pids(&out);
+
+    assert_eq!(filter.pmt_pid(), Some(TARGET_PMT));
+    assert_eq!(
+        filter.missing_service_sections, 1,
+        "section 1 has no target"
+    );
+    assert_eq!(filter.pat_rewrites, 1, "section 2 is rewritten");
+    assert_eq!(parse_pat_of(&out), vec![(TARGET, TARGET_PMT)]);
+    assert!(out_pids.contains(&TARGET_PMT));
+    assert!(out_pids.contains(&TARGET_ES[0]));
+}
+
+#[test]
+fn a_second_section_after_a_continuation_is_parsed() {
+    // A multi-packet PAT (45 programmes) whose continuation packet carries the
+    // tail of the big section *and* a whole second section with the target. A
+    // continuation packet has no pointer field: the second section starts right
+    // after the first ends. Dropping those leftover bytes loses the target.
+    let programs: Vec<(u16, u16)> = (0..45)
+        .map(|index| (0x0500 + index as u16, 0x0200 + index as u16))
+        .collect();
+    let big = pat_section(&programs);
+    let (head, tail) = big.split_at(TS_PACKET_SIZE - 5);
+    let (target, target_pmt) = (0x0999u16, 0x0300u16);
+    let second = pat_section(&[(target, target_pmt)]);
+
+    let mut first = vec![0x00];
+    first.extend_from_slice(head);
+    let mut stream = packet(PAT_PID, true, 0, &first);
+
+    let mut second_payload = tail.to_vec();
+    second_payload.extend_from_slice(&second);
+    stream.extend_from_slice(&packet(PAT_PID, false, 1, &second_payload));
+
+    let mut filter = ServiceFilter::new(target);
+    let out = filter.push(&stream);
+
+    assert_eq!(filter.pmt_pid(), Some(target_pmt));
+    assert_eq!(filter.pat_rewrites, 1, "the second section is rewritten");
+    assert_eq!(
+        filter.missing_service_sections, 1,
+        "the big section has no target"
+    );
+    assert_eq!(pids(&out).iter().filter(|&&pid| pid == PAT_PID).count(), 1);
+
+    // The rewritten PAT parses and names the target.
+    let packet = out
+        .chunks_exact(TS_PACKET_SIZE)
+        .find(|packet| (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]) == PAT_PID)
+        .expect("a PAT was forwarded");
+    // The template was a continuation packet (PUSI clear), but the rewritten
+    // packet starts its own section, so PUSI must be set.
+    assert_ne!(packet[1] & 0x40, 0, "rewritten PAT must set PUSI");
+    let start = 5 + usize::from(packet[4]);
+    let length =
+        3 + ((usize::from(packet[start + 1] & 0x0F) << 8) | usize::from(packet[start + 2]));
+    let programs = parse_pat(&packet[start..start + length])
+        .expect("pat")
+        .programs;
+    assert_eq!(programs, vec![(target, target_pmt)]);
+}
+
+#[test]
+fn rewritten_pats_use_a_consecutive_continuity_counter() {
+    // 45 programmes make the PAT span two packets. Each cycle collapses into
+    // one rewritten packet, whose CC must increment locally (0, 1, 2) instead
+    // of copying the source counters (0, 2, 4).
+    let programs: Vec<(u16, u16)> = (0..45)
+        .map(|index| (0x0500 + index as u16, 0x0200 + index as u16))
+        .collect();
+    let (target, target_pmt) = programs[22];
+    let pat = pat_section(&programs);
+
+    let mut stream = Vec::new();
+    for cycle in 0..3u8 {
+        stream.extend_from_slice(&section_packets(PAT_PID, &pat, cycle * 2));
+    }
+
+    let mut filter = ServiceFilter::new(target);
+    let out = filter.push(&stream);
+
+    let ccs: Vec<u8> = out
+        .chunks_exact(TS_PACKET_SIZE)
+        .filter(|packet| (u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2]) == PAT_PID)
+        .map(|packet| packet[3] & 0x0F)
+        .collect();
+    assert_eq!(ccs, vec![0, 1, 2], "rewritten PAT CCs must be consecutive");
+    assert_eq!(filter.pat_rewrites, 3);
+    assert_eq!(parse_pat_of(&out), vec![(target, target_pmt)]);
 }

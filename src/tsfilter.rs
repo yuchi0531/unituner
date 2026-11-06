@@ -27,8 +27,24 @@
 //! downstream SI to stay complete). The CRC32 (MPEG-2) is recomputed with
 //! [`crate::si::crc32_mpeg2`].
 //!
+//! The rewritten PAT is a *new logical section stream*: several source packets
+//! collapse into one output packet, so the source continuity counter cannot be
+//! copied (a receiver would report a continuity error, e.g. CC 0 then 2). The
+//! emitted CCs therefore come from a local counter for PID `0x0000`, starting
+//! at 0 and incrementing for every emitted packet.
+//!
 //! [`rewrite_pat_for_service`] is the pure helper behind this, usable and
 //! testable on a bare section.
+//!
+//! # Applicability
+//!
+//! Only tables with `current_next_indicator == 1` are applied: a next-version
+//! PMT must not swap the PCR/ES PIDs before the table is in force (video would
+//! stall during the switch), and a next-version PAT must not move the PMT PID
+//! early. Such sections are counted in
+//! [`ServiceFilter::ignored_next_version_pmt_sections`] and
+//! [`ServiceFilter::ignored_next_version_pat_sections`] and never change the
+//! forwarded PID set.
 //!
 //! # Decisions
 //!
@@ -231,10 +247,14 @@ struct PatState {
     template_offset: usize,
     /// Continuity counter of the last PAT packet with a payload.
     last_cc: Option<u8>,
+    /// Continuity counter of the last PAT packet this filter emitted. The
+    /// rewritten PAT is a new logical section stream, so its CCs increment
+    /// locally instead of copying the (possibly skipped) source counters.
+    out_cc: Option<u8>,
 }
 
 impl PatState {
-    /// Forgets the section in progress but keeps the continuity counter.
+    /// Forgets the section in progress but keeps the continuity counters.
     fn abandon(&mut self) {
         self.partial.clear();
         self.expected = None;
@@ -297,6 +317,12 @@ pub struct ServiceFilter {
     pub missing_service_sections: u64,
     /// PAT sections abandoned before they completed.
     pub dropped_pat_sections: u64,
+    /// PAT sections ignored because `current_next_indicator` was 0 (a
+    /// next-version table: it must not move the PMT PID before it is in force).
+    pub ignored_next_version_pat_sections: u64,
+    /// PMT sections ignored because `current_next_indicator` was 0. Applying
+    /// one early would swap the PCR/ES PID set before the version is in force.
+    pub ignored_next_version_pmt_sections: u64,
 }
 
 impl ServiceFilter {
@@ -323,6 +349,8 @@ impl ServiceFilter {
             pmt_updates: 0,
             missing_service_sections: 0,
             dropped_pat_sections: 0,
+            ignored_next_version_pat_sections: 0,
+            ignored_next_version_pmt_sections: 0,
         }
     }
 
@@ -334,6 +362,13 @@ impl ServiceFilter {
     /// The PMT PID currently associated with the service, if the PAT named it.
     pub fn pmt_pid(&self) -> Option<u16> {
         self.pmt_pid
+    }
+
+    /// `version_number` of the PMT currently applied, if one was applied.
+    ///
+    /// A next-version PMT (`current_next_indicator == 0`) never changes this.
+    pub fn pmt_version(&self) -> Option<u8> {
+        self.pmt_version
     }
 
     /// Feeds a run of 188-byte packets and returns the packets to forward.
@@ -440,8 +475,7 @@ impl ServiceFilter {
 
             // Bytes before the pointer finish the section still in progress.
             if self.pat.in_progress() && pointer > 0 {
-                self.pat.partial.extend_from_slice(&payload[1..start]);
-                self.finish_pat_section(out);
+                self.continue_pat_section(&payload[1..start], out);
             }
             if self.pat.in_progress() {
                 // A new section starts here, so this one is abandoned.
@@ -449,52 +483,60 @@ impl ServiceFilter {
                 self.dropped_pat_sections += 1;
             }
 
-            // A PAT may carry several sections; walk them in order.
-            let mut rest = &payload[start..];
-            while !rest.is_empty() && rest[0] != 0xFF {
-                if rest.len() < 3 {
-                    break;
-                }
-                let total = 3 + ((usize::from(rest[1] & 0x0F) << 8) | usize::from(rest[2]));
-                if !(12..=MAX_SECTION_LEN).contains(&total) {
-                    return;
-                }
-                if rest.len() >= total {
-                    self.emit_pat(&rest[..total], packet, offset, out);
-                    rest = &rest[total..];
-                } else {
-                    self.pat.expected = Some(total);
-                    self.pat.template = Some(packet.to_vec());
-                    self.pat.template_offset = offset;
-                    self.pat.partial.extend_from_slice(rest);
-                    return;
-                }
-            }
+            // A PAT may carry several sections, and each may span packets.
+            self.walk_pat_sections(&payload[start..], packet, offset, out);
         } else if self.pat.in_progress() {
-            self.pat.partial.extend_from_slice(payload);
-            self.finish_pat_section(out);
+            let used = self.continue_pat_section(payload, out);
+            if used < payload.len() {
+                // The section in progress completed inside this packet and a
+                // second section starts right after it: handle it as if the
+                // packet had begun with a pointer field pointing here.
+                self.walk_pat_sections(&payload[used..], packet, offset, out);
+            }
         }
     }
 
-    /// Emits the held PAT section if it has fully arrived.
-    fn finish_pat_section(&mut self, out: &mut Vec<u8>) {
-        let Some(expected) = self.pat.expected.or_else(|| {
-            (self.pat.partial.len() >= 3).then(|| {
-                3 + ((usize::from(self.pat.partial[1] & 0x0F) << 8)
-                    | usize::from(self.pat.partial[2]))
-            })
-        }) else {
-            return;
-        };
-        if !(12..=MAX_SECTION_LEN).contains(&expected) {
-            self.pat.abandon();
-            self.dropped_pat_sections += 1;
-            return;
+    /// Feeds `bytes` to the PAT section in progress and emits it if it has now
+    /// fully arrived.
+    ///
+    /// Returns the number of bytes consumed: fewer than `bytes.len()` only when
+    /// the section completed and the rest of `bytes` belongs to a following
+    /// section (a continuation packet may carry several sections).
+    fn continue_pat_section(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
+        let mut used = 0;
+        if self.pat.expected.is_none() {
+            // The section header itself was split across packets.
+            let take = (3 - self.pat.partial.len()).min(bytes.len());
+            self.pat.partial.extend_from_slice(&bytes[..take]);
+            used += take;
+            if self.pat.partial.len() < 3 {
+                return used;
+            }
+            let total = 3
+                + ((usize::from(self.pat.partial[1] & 0x0F) << 8)
+                    | usize::from(self.pat.partial[2]));
+            if !(12..=MAX_SECTION_LEN).contains(&total) {
+                // A corrupt section length: drop it and do not try to read the
+                // rest of the packet as another section (its boundaries are
+                // unknown now).
+                self.pat.abandon();
+                self.dropped_pat_sections += 1;
+                return bytes.len();
+            }
+            self.pat.expected = Some(total);
         }
+
+        let expected = self.pat.expected.unwrap_or(0);
+        let need = expected.saturating_sub(self.pat.partial.len());
+        let take = need.min(bytes.len() - used);
+        self.pat
+            .partial
+            .extend_from_slice(&bytes[used..used + take]);
+        used += take;
         if self.pat.partial.len() < expected {
-            self.pat.expected = Some(expected);
-            return;
+            return used;
         }
+
         let section = self.pat.partial[..expected].to_vec();
         let template = self.pat.template.take();
         let template_offset = self.pat.template_offset;
@@ -502,13 +544,60 @@ impl ServiceFilter {
         if let Some(template) = template {
             self.emit_pat(&section, &template, template_offset, out);
         }
+        used
+    }
+
+    /// Walks a run of complete or partial PAT sections, emitting the complete
+    /// ones and buffering the last, incomplete one.
+    fn walk_pat_sections(
+        &mut self,
+        rest: &[u8],
+        packet: &[u8],
+        payload_offset: usize,
+        out: &mut Vec<u8>,
+    ) {
+        let mut rest = rest;
+        while !rest.is_empty() && rest[0] != 0xFF {
+            if rest.len() < 3 {
+                // The header is split across packets: buffer what there is and
+                // let the continuation path compute the length.
+                self.pat.template = Some(packet.to_vec());
+                self.pat.template_offset = payload_offset;
+                self.pat.partial.extend_from_slice(rest);
+                return;
+            }
+            let total = 3 + ((usize::from(rest[1] & 0x0F) << 8) | usize::from(rest[2]));
+            if !(12..=MAX_SECTION_LEN).contains(&total) {
+                return;
+            }
+            if rest.len() >= total {
+                self.emit_pat(&rest[..total], packet, payload_offset, out);
+                rest = &rest[total..];
+            } else {
+                self.pat.expected = Some(total);
+                self.pat.template = Some(packet.to_vec());
+                self.pat.template_offset = payload_offset;
+                self.pat.partial.extend_from_slice(rest);
+                return;
+            }
+        }
     }
 
     /// Rewrites `section` and emits it in place of `template`.
     ///
-    /// The packet's header (including `payload_unit_start_indicator` and the
-    /// continuity counter) is preserved; the payload is replaced by a zero
-    /// pointer field, the rewritten section, and `0xFF` stuffing.
+    /// The packet's header is preserved except for `payload_unit_start_indicator`
+    /// and the continuity counter, which come from a local sequence for PID
+    /// `0x0000`: the rewritten PAT is a new logical section stream, so its first
+    /// packet is CC 0 and every following one increments by one. Copying the
+    /// source counters would emit jumps (0, 2, 4, …) whenever a multi-packet PAT
+    /// collapses into one packet, which strict demuxers report as continuity
+    /// errors. PUSI is set because every emitted packet starts a section, even
+    /// when the template was a continuation packet. The payload is replaced by a
+    /// zero pointer field, the rewritten section, and `0xFF` stuffing.
+    ///
+    /// A section with `current_next_indicator == 0` is a next-version table: it
+    /// is counted and not emitted, so a version switch cannot move the service
+    /// to another PMT PID before the new PAT is in force.
     fn emit_pat(
         &mut self,
         section: &[u8],
@@ -516,6 +605,10 @@ impl ServiceFilter {
         payload_offset: usize,
         out: &mut Vec<u8>,
     ) {
+        if section.get(5).is_some_and(|byte| byte & 0x01 == 0) {
+            self.ignored_next_version_pat_sections += 1;
+            return;
+        }
         let Some(rewritten) = rewrite_pat_for_service(section, self.service_id) else {
             self.missing_service_sections += 1;
             return;
@@ -528,6 +621,15 @@ impl ServiceFilter {
             return;
         }
         let mut packet = template.to_vec();
+        let cc = match self.pat.out_cc {
+            Some(cc) => cc.wrapping_add(1) & 0x0F,
+            None => 0,
+        };
+        self.pat.out_cc = Some(cc);
+        packet[3] = (packet[3] & 0xF0) | cc;
+        // Every emitted packet begins a section, even when the template was a
+        // continuation packet of the original (PUSI clear).
+        packet[1] |= 0x40;
         packet[payload_offset] = 0x00;
         packet[payload_offset + 1..payload_offset + 1 + rewritten.len()]
             .copy_from_slice(&rewritten);
@@ -555,7 +657,8 @@ impl ServiceFilter {
         self.pmt_seen = false;
     }
 
-    /// Applies a complete PMT section when it describes the target programme.
+    /// Applies a complete PMT section when it describes the target programme
+    /// and is the version currently in force.
     fn apply_pmt_section(&mut self, section: &[u8]) {
         let Ok(pmt) = parse_pmt(section) else {
             return;
@@ -563,8 +666,14 @@ impl ServiceFilter {
         if pmt.program_number != self.service_id {
             return;
         }
+        if !pmt.current_next {
+            // A next-version PMT: applying it now would swap the PCR/ES PIDs
+            // before the version is in force and stall the video.
+            self.ignored_next_version_pmt_sections += 1;
+            return;
+        }
 
-        let version = section.get(5).map(|byte| (byte >> 1) & 0x1F);
+        let version = Some(pmt.version_number);
         let mut streams: Vec<u16> = pmt
             .streams
             .iter()
