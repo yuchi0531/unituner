@@ -244,6 +244,12 @@ async fn embedded_assets_have_their_content_types() {
     assert!(script.contains("/webui/api/status"), "{script}");
     assert!(script.contains("/webui/api/restart"));
     assert!(script.contains("/webui/api/' + name"), "{script}");
+    // Per-type channel sub-tabs: the bar is rebuilt from the in-memory model
+    // and the table body is filtered by the selected type.
+    assert!(script.contains("renderChannelTypeTabs"), "{script}");
+    assert!(script.contains("channel-subtabs"), "{script}");
+    assert!(script.contains("channelType"), "{script}");
+    assert!(script.contains("aria-selected"), "{script}");
 
     let (status, headers, body) = get(&state, "/assets/style.css").await;
     assert_eq!(status, StatusCode::OK);
@@ -251,7 +257,25 @@ async fn embedded_assets_have_their_content_types() {
         headers.get("content-type").and_then(|v| v.to_str().ok()),
         Some("text/css; charset=utf-8")
     );
-    assert!(text(&body).contains("@media"), "responsive CSS present");
+    let css = text(&body);
+    assert!(css.contains("@media"), "responsive CSS present");
+    assert!(
+        css.contains(".subtabs"),
+        "the sub-tab bar reuses the tab styling"
+    );
+}
+
+#[tokio::test]
+async fn the_index_has_a_channel_subtab_container() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let (status, _, body) = get(&state, "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let html = text(&body);
+    // Rendered by app.js from the model, never hardcoded in the document.
+    assert!(html.contains("id=\"channel-subtabs\""), "{html}");
+    assert!(html.contains("role=\"tablist\""), "{html}");
 }
 
 #[tokio::test]

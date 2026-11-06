@@ -288,26 +288,72 @@ async function loadChannels() {
   renderChannels();
 }
 
-function renderChannels() {
-  const rows = models.channels.map((channel, index) => {
-    const remove = el('button', { class: 'icon danger', text: '×', title: 'Delete' });
-    remove.addEventListener('click', () => {
-      models.channels.splice(index, 1);
+/** The selected channel type sub-tab, or null for "All". */
+let channelType = null;
+
+/** Channel types in first-appearance order, ignoring blank rows. */
+function channelTypes() {
+  const types = [];
+  for (const channel of models.channels) {
+    if (channel.type && !types.includes(channel.type)) types.push(channel.type);
+  }
+  return types;
+}
+
+/** Rebuilds the sub-tab bar from the current model. */
+function renderChannelTypeTabs() {
+  const types = channelTypes();
+  // Keep the selection while the type still exists, otherwise fall back to All.
+  if (channelType !== null && !types.includes(channelType)) channelType = null;
+
+  const tabCount = (type) => (type === null
+    ? models.channels.length
+    : models.channels.filter((channel) => channel.type === type).length);
+  const tab = (type) => {
+    const button = el('button', {
+      role: 'tab',
+      'aria-selected': String(channelType === type),
+      text: (type === null ? 'All' : type) + ' (' + tabCount(type) + ')',
+    });
+    button.classList.toggle('active', channelType === type);
+    button.addEventListener('click', () => {
+      channelType = type;
       renderChannels();
     });
-    return el('tr', {}, [
-      el('td', {}, [textInput(channel.name, (value) => (channel.name = value), 'ＮＨＫ総合')]),
-      el('td', {}, [textInput(channel.type, (value) => (channel.type = value), 'GR')]),
-      el('td', {}, [textInput(channel.channel, (value) => (channel.channel = value), '27')]),
-      el('td', {}, [checkbox(channel.disabled, (value) => (channel.disabled = value))]),
-      el('td', { class: 'row-actions' }, [remove]),
-    ]);
-  });
+    return button;
+  };
+  $('#channel-subtabs').replaceChildren(tab(null), ...types.map(tab));
+}
+
+/** Rebuilds the sub-tab bar and the table body filtered to the selected type. */
+function renderChannels() {
+  renderChannelTypeTabs();
+  const rows = models.channels
+    .map((channel, index) => ({ channel, index }))
+    .filter(({ channel }) => channelType === null || channel.type === channelType)
+    .map(({ channel, index }) => {
+      const remove = el('button', { class: 'icon danger', text: '×', title: 'Delete' });
+      remove.addEventListener('click', () => {
+        models.channels.splice(index, 1);
+        renderChannels();
+      });
+      // `change` (not `input`): a re-render per keystroke would steal focus
+      // from the row. On commit the bar and the filter follow the new type.
+      const type = textInput(channel.type, (value) => (channel.type = value), 'GR');
+      type.addEventListener('change', renderChannels);
+      return el('tr', { 'data-index': index }, [
+        el('td', {}, [textInput(channel.name, (value) => (channel.name = value), 'ＮＨＫ総合')]),
+        el('td', {}, [type]),
+        el('td', {}, [textInput(channel.channel, (value) => (channel.channel = value), '27')]),
+        el('td', {}, [checkbox(channel.disabled, (value) => (channel.disabled = value))]),
+        el('td', { class: 'row-actions' }, [remove]),
+      ]);
+    });
   $('#channels-table tbody').replaceChildren(...rows);
 }
 
 function addChannel() {
-  models.channels.push({ name: '', type: '', channel: '', disabled: false });
+  models.channels.push({ name: '', type: channelType ?? '', channel: '', disabled: false });
   renderChannels();
 }
 
