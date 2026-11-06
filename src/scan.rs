@@ -17,6 +17,34 @@
 //! materialising a multi-billion-entry vector. A request above the cap is a 400
 //! from [`ScanQuery::from_params`].
 //!
+//! # Per-type defaults
+//!
+//! The mirakurun defaults only apply to the literal built-in type names:
+//!
+//! | type | `minCh` / `maxCh` | `scanMode` | `setDisabledOnAdd` | name format |
+//! |------|-------------------|------------|--------------------|-------------|
+//! | `GR` | 13 / 62 | `Channel` | `false` | `{ch}` |
+//! | `BS` | 1 / 24 | `Service` | `true` | `BS{ch00}_{subch}` |
+//! | `CS` | 1 / 24 | `Service` | `true` | `CS{ch00}` |
+//!
+//! Any other type name (`BS4K`, `CABLE_CATV`, ...) is user-defined: it has no
+//! conventional channel numbering, so guessing a range would tune channels the
+//! caller never asked for. Such a scan must pass **both** `minCh` and `maxCh`
+//! (otherwise [`ScanQuery::from_params`] returns the 400 message) and gets the
+//! conservative defaults `scanMode=Channel`, `setDisabledOnAdd=false` and
+//! `channelNameFormat="{ch}"` (the bare number). The configuration schema is
+//! unchanged: no per-type table is added to `channels.yml`.
+//!
+//! # Subchannels
+//!
+//! `useSubCh=true` (or the `BS` type) expands every channel number into the
+//! requested subchannels. `minSubCh` / `maxSubCh` are comma-separated lists of
+//! ranges: the pair at index `i` means `min[i]..=max[i]`, a shorter list pads
+//! with its last value, and the union is tuned in ascending order. The cross
+//! product is walked channel outer, subchannel inner, and each progress line
+//! names the subchannel it is tuning. Values are ARIB BS subchannels, so
+//! `0..=3`; anything else is a 400.
+//!
 //! A channel that produces no signal, times out, or whose tuner is busy is
 //! skipped and the scan continues (SPEC §8.1). Each per-channel session is
 //! released before the next channel is tuned.
@@ -39,12 +67,13 @@
 //!
 //! A scan stops when its progress receiver goes away (the HTTP client
 //! disconnected) and when the server-wide shutdown watch fires: both are
-//! observed between channels and while waiting for SI, and neither writes
-//! `channels.yml`. The acquire itself may also be cut off by the per-channel
-//! budget: the session layer is cancellation-safe, so a cut-off acquire stops
-//! its own process tree rather than leaking the tuner. [`scan_channel`] then
-//! waits for that teardown before the next channel, so one abandoned channel
-//! cannot report the next one as "busy".
+//! observed between channels, while waiting for the tuner to become ready, and
+//! while waiting for SI, and neither writes `channels.yml` nor touches the
+//! service table. The acquire itself may also be cut off by the per-channel
+//! budget: the session layer is cancellation-safe, so a cut-off acquire (by the
+//! budget *or* by a shutdown) stops its own process tree rather than leaking the
+//! tuner. [`scan_channel`] then waits for that teardown before the next channel,
+//! so one abandoned channel cannot report the next one as "busy".
 //!
 //! # Startup scan
 //!
@@ -74,7 +103,12 @@
 //! an unchanged configuration look edited.
 //!
 //! `dryRun=true` skips both the write and the service-table update: it only
-//! prints what a real scan would do.
+//! prints what a real scan would do. A non-dry-run scan commits in two steps:
+//! the atomic `channels.yml` write first, then the shared [`ServiceTable`]
+//! update (upsert, `retain_channel` for the entries that produced services, and
+//! one final `prune_unbound`). A cancelled scan (a disconnected client or a
+//! shutdown) therefore leaves both the file and the table untouched, and a scan
+//! that finds nothing new still updates the table without rewriting the file.
 //!
 //! A completed scan prints `**RESTART REQUIRED** to apply changes.`: the
 //! running server keeps its in-memory configuration (SPEC §8.1 / §10).
@@ -123,6 +157,13 @@ const _: () = assert!(CHANNEL_TIMEOUT.as_secs() > crate::session::READINESS_TIME
 /// state per candidate.
 pub const MAX_SCAN_CHANNELS: usize = 512;
 
+/// Highest ARIB BS subchannel number (SPEC §8.1 `minSubCh` / `maxSubCh`).
+///
+/// A BS multiplex is split into subchannels `0..=3`; anything above that is not
+/// a subchannel but a typo (or a non-BS input), so the scan rejects it instead
+/// of tuning a channel that cannot exist.
+pub const MAX_SUBCHANNEL: u32 = 3;
+
 /// First retry delay for a startup-scan channel whose tuner was busy
 /// (SPEC §8: "相手がbusyならskip＋次回retry").
 pub const STARTUP_RETRY_INITIAL: Duration = Duration::from_secs(30);
@@ -159,8 +200,9 @@ pub struct ScanQuery {
     /// `channelNameFormat`; `None` means the per-type default.
     pub channel_name_format: Option<String>,
     pub use_sub_channel: bool,
-    pub min_sub_channels: Vec<u32>,
-    pub max_sub_channels: Vec<u32>,
+    /// The subchannel numbers to tune for every channel number, in the order
+    /// they were requested. One entry (`0`) unless `useSubCh`/`BS` expands.
+    pub sub_channels: Vec<u32>,
     pub timeout: Duration,
 }
 
@@ -178,8 +220,23 @@ impl ScanQuery {
         crate::config::validate_type_name(&type_name)?;
 
         let satellite = matches!(type_name.as_str(), "BS" | "CS");
-        let min_channel = parse_u32(params, "minCh")?.unwrap_or(if satellite { 1 } else { 13 });
-        let max_channel = parse_u32(params, "maxCh")?.unwrap_or(if satellite { 24 } else { 62 });
+        let builtin = satellite || type_name == "GR";
+        // The BS/CS/GR defaults are only meaningful for those literal type
+        // names: a user-defined type (`BS4K`, `CABLE_CATV`, ...) has no
+        // conventional channel numbering, so guessing a range would tune
+        // unrelated channels. Requiring both bounds keeps the config schema
+        // stable (SPEC §8.1 accepts any type string) without inventing a
+        // per-type default table.
+        let min_channel = parse_u32(params, "minCh")?;
+        let max_channel = parse_u32(params, "maxCh")?;
+        if !builtin && (min_channel.is_none() || max_channel.is_none()) {
+            return Err(format!(
+                "type {type_name:?} is not a built-in type (GR/BS/CS): \
+                 minCh and maxCh are required"
+            ));
+        }
+        let min_channel = min_channel.unwrap_or(if satellite { 1 } else { 13 });
+        let max_channel = max_channel.unwrap_or(if satellite { 24 } else { 62 });
         if min_channel > max_channel {
             return Err(format!(
                 "minCh ({min_channel}) must not be greater than maxCh ({max_channel})"
@@ -189,11 +246,13 @@ impl ScanQuery {
         let refresh = parse_bool(params, "refresh")?.unwrap_or(false);
         let dry_run = parse_bool(params, "dryRun")?.unwrap_or(false);
         let mode = match params.get("scanMode").map(|value| value.trim()) {
+            // mirakurun's defaults: BS/CS scan per service, everything else
+            // (GR and user-defined types) per channel.
             None | Some("") => {
-                if type_name == "GR" || !satellite {
-                    ScanMode::Channel
-                } else {
+                if satellite {
                     ScanMode::Service
+                } else {
+                    ScanMode::Channel
                 }
             }
             Some(value) if value.eq_ignore_ascii_case("Channel") => ScanMode::Channel,
@@ -220,6 +279,14 @@ impl ScanQuery {
         }
         let min_sub_channels = parse_list(params.get("minSubCh"))?;
         let max_sub_channels = parse_list(params.get("maxSubCh"))?;
+        // mirakurun ignores the subchannel parameters for a type that is not
+        // expanded; validating them anyway would reject a request whose result
+        // does not depend on them.
+        let sub_channels = if use_sub_channel || type_name == "BS" {
+            sub_channels_from(&min_sub_channels, &max_sub_channels)?
+        } else {
+            vec![0]
+        };
 
         let query = Self {
             type_name,
@@ -232,8 +299,7 @@ impl ScanQuery {
             set_disabled_on_add,
             channel_name_format,
             use_sub_channel,
-            min_sub_channels,
-            max_sub_channels,
+            sub_channels,
             timeout: CHANNEL_TIMEOUT,
         };
         // A remote request must not build an unbounded candidate list.
@@ -244,6 +310,14 @@ impl ScanQuery {
             ));
         }
         Ok(query)
+    }
+
+    /// Whether the scan tunes one candidate per subchannel.
+    ///
+    /// Only `BS` expands by default (SPEC §8.1); any other type expands only
+    /// with `useSubCh=true`, exactly like mirakurun.
+    fn expands_subchannels(&self) -> bool {
+        self.use_sub_channel || self.type_name == "BS"
     }
 
     /// How many candidates [`candidates`] yields, without building them.
@@ -258,10 +332,8 @@ impl ScanQuery {
 
     /// Number of subchannels expanded per channel number.
     fn subchannel_count(&self) -> u64 {
-        if self.use_sub_channel || self.type_name == "BS" {
-            let min = self.min_sub_channels.first().copied().unwrap_or(0).min(1);
-            let max = self.max_sub_channels.last().copied().unwrap_or(0).max(min);
-            u64::from(max - min) + 1
+        if self.expands_subchannels() {
+            self.sub_channels.len() as u64
         } else {
             1
         }
@@ -284,6 +356,58 @@ impl ScanQuery {
             },
         }
     }
+}
+
+/// Expands the `minSubCh` / `maxSubCh` lists into the subchannels to tune.
+///
+/// Both parameters are comma separated (SPEC §8.1). The pair at index `i`
+/// describes the range `min[i]..=max[i]`; a list shorter than the other pads
+/// with its last value, and a missing bound falls back to `0` (min) or to the
+/// paired minimum (max). The subchannels to tune are the union of those ranges
+/// in ascending order, so `minSubCh=0&maxSubCh=1` tunes `0, 1` and
+/// `minSubCh=0,2&maxSubCh=1,3` tunes `0, 1, 2, 3`.
+///
+/// Every value must be an ARIB BS subchannel ([`MAX_SUBCHANNEL`]): anything
+/// above is a typo or a non-BS input, not a channel that can exist. Both lists
+/// are capped at the number of subchannels for the same reason.
+fn sub_channels_from(min: &[u32], max: &[u32]) -> Result<Vec<u32>, String> {
+    for (name, values) in [("minSubCh", min), ("maxSubCh", max)] {
+        if values.len() > MAX_SUBCHANNEL as usize + 1 {
+            return Err(format!(
+                "{name} lists {} subchannels; at most {} exist",
+                values.len(),
+                MAX_SUBCHANNEL + 1
+            ));
+        }
+        if let Some(&value) = values.iter().find(|&&value| value > MAX_SUBCHANNEL) {
+            return Err(format!(
+                "invalid {name} {value}: a BS subchannel is 0..={MAX_SUBCHANNEL}"
+            ));
+        }
+    }
+
+    let pairs = min.len().max(max.len());
+    let mut sub_channels: Vec<u32> = Vec::new();
+    for index in 0..pairs {
+        let low = min.get(index).or_else(|| min.last()).copied().unwrap_or(0);
+        let high = max
+            .get(index)
+            .or_else(|| max.last())
+            .copied()
+            .unwrap_or(low);
+        if low > high {
+            return Err(format!(
+                "minSubCh ({low}) must not be greater than maxSubCh ({high})"
+            ));
+        }
+        sub_channels.extend(low..=high);
+    }
+    sub_channels.sort_unstable();
+    sub_channels.dedup();
+    if sub_channels.is_empty() {
+        sub_channels.push(0);
+    }
+    Ok(sub_channels)
 }
 
 fn parse_u32(
@@ -619,6 +743,11 @@ pub async fn run_scan(
 
     let total = query.candidate_count().max(1);
     let mut found_entries: Vec<ChannelEntry> = Vec::new();
+    // Table updates collected during the scan and published only once the file
+    // write has succeeded (or was known to be unnecessary). A scan cancelled by
+    // a disconnect or a shutdown therefore leaves the table untouched, so the
+    // API and `channels.yml` never disagree.
+    let mut table_updates: Vec<TableUpdate> = Vec::new();
     // Channels the scan actually produced results for. `refresh=true` may only
     // replace an existing entry for one of these: a no-signal or busy channel
     // must never delete a working configuration entry (SPEC §8.1).
@@ -637,10 +766,20 @@ pub async fn run_scan(
             return Ok(());
         }
         let percent = (index as u64 + 1) * 100 / total;
+        // The channel string alone hides which subchannel is being tuned when
+        // `channelNameFormat` does not contain `{subch}`, so name both whenever
+        // the scan expands subchannels.
+        let label = if query.expands_subchannels() {
+            format!(
+                "{:?} (ch {}, subch {})",
+                candidate.channel, candidate.number, candidate.sub
+            )
+        } else {
+            format!("{:?}", candidate.channel)
+        };
         lines
             .push(format!(
-                "channel: {:?} ({}/{}) [{}%] ... ",
-                candidate.channel,
+                "channel: {label} ({}/{}) [{}%] ... ",
                 index + 1,
                 total,
                 percent
@@ -711,29 +850,44 @@ pub async fn run_scan(
                 if query.mode == ScanMode::Service {
                     families.insert(family_of(&candidate.channel).to_string());
                 }
+                // A disabled entry is a real channel and is scanned, but its
+                // config entry stays disabled (SPEC §8.1). Say so instead of
+                // implying the file changed.
+                let kept_disabled = entries.iter().any(|entry| {
+                    existing.iter().any(|seeded| {
+                        seeded.channel_type == entry.channel_type
+                            && seeded.channel == entry.channel
+                            && seeded.disabled
+                    })
+                });
+                let note = if kept_disabled {
+                    " (disabled: kept disabled)"
+                } else {
+                    ""
+                };
                 lines
                     .push(format!(
-                        "Found {} channels for {}\n",
+                        "Found {} channels for {}{note}\n",
                         entries.len(),
                         candidate.channel
                     ))
                     .await;
-                if !query.dry_run {
-                    update_service_table(
-                        manager.services(),
-                        &query.type_name,
-                        query.mode,
-                        &entries,
-                        &services,
-                    );
+                if query.dry_run {
+                    found_entries.extend(entries);
+                } else {
+                    table_updates.push(TableUpdate {
+                        type_name: query.type_name.clone(),
+                        mode: query.mode,
+                        entries,
+                        services,
+                    });
                 }
-                found_entries.extend(entries);
             }
         }
     }
 
     // The client may have gone away while the last channel was read.
-    if lines.is_closed() {
+    if lines.is_closed() || cancelled(&shutdown) {
         tracing::info!("channel scan cancelled before saving");
         return Ok(());
     }
@@ -747,6 +901,10 @@ pub async fn run_scan(
             ))
             .await;
     } else {
+        let found_entries: Vec<ChannelEntry> = table_updates
+            .iter()
+            .flat_map(|update| update.entries.iter().cloned())
+            .collect();
         let (entries, written) = write_channels(
             config,
             config_dir,
@@ -755,6 +913,13 @@ pub async fn run_scan(
             &families,
             found_entries,
         )?;
+        // The file is now consistent (written, or already identical), so the
+        // in-memory table may follow. Doing this after the write is what keeps
+        // the API from showing services a cancelled scan never saved.
+        for update in &table_updates {
+            update_service_table(manager.services(), update);
+        }
+        manager.services().prune_unbound();
         if written {
             lines
                 .push(format!(
@@ -784,9 +949,7 @@ pub async fn run_scan(
 
 /// Whether a shutdown watch has fired (or its sender was dropped).
 fn cancelled(shutdown: &Option<watch::Receiver<bool>>) -> bool {
-    shutdown
-        .as_ref()
-        .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+    shutdown.as_ref().is_some_and(stopped)
 }
 
 /// Sends progress lines; a hung-up receiver stops the scan instead of wedging
@@ -827,19 +990,19 @@ struct Candidate {
 /// Enumerates the channels to tune lazily, expanding BS subchannels
 /// (SPEC §8.1).
 ///
-/// `ScanQuery::from_params` already rejected a range above
-/// [`MAX_SCAN_CHANNELS`], so this iterator is bounded; it is still lazy so the
-/// first progress line is emitted before any list is built.
+/// The expansion is the cross product of the channel range and the requested
+/// subchannels, in that order: channel outer, subchannel inner. `ScanQuery::
+/// from_params` already rejected a range above [`MAX_SCAN_CHANNELS`], so this
+/// iterator is bounded; it is still lazy so the first progress line is emitted
+/// before any list is built.
 fn candidates(query: &ScanQuery) -> impl Iterator<Item = Candidate> + '_ {
-    let (sub_min, sub_max) = if query.use_sub_channel || query.type_name == "BS" {
-        let min = query.min_sub_channels.first().copied().unwrap_or(0).min(1);
-        let max = query.max_sub_channels.last().copied().unwrap_or(0).max(min);
-        (min, max)
+    let sub_channels: &[u32] = if query.expands_subchannels() {
+        &query.sub_channels
     } else {
-        (0, 0)
+        &[0]
     };
     (query.min_channel..=query.max_channel).flat_map(move |number| {
-        (sub_min..=sub_max).map(move |sub| Candidate {
+        sub_channels.iter().copied().map(move |sub| Candidate {
             number,
             sub,
             channel: query.channel_name(number, sub),
@@ -898,6 +1061,23 @@ async fn scan_channel_cancellable(
 /// Whether the shutdown watch has fired (or its sender was dropped).
 fn stopped(shutdown: &watch::Receiver<bool>) -> bool {
     *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
+/// Resolves as soon as the shutdown watch is set to `true` (or its sender is
+/// dropped).
+///
+/// Used inside a `select!` instead of a bare `changed()` so an already-fired
+/// watch is noticed too: `changed()` only resolves on a *new* value, and a scan
+/// that starts just after the server began shutting down must not keep tuning.
+async fn shutdown_fired(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if stopped(shutdown) {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Tunes one channel, collects SI for at most `timeout`, and releases the scan
@@ -979,11 +1159,25 @@ async fn scan_channel_watched(
     let deadline = started + timeout;
     let acquire_budget = crate::session::READINESS_TIMEOUT + Duration::from_secs(5);
     let acquire_deadline = deadline.min(started + acquire_budget);
-    let acquired = tokio::time::timeout_at(
+    let acquire = tokio::time::timeout_at(
         acquire_deadline,
         manager.acquire_scan(type_name, channel, user, SessionTap::Raw, false),
-    )
-    .await;
+    );
+    // Shutdown must be honoured within about a second even while the acquire is
+    // still waiting for readiness (which can take up to `acquire_budget`). The
+    // session layer is cancellation-safe, so dropping the acquire stops the
+    // reservation it already took instead of leaking the tuner.
+    let acquired = match shutdown.as_deref_mut() {
+        Some(rx) => tokio::select! {
+            acquired = acquire => Some(acquired),
+            _ = shutdown_fired(rx) => None,
+        },
+        None => Some(acquire.await),
+    };
+    let Some(acquired) = acquired else {
+        tracing::debug!(channel, "scan acquire cancelled by shutdown");
+        return (ChannelOutcome::NoSignal, true);
+    };
 
     let mut subscription = match acquired {
         Err(_) => {
@@ -1029,7 +1223,7 @@ async fn scan_channel_watched(
             Some(rx) => {
                 let watched = tokio::select! {
                     chunk = tokio::time::timeout_at(deadline, subscription.rx.recv()) => Some(chunk),
-                    _ = rx.changed() => None,
+                    _ = shutdown_fired(rx) => None,
                 };
                 match watched {
                     Some(chunk) => chunk,
@@ -1159,11 +1353,10 @@ fn entries_for(
                     }
                 };
                 ChannelEntry {
-                    name: if service.name.is_empty() {
-                        channel.clone()
-                    } else {
-                        service.name.clone()
-                    },
+                    // An empty SDT name is kept empty here: `merge` falls back
+                    // to the channel-derived name only in that case, so a real
+                    // service name is never discarded.
+                    name: service.name.clone(),
                     channel_type: query.type_name.clone(),
                     disabled: disabled_of(&channel),
                     channel,
@@ -1180,8 +1373,9 @@ fn entries_for(
 ///   produced by the scan are dropped and replaced, and so are entries of the
 ///   scanned multiplex whose service disappeared (`families`);
 /// * without `refresh`, an existing `(type, channel)` always wins;
-/// * names stay unique (the startup validation requires it), so a colliding
-///   name gets the channel appended.
+/// * names stay unique (the startup validation requires it). A collision keeps
+///   the original service name and appends ` (2)`, ` (3)`, ...; only an empty
+///   service name falls back to the channel-derived name.
 fn merge(
     existing: &[ChannelEntry],
     query: &ScanQuery,
@@ -1210,13 +1404,21 @@ fn merge(
         if occupied {
             continue;
         }
+        if entry.name.is_empty() {
+            entry.name = entry.channel.clone();
+        }
         if !names.insert(entry.name.clone()) {
-            entry.name = format!("{} ({})", entry.name, entry.channel);
-            // Two services can share a name on the same multiplex; keep the
-            // generated name unique by falling back to the channel + sid.
-            let mut suffix = 1;
-            while !names.insert(entry.name.clone()) {
-                entry.name = format!("{} ({}-{suffix})", entry.channel, suffix);
+            // Two services can share a name (a relay, or a duplicated SDT).
+            // The service name is real information, so keep it and only add a
+            // suffix instead of replacing it with the channel.
+            let base = entry.name.clone();
+            let mut suffix = 2;
+            loop {
+                let candidate = format!("{base} ({suffix})");
+                if names.insert(candidate.clone()) {
+                    entry.name = candidate;
+                    break;
+                }
                 suffix += 1;
             }
         }
@@ -1249,15 +1451,32 @@ fn in_family(family: &str, channel: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('_'))
 }
 
-/// Writes the found services into the shared table (SPEC §13: a scan is
-/// reflected by `/api/services`).
-fn update_service_table(
-    services: &ServiceTable,
-    type_name: &str,
+/// The services and entries one scanned channel contributed, published to the
+/// shared [`ServiceTable`] only after the `channels.yml` write succeeded.
+#[derive(Debug)]
+struct TableUpdate {
+    type_name: String,
     mode: ScanMode,
-    entries: &[ChannelEntry],
-    found: &[FoundService],
-) {
+    entries: Vec<ChannelEntry>,
+    services: Vec<FoundService>,
+}
+
+/// Writes the found services into the shared table (SPEC §13: a scan is
+/// reflected by `/api/services`), then drops the services the channel no longer
+/// carries.
+///
+/// `retain_channel` runs after the upsert loop, so there is no window in which
+/// a service that is still on air answers 404: the fresh records are already in
+/// place when the stale ones go. It is only called for a channel that produced
+/// at least one service, so a no-signal or busy channel keeps whatever the
+/// previous pass stored (a failed scan must never wipe the table).
+fn update_service_table(services: &ServiceTable, update: &TableUpdate) {
+    let TableUpdate {
+        type_name,
+        mode,
+        entries,
+        services: found,
+    } = update;
     for (index, service) in found.iter().enumerate() {
         // In `Service` mode `entries_for` emits one entry per service, in the
         // same order; in `Channel` mode every service shares the one entry.
@@ -1276,9 +1495,33 @@ fn update_service_table(
         record.remote_control_key_id = service.remote_control_key_id;
         record.pmt_pid = service.pmt_pid;
         if let Some(channel) = channel {
-            record.channel = Some((type_name.to_string(), channel));
+            record.channel = Some((type_name.clone(), channel));
         }
         services.upsert(record);
+    }
+
+    if found.is_empty() {
+        // Nothing was read on this channel: never prune on failure.
+        return;
+    }
+    // Group the sids by the `channels.yml` channel they were attributed to, so
+    // a format that maps several services onto one channel string (for example
+    // `{ch}` in `Service` mode) does not let one entry prune another's record.
+    let mut keep_by_channel: HashMap<&str, HashSet<u16>> = HashMap::new();
+    for (index, service) in found.iter().enumerate() {
+        let entry = match mode {
+            ScanMode::Service => entries.get(index),
+            ScanMode::Channel => entries.first(),
+        };
+        if let Some(entry) = entry {
+            keep_by_channel
+                .entry(entry.channel.as_str())
+                .or_default()
+                .insert(service.service_id);
+        }
+    }
+    for (channel, keep) in keep_by_channel {
+        services.retain_channel(type_name, channel, &keep);
     }
 }
 
@@ -1674,8 +1917,116 @@ mod tests {
         ]))
         .expect("query");
         assert_eq!(query.skip_channels, vec![1, 2, 3]);
-        assert_eq!(query.min_sub_channels, vec![1]);
-        assert_eq!(query.max_sub_channels, vec![2]);
+        assert_eq!(query.sub_channels, vec![1, 2]);
+    }
+
+    #[test]
+    fn subchannel_lists_pair_up_and_merge_into_one_ascending_set() {
+        // `minSubCh=0,2` / `maxSubCh=1,3`: two ranges, tuned channel outer and
+        // subchannel inner.
+        let query = ScanQuery::from_params(&params(&[
+            ("type", "BS"),
+            ("minCh", "13"),
+            ("maxCh", "13"),
+            ("minSubCh", "0,2"),
+            ("maxSubCh", "1,3"),
+        ]))
+        .expect("query");
+        assert_eq!(query.sub_channels, vec![0, 1, 2, 3]);
+        let names: Vec<String> = candidates(&query)
+            .map(|candidate| candidate.channel)
+            .collect();
+        assert_eq!(names, ["BS13_0", "BS13_1", "BS13_2", "BS13_3"]);
+        assert_eq!(query.candidate_count(), 4);
+
+        // A shorter list is padded from its last value: `minSubCh=1&maxSubCh=1,2`.
+        let query = ScanQuery::from_params(&params(&[
+            ("type", "BS"),
+            ("minCh", "13"),
+            ("maxCh", "13"),
+            ("minSubCh", "1"),
+            ("maxSubCh", "1,2"),
+        ]))
+        .expect("query");
+        assert_eq!(query.sub_channels, vec![1, 2]);
+    }
+
+    #[test]
+    fn an_out_of_range_or_inverted_subchannel_list_is_rejected() {
+        for (min, max) in [("0", "4"), ("4", "4"), ("2", "1")] {
+            let error = ScanQuery::from_params(&params(&[
+                ("type", "BS"),
+                ("minCh", "13"),
+                ("maxCh", "13"),
+                ("minSubCh", min),
+                ("maxSubCh", max),
+            ]))
+            .expect_err("invalid subchannel range");
+            assert!(
+                error.contains("SubCh") || error.contains("subchannel"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn subchannel_parameters_are_ignored_when_the_type_does_not_expand() {
+        // mirakurun: the subchannel parameters only apply to a BS subchannel
+        // scan. A GR request that happens to carry them is not rejected and
+        // tunes one candidate per channel number.
+        let query = ScanQuery::from_params(&params(&[
+            ("type", "GR"),
+            ("minCh", "24"),
+            ("maxCh", "25"),
+            ("minSubCh", "0"),
+            ("maxSubCh", "9"),
+        ]))
+        .expect("query");
+        assert_eq!(query.sub_channels, vec![0]);
+        let names: Vec<String> = candidates(&query)
+            .map(|candidate| candidate.channel)
+            .collect();
+        assert_eq!(names, ["24", "25"]);
+    }
+
+    #[test]
+    fn a_custom_type_requires_an_explicit_range() {
+        // The BS/CS/GR defaults do not apply to a user-defined type: guessing
+        // would tune channels the caller never asked for.
+        let error = ScanQuery::from_params(&params(&[("type", "CABLE_CATV")]))
+            .expect_err("no default range");
+        assert!(error.contains("minCh"), "{error}");
+        assert!(error.contains("CABLE_CATV"), "{error}");
+        assert!(
+            ScanQuery::from_params(&params(&[("type", "CABLE_CATV"), ("minCh", "1")])).is_err(),
+            "both bounds are required"
+        );
+
+        let query = ScanQuery::from_params(&params(&[
+            ("type", "CABLE_CATV"),
+            ("minCh", "17"),
+            ("maxCh", "18"),
+        ]))
+        .expect("query");
+        assert_eq!(query.min_channel, 17);
+        assert_eq!(query.max_channel, 18);
+        // Conservative defaults for anything that is not BS/CS.
+        assert_eq!(query.mode, ScanMode::Channel);
+        assert!(!query.set_disabled_on_add);
+        assert_eq!(query.channel_name(17, 0), "17");
+        let names: Vec<String> = candidates(&query)
+            .map(|candidate| candidate.channel)
+            .collect();
+        assert_eq!(names, ["17", "18"]);
+    }
+
+    #[test]
+    fn the_builtin_types_still_default_their_ranges() {
+        for (type_name, min, max) in [("GR", 13, 62), ("BS", 1, 24), ("CS", 1, 24)] {
+            let query = ScanQuery::from_params(&params(&[("type", type_name)])).expect("query");
+            assert_eq!(query.min_channel, min, "{type_name}");
+            assert_eq!(query.max_channel, max, "{type_name}");
+        }
     }
 
     #[test]
@@ -1897,7 +2248,7 @@ mod tests {
     }
 
     #[test]
-    fn colliding_names_stay_unique() {
+    fn colliding_names_keep_the_service_name_and_get_a_suffix() {
         let existing = vec![ChannelEntry {
             name: "Same".to_string(),
             channel_type: "GR".to_string(),
@@ -1905,14 +2256,34 @@ mod tests {
             disabled: false,
         }];
         let query = ScanQuery::from_params(&params(&[("type", "GR")])).expect("query");
-        let found = vec![ChannelEntry {
-            name: "Same".to_string(),
-            channel_type: "GR".to_string(),
-            channel: "28".to_string(),
-            disabled: false,
-        }];
+        let found = vec![
+            ChannelEntry {
+                name: "Same".to_string(),
+                channel_type: "GR".to_string(),
+                channel: "28".to_string(),
+                disabled: false,
+            },
+            ChannelEntry {
+                name: "Same".to_string(),
+                channel_type: "GR".to_string(),
+                channel: "29".to_string(),
+                disabled: false,
+            },
+            // An empty SDT name is the only case that falls back to the channel.
+            ChannelEntry {
+                name: String::new(),
+                channel_type: "GR".to_string(),
+                channel: "30".to_string(),
+                disabled: false,
+            },
+        ];
         let merged = merge(&existing, &query, &HashSet::new(), &HashSet::new(), found);
-        assert_eq!(merged[1].name, "Same (28)");
+        assert_eq!(merged[1].name, "Same (2)", "the service name survives");
+        assert_eq!(merged[2].name, "Same (3)");
+        assert_eq!(
+            merged[3].name, "30",
+            "an empty name falls back to the channel"
+        );
     }
 
     #[test]
@@ -1952,6 +2323,76 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].channel, "BS01_101");
         assert_eq!(entries[1].channel, "BS01_102");
+    }
+
+    #[test]
+    fn update_service_table_keeps_each_entries_sids_and_drops_the_stale_ones() {
+        let table = ServiceTable::new();
+        for (sid, channel) in [
+            (101u16, "BS01_1"),
+            (102, "BS01_1"),
+            (103, "BS01_1"),
+            (201, "BS13_1"),
+        ] {
+            let mut record = ServiceRecord::new(1, 1, sid, 0x01, "old");
+            record.channel = Some(("BS".to_string(), channel.to_string()));
+            table.insert(record);
+        }
+
+        let entry = |channel: &str, sid: u16| ChannelEntry {
+            name: format!("Service {sid}"),
+            channel_type: "BS".to_string(),
+            channel: channel.to_string(),
+            disabled: false,
+        };
+        let service = |sid: u16| FoundService {
+            service_id: sid,
+            network_id: 1,
+            tsid: 1,
+            service_type: 0x01,
+            name: format!("Service {sid}"),
+            remote_control_key_id: None,
+            pmt_pid: None,
+        };
+        // `useSubCh` collapses every service of one multiplex onto the same
+        // channel: 103 disappeared, 101/102 are still on air.
+        update_service_table(
+            &table,
+            &TableUpdate {
+                type_name: "BS".to_string(),
+                mode: ScanMode::Service,
+                entries: vec![entry("BS01_1", 101), entry("BS01_1", 102)],
+                services: vec![service(101), service(102)],
+            },
+        );
+
+        let mut remaining: Vec<(u16, String)> = table
+            .list()
+            .into_iter()
+            .map(|record| (record.service_id, record.channel.expect("bound").1))
+            .collect();
+        remaining.sort_unstable();
+        assert_eq!(
+            remaining,
+            [
+                (101, "BS01_1".to_string()),
+                (102, "BS01_1".to_string()),
+                (201, "BS13_1".to_string()),
+            ],
+            "only the disappeared sid of this channel goes"
+        );
+
+        // A channel that produced nothing must never be pruned.
+        update_service_table(
+            &table,
+            &TableUpdate {
+                type_name: "BS".to_string(),
+                mode: ScanMode::Service,
+                entries: Vec::new(),
+                services: Vec::new(),
+            },
+        );
+        assert_eq!(table.len(), 3, "a failed channel keeps its services");
     }
 
     #[test]
