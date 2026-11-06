@@ -21,21 +21,39 @@
 //! skipped and the scan continues (SPEC §8.1). Each per-channel session is
 //! released before the next channel is tuned.
 //!
+//! A channel the scan loses to a **user request** (any non-negative priority
+//! beats [`SCAN_PRIORITY`]) is reported as preempted, never as "no signal": the
+//! user keeps the tuner and the startup scan retries the channel with the same
+//! backoff as a busy one, so its services still appear later.
+//!
+//! # SI completeness
+//!
+//! Only the **SDT-actual** (`0x42`) describes the multiplex being received, so
+//! `ChannelSink` ignores SDT-other (`0x46`, another transponder) entirely. A
+//! multi-section SDT is accumulated until every `section_number` up to
+//! `last_section_number` of one table version has arrived, and only then
+//! replaces the channel's service list; a table that never completes still
+//! contributes the sections that did arrive when the channel budget expires.
+//!
 //! # Cancellation
 //!
 //! A scan stops when its progress receiver goes away (the HTTP client
 //! disconnected) and when the server-wide shutdown watch fires: both are
 //! observed between channels and while waiting for SI, and neither writes
-//! `channels.yml`.
+//! `channels.yml`. The acquire itself may also be cut off by the per-channel
+//! budget: the session layer is cancellation-safe, so a cut-off acquire stops
+//! its own process tree rather than leaking the tuner. [`scan_channel`] then
+//! waits for that teardown before the next channel, so one abandoned channel
+//! cannot report the next one as "busy".
 //!
 //! # Startup scan
 //!
 //! The same per-channel helper ([`scan_channel`]) also drives the SPEC §8
 //! startup service scan ([`startup_scan`]): every enabled `channels.yml` entry
 //! is tuned once, the found services are upserted into the shared
-//! [`ServiceTable`], and channels whose tuner was busy or absent are retried in
-//! the background with exponential backoff. The task stops on a shutdown
-//! signal and never preempts a user ([`SCAN_PRIORITY`]).
+//! [`ServiceTable`], and channels whose tuner was busy, absent, or preempted by
+//! a user are retried in the background with exponential backoff. The task stops
+//! on a shutdown signal and never preempts a user ([`SCAN_PRIORITY`]).
 //!
 //! # Writing `channels.yml`
 //!
@@ -75,11 +93,27 @@ use tokio::time::Instant;
 use crate::config::{Config, ConfigError};
 use crate::services::{ServiceRecord, ServiceTable};
 use crate::session::{SessionManager, SessionTap, TunerUser, SCAN_PRIORITY};
-use crate::si::{SiEvent, SiParser};
+use crate::si::{SdtInfo, SiEvent, SiParser, TableCompleteness};
 use crate::webui::store;
 
 /// Default per-channel scan budget (SPEC §8: "既定 timeout 10s/ch").
-pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// This budget covers **both** the acquire (including the session readiness
+/// wait, [`crate::session::READINESS_TIMEOUT`] = 10 s) and reading SI, so it
+/// must stay strictly greater than the readiness timeout: otherwise the scan's
+/// own `timeout_at` would always fire first and cut the acquire off from
+/// outside. 25 s leaves the readiness gate its 10 s plus up to 5 s of waiting
+/// for a concurrent spawn, with the rest for SI.
+///
+/// The session layer is cancellation-safe (see [`crate::session`]), so even a
+/// cut-off acquire now stops its tree instead of leaking the tuner; the larger
+/// budget simply avoids the cancellation on a merely slow tuner.
+pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Compile-time guard for the budget relationship documented on
+/// [`CHANNEL_TIMEOUT`]: a channel budget at or below the readiness timeout would
+/// make the scan cancel every slow spawn.
+const _: () = assert!(CHANNEL_TIMEOUT.as_secs() > crate::session::READINESS_TIMEOUT.as_secs());
 
 /// Hard cap on the channels one scan request may touch.
 ///
@@ -358,6 +392,14 @@ pub(crate) struct FoundService {
 /// `original_network_id`. A NIT *other* (`0x41`) describes a *different*
 /// transport stream and never contributes a network id or a remote-control key
 /// id (SPEC §8).
+///
+/// The SDT is handled the same way: only an **SDT-actual** (`0x42`) describes
+/// this multiplex, so an SDT-other (`0x46`, another transponder) never
+/// contributes services. A multi-section SDT is accumulated until every
+/// `section_number` up to `last_section_number` of one version has arrived
+/// ([`TableCompleteness`]); the accumulated set replaces [`found`](Self::found)
+/// only once, when the table is complete, so a partially received table never
+/// half-populates the result.
 #[derive(Debug, Default)]
 struct ChannelSink {
     /// The parser's `network_id`, i.e. the NIT-actual's network id.
@@ -368,8 +410,73 @@ struct ChannelSink {
     remote_control_key_id: Option<u8>,
     /// `service_id -> PMT PID` from the PAT.
     pmt_pids: HashMap<u16, u16>,
-    /// Services in SDT order, one entry per service id.
+    /// `transport_stream_id` of the multiplex: from the PAT (authoritative),
+    /// else from the first SDT-actual.
+    expected_tsid: Option<u16>,
+    /// Sections of the SDT-actual being assembled.
+    sdt: SdtAccumulator,
+    /// Services from the last complete SDT-actual (or, at the end of the
+    /// budget, the partially received one).
     found: Vec<FoundService>,
+    /// Whether a **complete** SDT-actual for [`expected_tsid`](Self::expected_tsid)
+    /// has already been stored.
+    complete: bool,
+}
+
+/// Accumulates SDT-actual sections until one table version is complete.
+#[derive(Debug, Default)]
+struct SdtAccumulator {
+    completeness: TableCompleteness,
+    /// `(original_network_id, transport_stream_id, version_number)` of the
+    /// table whose sections are being collected.
+    current: Option<(u16, u16, u8)>,
+    /// `section_number -> services of that section`.
+    sections: HashMap<u8, Vec<(u16, u8, String)>>,
+}
+
+impl SdtAccumulator {
+    /// Records one SDT-actual section and, once its table version is complete,
+    /// returns the services of every section in section order.
+    fn push(&mut self, sdt: &SdtInfo) -> Option<Vec<(u16, u8, String)>> {
+        let table = (
+            sdt.original_network_id,
+            sdt.transport_stream_id,
+            sdt.version_number,
+        );
+        if self.current != Some(table) {
+            // A new table (or table version): sections of the previous one
+            // must not contribute to it.
+            self.current = Some(table);
+            self.sections.clear();
+            self.completeness.reset();
+        }
+        self.sections
+            .insert(sdt.section_number, sdt.services.clone());
+        if !self.completeness.observe(sdt) {
+            return None;
+        }
+        Some(self.collect(sdt.last_section_number))
+    }
+
+    /// Every collected service, in section order, up to `last_section_number`.
+    fn collect(&self, last_section_number: u8) -> Vec<(u16, u8, String)> {
+        (0..=last_section_number)
+            .filter_map(|number| self.sections.get(&number))
+            .flat_map(|services| services.iter().cloned())
+            .collect()
+    }
+
+    /// Every collected service of a table that did not finish within the
+    /// channel budget, in section order.
+    ///
+    /// The highest received section number bounds the walk, so a gap in the
+    /// middle still yields the sections around it instead of nothing.
+    fn partial(&self) -> Vec<(u16, u8, String)> {
+        match self.sections.keys().max().copied() {
+            Some(last) => self.collect(last),
+            None => Vec::new(),
+        }
+    }
 }
 
 impl ChannelSink {
@@ -396,40 +503,88 @@ impl ChannelSink {
                 for &(service_id, pmt_pid) in &pat.programs {
                     self.pmt_pids.insert(service_id, pmt_pid);
                 }
+                // The PAT is authoritative for the multiplex's TSID.
+                if self.expected_tsid.is_none() {
+                    self.expected_tsid = Some(pat.transport_stream_id);
+                }
                 for service in &mut self.found {
                     if service.tsid == 0 {
                         service.tsid = pat.transport_stream_id;
                     }
                 }
             }
-            SiEvent::Sdt(sdt) => {
-                let network_id = self.network_id().unwrap_or(sdt.original_network_id);
-                for (service_id, service_type, name) in &sdt.services {
-                    if self
-                        .found
-                        .iter()
-                        .any(|service| service.service_id == *service_id)
-                    {
-                        continue;
-                    }
-                    self.found.push(FoundService {
-                        service_id: *service_id,
-                        network_id,
-                        tsid: sdt.transport_stream_id,
-                        service_type: *service_type,
-                        name: name.clone(),
-                        remote_control_key_id: None,
-                        pmt_pid: None,
-                    });
-                }
-            }
+            SiEvent::Sdt(sdt) => self.push_sdt(sdt),
             SiEvent::Pmt(_) => {}
         }
     }
 
+    fn push_sdt(&mut self, sdt: &SdtInfo) {
+        // Only the SDT *actual* describes this multiplex (SPEC §8, B10). An
+        // SDT-other carries another transponder's services and TSID, so it
+        // must not contribute anything, not even the expected TSID.
+        if !sdt.is_actual {
+            return;
+        }
+        // A stream can be mislabelled: when the PAT already named the
+        // multiplex, an SDT-actual for a different TSID is not ours.
+        if self
+            .expected_tsid
+            .is_some_and(|tsid| tsid != sdt.transport_stream_id)
+        {
+            return;
+        }
+        self.expected_tsid = Some(sdt.transport_stream_id);
+
+        let Some(services) = self.sdt.push(sdt) else {
+            return;
+        };
+        let network_id = self.network_id().unwrap_or(sdt.original_network_id);
+        self.found = services
+            .into_iter()
+            .map(|(service_id, service_type, name)| FoundService {
+                service_id,
+                network_id,
+                tsid: sdt.transport_stream_id,
+                service_type,
+                name,
+                remote_control_key_id: None,
+                pmt_pid: None,
+            })
+            .collect();
+        self.complete = true;
+    }
+
+    /// Whether a complete SDT-actual has been stored.
+    fn is_complete(&self) -> bool {
+        self.complete && !self.found.is_empty()
+    }
+
     /// Copies the NIT remote-control key id and the PAT PMT PIDs onto every
     /// service found so far.
+    ///
+    /// When the budget expires before the SDT table is complete, the sections
+    /// that did arrive are used instead: a slow table still yields its services
+    /// rather than "no signal".
     fn finish(&mut self) {
+        if !self.complete {
+            let services = self.sdt.partial();
+            if !services.is_empty() {
+                let network_id = self.network_id().unwrap_or(0);
+                let tsid = self.expected_tsid.unwrap_or(0);
+                self.found = services
+                    .into_iter()
+                    .map(|(service_id, service_type, name)| FoundService {
+                        service_id,
+                        network_id,
+                        tsid,
+                        service_type,
+                        name,
+                        remote_control_key_id: None,
+                        pmt_pid: None,
+                    })
+                    .collect();
+            }
+        }
         for service in &mut self.found {
             service.remote_control_key_id = self.remote_control_key_id;
             service.pmt_pid = self.pmt_pids.get(&service.service_id).copied();
@@ -525,6 +680,11 @@ pub async fn run_scan(
         };
         match outcome {
             ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
+            ChannelOutcome::Preempted => {
+                lines
+                    .push("skipped (preempted by a user request)\n".to_string())
+                    .await
+            }
             ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
             ChannelOutcome::Services(services) => {
                 let services: Vec<FoundService> = services
@@ -693,6 +853,11 @@ pub(crate) enum ChannelOutcome {
     /// Every tuner was busy, or no configured tuner supports the type:
     /// SPEC §8 skips the channel and retries it later.
     Busy,
+    /// A user request took the tuner over during the scan (SPEC §6.1: any
+    /// non-negative priority beats [`SCAN_PRIORITY`]). This is **not** "no
+    /// signal": the user won, and the channel must be retried with the same
+    /// backoff as a busy tuner so its services still appear.
+    Preempted,
     /// No output, or output without SI, within the per-channel budget (also
     /// what a tuner that failed to start is reported as).
     NoSignal,
@@ -702,11 +867,12 @@ pub(crate) enum ChannelOutcome {
 
 /// [`scan_channel`] with a shutdown watch.
 ///
-/// The cancellation is observed **between reads**, never by dropping a future
-/// that is still acquiring: an interrupted `acquire` can leave a reservation
-/// behind, while a read-loop break still runs the normal "release the scan
-/// session" path. `None` means shutdown fired while the channel was being read;
-/// the caller stops without writing `channels.yml`.
+/// Cancellation is observed **between reads**, so the normal "release the scan
+/// session" path always runs. The session layer is cancellation-safe as well
+/// (see [`crate::session`]), so an acquire that is cut off by the per-channel
+/// budget cleans up after itself instead of leaking the tuner. `None` means
+/// shutdown fired while the channel was being read; the caller stops without
+/// writing `channels.yml`.
 async fn scan_channel_cancellable(
     manager: &SessionManager,
     type_name: &str,
@@ -753,6 +919,40 @@ pub(crate) async fn scan_channel(
         .0
 }
 
+/// Waits (bounded) until no session for `(type_name, channel)` is still starting
+/// or stopping.
+///
+/// A cancelled acquire stops its reservation in a detached task, which is
+/// asynchronous: the tuner stays `Starting`/`Stopping` until the process group
+/// is gone. Returning before that would make the *next* channel of the same scan
+/// report "busy" because of the channel it just gave up on. A `Ready` session is
+/// someone else's (a user joined first), so it is left alone.
+async fn wait_for_release(manager: &SessionManager, type_name: &str, channel: &str) {
+    let deadline = Instant::now() + RELEASE_WAIT;
+    loop {
+        let occupied = manager.sessions_snapshot().iter().any(|session| {
+            session.type_name == type_name
+                && session.channel == channel
+                && matches!(
+                    session.phase,
+                    crate::session::SessionPhase::Starting | crate::session::SessionPhase::Stopping
+                )
+        });
+        if !occupied {
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(channel, "the cancelled scan session is still stopping");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Upper bound for [`wait_for_release`]: long enough for one SIGTERM grace
+/// period plus the reap, short enough not to wedge a scan.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
+
 /// [`scan_channel`] with an optional shutdown watch, returning whether the read
 /// loop was cancelled.
 async fn scan_channel_watched(
@@ -771,11 +971,16 @@ async fn scan_channel_watched(
         .any(|session| session.type_name == type_name && session.channel == channel);
 
     let user = TunerUser::new("scan", SCAN_PRIORITY);
-    // One budget per channel covers tuning *and* reading, so a wedged frontend
-    // cannot stretch a scan past `timeout` per channel (SPEC §8: 10s/ch).
-    let deadline = Instant::now() + timeout;
+    // One budget per channel covers tuning *and* reading (SPEC §8). The
+    // acquire gets at most its own readiness gate plus the concurrent-wait
+    // margin, so a slow spawn cannot swallow the whole budget and leave nothing
+    // for SI; the read then uses what is left of the channel deadline.
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let acquire_budget = crate::session::READINESS_TIMEOUT + Duration::from_secs(5);
+    let acquire_deadline = deadline.min(started + acquire_budget);
     let acquired = tokio::time::timeout_at(
-        deadline,
+        acquire_deadline,
         manager.acquire_scan(type_name, channel, user, SessionTap::Raw, false),
     )
     .await;
@@ -783,6 +988,12 @@ async fn scan_channel_watched(
     let mut subscription = match acquired {
         Err(_) => {
             tracing::debug!(channel, "scan acquire timed out");
+            // The session layer is cancellation-safe and stops the reservation
+            // it had already taken, but that takes a moment (SIGTERM grace, then
+            // SIGKILL). Wait for it to be gone, otherwise the tuner still holds
+            // `Stopping`/`Starting` and the next channel of the scan would be
+            // refused with "busy" because of this one.
+            wait_for_release(manager, type_name, channel).await;
             return (ChannelOutcome::NoSignal, false);
         }
         Ok(Err(error)) => {
@@ -812,6 +1023,7 @@ async fn scan_channel_watched(
     // which subscriber was ours, so a client that attached meanwhile keeps the
     // session alive while a stale scan subscriber does not wedge it.
     let subscriber_id = subscription.subscriber_id;
+    let preempted = subscription.preempted.clone();
     loop {
         let chunk = match shutdown.as_deref_mut() {
             Some(rx) => {
@@ -833,11 +1045,12 @@ async fn scan_channel_watched(
             Ok(Some(chunk)) => {
                 for event in parser.push_packets(&chunk) {
                     sink.push(&event, parser.network_id());
-                    // SDT supplies the names; once it has arrived there is no
-                    // reason to keep the tuner for the rest of the budget. A
-                    // PAT seen before it also supplied the PMT PIDs; if it did
-                    // not, the record simply has no PMT PID yet.
-                    if matches!(event, SiEvent::Sdt(_)) && !sink.found.is_empty() {
+                    // A complete SDT-actual (every section of one version)
+                    // supplies the names; there is no reason to keep the tuner
+                    // for the rest of the budget. A PAT seen before it also
+                    // supplied the PMT PIDs; if it did not, the record simply
+                    // has no PMT PID yet.
+                    if sink.is_complete() {
                         sink.finish();
                         drop(subscription);
                         if !preexisting {
@@ -861,8 +1074,6 @@ async fn scan_channel_watched(
         found = sink.found.len(),
         "scan channel finished without completing a service list"
     );
-    sink.finish();
-
     // Release the scan session before the next channel is tuned (SPEC §8.1).
     drop(subscription);
     if !preexisting {
@@ -871,6 +1082,14 @@ async fn scan_channel_watched(
             .await;
     }
 
+    // A user request preempted the scan (its priority beats the scan's
+    // `-1000`). That is not "no signal": the channel must be retried with the
+    // same backoff as a busy tuner, and the user keeps the tuner.
+    if preempted.is_preempted() && sink.found.is_empty() {
+        return (ChannelOutcome::Preempted, cancelled);
+    }
+
+    sink.finish();
     let outcome = if sink.found.is_empty() {
         ChannelOutcome::NoSignal
     } else {
@@ -1139,7 +1358,8 @@ struct PassSummary {
 ///   request always wins and a busy tuner is skipped rather than preempted.
 /// * The per-channel budget is [`CHANNEL_TIMEOUT`], covering acquire + SI read.
 /// * Channels that failed for lack of a tuner ([`ChannelOutcome::Busy`], i.e.
-///   busy or no supporting tuner) are retried; a no-signal channel is not.
+///   busy or no supporting tuner) or because a user request preempted the scan
+///   ([`ChannelOutcome::Preempted`]) are retried; a no-signal channel is not.
 /// * Entries are only ever upserted, never cleared, so a failed channel keeps
 ///   whatever the previous pass (or an HTTP scan) put in the table.
 ///
@@ -1208,6 +1428,15 @@ pub async fn startup_scan(
     }
 }
 
+/// Whether a startup-scan pass retries a channel after `outcome`.
+///
+/// A busy tuner and a channel preempted by a user request are both transient:
+/// the next pass retries them with the same exponential backoff. A channel
+/// that legitimately produced no SI is not retried.
+fn retries(outcome: &ChannelOutcome) -> bool {
+    matches!(outcome, ChannelOutcome::Busy | ChannelOutcome::Preempted)
+}
+
 /// Scans `pending` sequentially, returning the pass summary and the channels
 /// that should be retried (only those whose tuner was unavailable).
 async fn scan_pass(
@@ -1237,13 +1466,15 @@ async fn scan_pass(
             summary.attempted -= 1;
             break;
         };
+        let should_retry = retries(&outcome);
+        let preempted = matches!(&outcome, ChannelOutcome::Preempted);
         match outcome {
-            ChannelOutcome::Busy => {
+            ChannelOutcome::Busy | ChannelOutcome::Preempted => {
                 summary.skipped += 1;
-                retry.push(channel.clone());
                 tracing::debug!(
                     type_name = %channel.type_name,
                     channel = %channel.channel,
+                    preempted,
                     "startup scan skipped the channel: no tuner available"
                 );
             }
@@ -1259,6 +1490,9 @@ async fn scan_pass(
                 summary.ok += 1;
                 summary.found += upsert_startup_services(manager.services(), channel, &services);
             }
+        }
+        if should_retry {
+            retry.push(channel.clone());
         }
     }
     (summary, retry)
@@ -1915,16 +2149,91 @@ mod tests {
     }
 
     fn sdt(original_network_id: u16, tsid: u16, service_id: u16) -> SiEvent {
+        sdt_section(original_network_id, tsid, service_id, true, 0, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sdt_section(
+        original_network_id: u16,
+        tsid: u16,
+        service_id: u16,
+        is_actual: bool,
+        section_number: u8,
+        last_section_number: u8,
+    ) -> SiEvent {
         SiEvent::Sdt(crate::si::SdtInfo {
             original_network_id,
             transport_stream_id: tsid,
-            services: vec![(service_id, 0x01, "Service".to_string())],
-            is_actual: true,
+            services: vec![(service_id, 0x01, format!("Service {service_id:04X}"))],
+            is_actual,
             version_number: 0,
             current_next: true,
-            section_number: 0,
-            last_section_number: 0,
+            section_number,
+            last_section_number,
         })
+    }
+
+    #[test]
+    fn an_sdt_other_never_contributes_services() {
+        let mut sink = ChannelSink::default();
+        // The SDT-other of another transponder arrives first; its services and
+        // TSID must be ignored, and the real SDT-actual must still be adopted.
+        sink.push(&sdt_section(3, 0x1111, 0x0001, false, 0, 0), None);
+        assert!(
+            sink.found.is_empty(),
+            "the SDT-other must not contribute services"
+        );
+        assert!(!sink.is_complete());
+
+        sink.push(&sdt_section(3, 0x7FE0, 0x0408, true, 0, 0), None);
+        sink.finish();
+        assert!(sink.is_complete());
+        assert_eq!(sink.found.len(), 1);
+        assert_eq!(sink.found[0].service_id, 0x0408);
+        assert_eq!(sink.found[0].tsid, 0x7FE0);
+    }
+
+    #[test]
+    fn a_multi_section_sdt_is_accumulated_until_it_is_complete() {
+        let mut sink = ChannelSink::default();
+        // Three sections, delivered out of order.
+        sink.push(&sdt_section(3, 0x7FE0, 0x0409, true, 1, 2), None);
+        assert!(!sink.is_complete(), "1 of 2 alone is not complete");
+        assert!(
+            sink.found.is_empty(),
+            "a partial table must not half-populate the result"
+        );
+        sink.push(&sdt_section(3, 0x7FE0, 0x040B, true, 2, 2), None);
+        assert!(!sink.is_complete());
+        sink.push(&sdt_section(3, 0x7FE0, 0x0408, true, 0, 2), None);
+
+        assert!(sink.is_complete());
+        sink.finish();
+        let ids: Vec<u16> = sink
+            .found
+            .iter()
+            .map(|service| service.service_id)
+            .collect();
+        assert_eq!(
+            ids,
+            [0x0408, 0x0409, 0x040B],
+            "section order, no duplicates"
+        );
+    }
+
+    #[test]
+    fn a_partial_sdt_still_yields_its_services_at_the_end_of_the_budget() {
+        let mut sink = ChannelSink::default();
+        sink.push(&sdt_section(3, 0x7FE0, 0x0408, true, 0, 2), None);
+        // Section 1 never arrives; the budget expires.
+        assert!(!sink.is_complete());
+        sink.finish();
+        let ids: Vec<u16> = sink
+            .found
+            .iter()
+            .map(|service| service.service_id)
+            .collect();
+        assert_eq!(ids, [0x0408], "the received sections are not thrown away");
     }
 
     #[test]
@@ -1973,5 +2282,156 @@ mod tests {
         assert_eq!(retry_delay(3), Duration::from_secs(240));
         assert_eq!(retry_delay(4), STARTUP_RETRY_MAX);
         assert_eq!(retry_delay(50), STARTUP_RETRY_MAX);
+    }
+
+    #[test]
+    fn a_preempted_channel_is_retried_like_a_busy_one() {
+        assert!(retries(&ChannelOutcome::Busy));
+        assert!(retries(&ChannelOutcome::Preempted));
+        assert!(!retries(&ChannelOutcome::NoSignal));
+    }
+
+    #[test]
+    fn the_channel_budget_outlasts_the_readiness_gate() {
+        assert!(
+            CHANNEL_TIMEOUT > crate::session::READINESS_TIMEOUT,
+            "a channel budget at or below the readiness timeout would cancel every slow spawn"
+        );
+    }
+
+    /// A scan fixture: one `GR` tuner whose command depends on the channel.
+    fn scan_tuner(
+        commands: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Config>,
+        crate::session::SessionManager,
+    ) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        for (name, body) in [
+            (
+                "server.yml",
+                "addr: \":0\"\nidle_timeout_secs: 5\n".to_string(),
+            ),
+            (
+                "tuners.yml",
+                format!("- name: t0\n  types: [GR]\n  command: '{commands}'\n"),
+            ),
+            ("channels.yml", String::new()),
+            (
+                "pipelines.yml",
+                "pipelines:\n  pass:\n    - \"cat\"\ntypes: {}\n".to_string(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write config");
+        }
+        let config = Arc::new(Config::load(dir.path()).expect("config loads"));
+        let manager = crate::session::SessionManager::new(
+            Arc::clone(&config),
+            crate::services::ServiceTable::new(),
+        );
+        (dir, config, manager)
+    }
+
+    #[tokio::test]
+    async fn a_silent_channel_does_not_block_the_next_one() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mux = dir.path().join("mux.bin");
+        let mut packet = vec![0x11u8; crate::tsframe::TS_PACKET_SIZE];
+        packet[0] = 0x47;
+        std::fs::write(&mux, [packet.clone(), packet.clone(), packet].concat()).expect("write mux");
+        // Channel 27 produces no byte at all; 28 streams immediately.
+        let commands = format!(
+            "sh -c \"case {{channel}} in 27) sleep 30;; *) cat {}; sleep 30;; esac\"",
+            mux.display()
+        );
+        let (_dir, _config, manager) = scan_tuner(&commands);
+
+        let started = tokio::time::Instant::now();
+        let silent = scan_channel(&manager, "GR", "27", Duration::from_secs(1)).await;
+        assert!(
+            matches!(silent, ChannelOutcome::NoSignal),
+            "a silent channel is no signal: {silent:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the channel budget was not honoured: {:?}",
+            started.elapsed()
+        );
+
+        // The silent channel must not occupy the tuner: the next one is scanned.
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            scan_channel(&manager, "GR", "28", Duration::from_secs(2)),
+        )
+        .await
+        .expect("the next channel must not be blocked by the silent one");
+        assert!(
+            !matches!(next, ChannelOutcome::Busy | ChannelOutcome::Preempted),
+            "the next channel lost the tuner: {next:?} sessions={:?}",
+            manager.sessions_snapshot()
+        );
+        assert!(
+            manager.sessions_snapshot().is_empty(),
+            "the scan must release its session: {:?}",
+            manager.sessions_snapshot()
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_user_takeover_during_a_scan_is_reported_as_preempted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mux = dir.path().join("mux.bin");
+        let mut packet = vec![0x11u8; crate::tsframe::TS_PACKET_SIZE];
+        packet[0] = 0x47;
+        // Three packets: the normalizer confirms the packet size from more than
+        // one sync byte before it emits anything.
+        std::fs::write(&mux, [packet.clone(), packet.clone(), packet].concat()).expect("write mux");
+        // Both channels stream, but the fixture carries no SI, so the scan
+        // stays on 27 without ever completing a service list.
+        let commands = format!("sh -c \"cat {}; sleep 30\"", mux.display());
+        let (_dir, _config, manager) = scan_tuner(&commands);
+
+        let scan = tokio::spawn({
+            let manager = manager.clone();
+            async move { scan_channel(&manager, "GR", "27", Duration::from_secs(10)).await }
+        });
+
+        // Wait until the scan session is streaming, then let a viewer take it
+        // over (any non-negative priority beats `SCAN_PRIORITY`).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = manager.sessions_snapshot().iter().any(|session| {
+                session.channel == "27" && session.phase == crate::session::SessionPhase::Ready
+            });
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the scan never started streaming: {:?}",
+                manager.sessions_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let viewer = manager
+            .acquire("GR", "28", TunerUser::new("viewer", 0), None, true)
+            .await
+            .expect("the viewer must win over the scan");
+        assert_eq!(viewer.channel, "28");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), scan)
+            .await
+            .expect("the scan must notice the takeover")
+            .expect("scan task");
+        assert!(
+            matches!(outcome, ChannelOutcome::Preempted),
+            "a user takeover must not be reported as no signal: {outcome:?}"
+        );
+
+        drop(viewer);
+        manager.shutdown().await;
     }
 }

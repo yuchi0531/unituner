@@ -66,6 +66,24 @@
 //! new reservation already holds the same tuner, so the tuner is never reported
 //! free while the old tree is dying.
 //!
+//! # Cancellation safety
+//!
+//! The acquisition entry points are safe to drop at **any** point. The spawn
+//! itself runs in a detached task, so dropping the caller's future cannot
+//! interrupt it half-way; the request only awaits a `oneshot`. When the
+//! requester goes away (HTTP client abort, scan budget, `select!` cancellation)
+//! the detached task notices the closed channel, stops waiting for readiness and
+//! stops the process tree. If the spawn was already promoted, it drops the
+//! subscription and releases the session again instead of waiting out the idle
+//! timeout.
+//!
+//! [`ReservationGuard`] backs that up: a `Drop` guard created together with the
+//! reservation marks it `Stopping` and starts a detached teardown, so a panic or
+//! an aborted task cannot leave a permanent `Starting` entry that occupies the
+//! tuner forever. Trees that are stopped outside the registry (a takeover
+//! victim, a cancelled reservation) stay in `Inner::stopping` until their
+//! process group is gone, so [`SessionManager::shutdown`] stops them as well.
+//!
 //! # Raw vs filtered
 //!
 //! Every session broadcasts the **post-pipeline** TS (SPEC §4). [`SessionTap`]
@@ -283,6 +301,21 @@ pub enum SessionTap {
     Filtered { service_id: Option<u16> },
 }
 
+/// A shared flag that a session was retired by a takeover.
+///
+/// A scan subscriber uses it to tell "the channel has no signal" (the stream
+/// ended on its own) from "a user request took the tuner over" (the scan must
+/// retry the channel instead of marking it dead for the process lifetime).
+#[derive(Clone, Debug, Default)]
+pub struct PreemptionFlag(Arc<AtomicBool>);
+
+impl PreemptionFlag {
+    /// Whether the session was retired to make room for another request.
+    pub fn is_preempted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// A live subscription to a session's post-pipeline TS.
 ///
 /// Dropping the subscription closes the mpsc receiver, which ends the
@@ -303,6 +336,8 @@ pub struct Subscription {
     pub subscriber_id: u64,
     /// The per-subscriber tap this subscription was created with.
     pub tap: SessionTap,
+    /// Set when this session is retired by a takeover; see [`PreemptionFlag`].
+    pub preempted: PreemptionFlag,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -314,6 +349,7 @@ impl std::fmt::Debug for Subscription {
             .field("channel", &self.channel)
             .field("subscriber_id", &self.subscriber_id)
             .field("tap", &self.tap)
+            .field("preempted", &self.preempted.is_preempted())
             .finish()
     }
 }
@@ -524,6 +560,10 @@ struct Session {
     /// The stream ended without a read error (natural EOF). Such a session must
     /// not blacklist its tuner for the rest of the request.
     clean_eof: AtomicBool,
+    /// Set when this session is retired by a takeover. A scan subscriber uses
+    /// it to tell "the channel has no signal" from "the scan lost the tuner to
+    /// a user request" (the latter must be retried, not marked dead).
+    preempted: PreemptionFlag,
     process: AsyncMutex<Option<ProcessTree>>,
     pids: Mutex<Vec<u32>>,
 }
@@ -546,9 +586,20 @@ impl Session {
             takeover_pending: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             clean_eof: AtomicBool::new(false),
+            preempted: PreemptionFlag::default(),
             process: AsyncMutex::new(None),
             pids: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Records that this session is being retired to free its tuner (SPEC §6.1).
+    fn mark_preempted(&self) {
+        self.preempted.0.store(true, Ordering::SeqCst);
+    }
+
+    /// The preemption flag handed out with every [`Subscription`].
+    fn preemption_flag(&self) -> PreemptionFlag {
+        self.preempted.clone()
     }
 
     fn phase(&self) -> SessionPhase {
@@ -686,6 +737,12 @@ struct Inner {
     /// shutdown returns.
     spawns_in_flight: AtomicUsize,
     spawn_finished: Notify,
+    /// Process trees that were unregistered (takeover, failed reservation) but
+    /// are still being stopped. `shutdown` drains this set as well, so a tree
+    /// whose takeover was cancelled mid-teardown can never survive: the stop
+    /// itself runs in a detached task, and the tree stays reachable here until
+    /// its process group is gone.
+    stopping: Mutex<Vec<Arc<Session>>>,
     next_session_id: AtomicU64,
 }
 
@@ -731,6 +788,38 @@ impl Inner {
             .any(|session| session.key.tuner == tuner)
     }
 
+    /// Starts a **detached** teardown of `session` and returns a receiver that
+    /// fires once its process group is gone.
+    ///
+    /// The session is registered in [`Inner::stopping`] first, so the tree
+    /// stays reachable by [`SessionManager::shutdown`] even when the caller
+    /// that asked for the stop is cancelled (an aborted takeover request, a
+    /// dropped scan). The session is unregistered from the registry when the
+    /// group has exited, so the tuner keeps reporting as occupied until the
+    /// device is really free. Repeated calls are harmless: `stop_process` is
+    /// idempotent and the set is deduplicated by pointer.
+    fn begin_stop(self: &Arc<Self>, session: &Arc<Session>) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut stopping = lock(&self.stopping);
+            if !stopping.iter().any(|entry| Arc::ptr_eq(entry, session)) {
+                stopping.push(Arc::clone(session));
+            }
+        }
+        let inner = Arc::clone(self);
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            session.stop_process().await;
+            {
+                let mut stopping = lock(&inner.stopping);
+                stopping.retain(|entry| !Arc::ptr_eq(entry, &session));
+            }
+            unregister_stopped(&inner, &session);
+            let _ = tx.send(());
+        });
+        rx
+    }
+
     fn tuner(&self, name: &str) -> Option<&TunerConfig> {
         self.config.tuners.iter().find(|tuner| tuner.name == name)
     }
@@ -758,6 +847,7 @@ impl SessionManager {
                 shutting_down: AtomicBool::new(false),
                 spawns_in_flight: AtomicUsize::new(0),
                 spawn_finished: Notify::new(),
+                stopping: Mutex::new(Vec::new()),
                 next_session_id: AtomicU64::new(0),
             }),
         }
@@ -938,17 +1028,30 @@ impl SessionManager {
                     }
                 }
                 Selection::Spawn { session, victim } => {
-                    match spawn_and_promote(&inner, session, victim, &user, tap).await {
-                        Ok(subscription) => return Ok(subscription),
-                        Err(SpawnFailure::ShuttingDown) => return Err(AcquireError::ShuttingDown),
-                        Err(SpawnFailure::Aborted(error)) => return Err(error),
-                        Err(SpawnFailure::Failed { tuner }) => {
+                    // The spawn runs in a detached task and reports through a
+                    // oneshot, so dropping this future (a scan `timeout_at`, an
+                    // HTTP client abort) can never leave a `Starting`
+                    // reservation behind: the task either cleans up after
+                    // itself or releases the freshly promoted session. See
+                    // [`spawn_detached`].
+                    let notify = spawn_detached(&inner, session, victim, user.clone(), tap);
+                    match notify.await {
+                        Ok(Ok(subscription)) => return Ok(subscription),
+                        Ok(Err(SpawnFailure::ShuttingDown)) => {
+                            return Err(AcquireError::ShuttingDown)
+                        }
+                        Ok(Err(SpawnFailure::Aborted(error))) => return Err(error),
+                        Ok(Err(SpawnFailure::Failed { tuner })) => {
                             // Pinned requests never fall back to another tuner.
                             if pin.is_some() {
                                 return Err(AcquireError::Unavailable);
                             }
                             failed.insert(tuner);
                         }
+                        // The detached task ended without reporting: only a
+                        // panicking spawn (whose own guard cleaned up after it)
+                        // can do that.
+                        Err(_) => return Err(AcquireError::Unavailable),
                     }
                 }
                 Selection::Fail(error) => {
@@ -1104,8 +1207,11 @@ impl SessionManager {
             "releasing session"
         );
         session.close_broadcast();
-        session.stop_process().await;
-        unregister_stopped(&self.inner, &session);
+        // Detached, for the same reason the takeover is: if the caller (a scan
+        // whose HTTP client vanished) is cancelled mid-teardown, the tree stays
+        // reachable by `shutdown` and is still unregistered afterwards.
+        let stopped = self.inner.begin_stop(&session);
+        let _ = stopped.await;
         true
     }
 
@@ -1124,7 +1230,11 @@ impl SessionManager {
     /// Stops every session and waits for all process trees to exit.
     ///
     /// The registry is cleared first, so no new request can join, and every
-    /// tree is signalled concurrently. No child process survives.
+    /// tree is signalled concurrently. Trees that are already being torn down
+    /// outside the registry (a takeover victim, a cancelled reservation) are
+    /// drained from [`Inner::stopping`] as well, so a request that was cancelled
+    /// mid-takeover cannot leave a process tree alive. No child process
+    /// survives.
     pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
 
@@ -1138,7 +1248,7 @@ impl SessionManager {
             }
         }
 
-        let sessions: Vec<Arc<Session>> = {
+        let mut sessions: Vec<Arc<Session>> = {
             let mut state = lock(&self.inner.state);
             let sessions: Vec<Arc<Session>> = state.sessions.values().cloned().collect();
             state.sessions.clear();
@@ -1147,6 +1257,14 @@ impl SessionManager {
         for session in &sessions {
             session.set_phase(SessionPhase::Stopping);
             session.close_broadcast();
+        }
+        // Tears in progress are unregistered already, so the registry pass above
+        // cannot see them. Their detached stop tasks keep them here until the
+        // process group is gone; stop them again (idempotent) and wait.
+        for session in lock(&self.inner.stopping).iter() {
+            if !sessions.iter().any(|known| Arc::ptr_eq(known, session)) {
+                sessions.push(Arc::clone(session));
+            }
         }
 
         let mut tasks = Vec::with_capacity(sessions.len());
@@ -1522,6 +1640,7 @@ fn attach(
         channel: session.key.channel.clone(),
         subscriber_id,
         tap,
+        preempted: session.preemption_flag(),
     };
     Some((
         subscription,
@@ -1564,13 +1683,72 @@ fn join(
 /// *before* the replacement is spawned. `session` is the reservation created by
 /// [`select`]; the session id is fixed for the whole lifetime of the process
 /// tree.
+///
+/// This always runs in a **detached task** (see [`spawn_detached`]) and reports
+/// through `notify`, so dropping the requesting future cannot interrupt it
+/// half-way. `notify.is_closed()` is the cancellation signal: the requester is
+/// gone, so the reservation must be released instead of promoted (or, if it was
+/// already promoted, released again) and the process tree stopped.
+///
+/// [`ReservationGuard`] is the last line of defence: if this task is itself
+/// dropped (runtime teardown) or panics, the guard removes the `Starting`
+/// reservation and detaches the teardown, so a tuner can never stay occupied by
+/// a reservation that nobody owns.
+struct ReservationGuard {
+    inner: Arc<Inner>,
+    session: Arc<Session>,
+}
+
+impl ReservationGuard {
+    fn new(inner: &Arc<Inner>, session: &Arc<Session>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            session: Arc::clone(session),
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        // Only a reservation that never reached `Ready` (and was not already
+        // released, which removes it from the registry) needs cleaning up.
+        let still_starting = {
+            let state = lock(&self.inner.state);
+            self.session.phase() == SessionPhase::Starting
+                && state
+                    .sessions
+                    .get(&self.session.key)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, &self.session))
+        };
+        if !still_starting {
+            return;
+        }
+        tracing::warn!(
+            session_id = self.session.id,
+            tuner = %self.session.key.tuner,
+            type_name = %self.session.key.type_name,
+            channel = %self.session.key.channel,
+            "reservation dropped while starting; releasing the tuner"
+        );
+        // Keep the registry slot as `Stopping` until the group is gone: the
+        // device is still held, so the tuner must not be reported free.
+        self.session.set_phase(SessionPhase::Stopping);
+        self.session.close_broadcast();
+        self.inner.begin_stop(&self.session);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_and_promote(
-    inner: &Arc<Inner>,
+    inner: Arc<Inner>,
     session: Arc<Session>,
     victim: Option<Arc<Session>>,
-    user: &TunerUser,
+    user: TunerUser,
     tap: SessionTap,
-) -> Result<Subscription, SpawnFailure> {
+    mut notify: oneshot::Sender<Result<Subscription, SpawnFailure>>,
+) {
+    let inner = &inner;
+    let _reservation = ReservationGuard::new(inner, &session);
     let tuner_name = session.key.tuner.clone();
     let label = format!(
         "{}:{}:{}",
@@ -1641,8 +1819,15 @@ async fn spawn_and_promote(
                 // Closing the broadcast ends the victim's subscribers (EOF) as
                 // soon as the pump exits; stopping the tree then releases the
                 // device this spawn needs.
+                //
+                // The teardown runs in a detached task and the victim stays in
+                // `Inner::stopping` until its group is gone, so this task being
+                // dropped (a cancelled request) can never orphan a SIGTERM'd
+                // tree that shutdown could no longer reach.
+                victim.mark_preempted();
                 victim.close_broadcast();
-                victim.stop_process().await;
+                let stopped = inner.begin_stop(victim);
+                let _ = stopped.await;
                 // Wake waiters so they re-select instead of sleeping out their
                 // poll interval.
                 victim.wake();
@@ -1656,16 +1841,29 @@ async fn spawn_and_promote(
                     "takeover abandoned: the victim changed before the kill"
                 );
                 release_reservation(inner, &session, Some(victim));
-                return Err(SpawnFailure::Aborted(AcquireError::Busy));
+                let _ = notify.send(Err(SpawnFailure::Aborted(AcquireError::Busy)));
+                return;
             }
             Takeover::Gone => {
                 // The victim was already unregistered (its stream ended or another
                 // request retired it). Its process tree may still be releasing the
-                // device, so wait for that stop to finish before spawning:
-                // `stop_process` serialises on the session's process lock.
-                victim.stop_process().await;
+                // device, so wait for that stop to finish before spawning.
+                let stopped = inner.begin_stop(victim);
+                let _ = stopped.await;
             }
         }
+    }
+
+    // The requester may have gone away while the victim was being stopped.
+    // Nothing has been spawned yet, so releasing the reservation is enough.
+    if notify.is_closed() {
+        tracing::debug!(
+            session_id = session.id,
+            %label,
+            "request cancelled during the takeover; releasing the reservation"
+        );
+        release_reservation(inner, &session, None);
+        return;
     }
 
     let readiness = match start_process_tree(inner, &session, &label).await {
@@ -1673,11 +1871,12 @@ async fn spawn_and_promote(
         Err(error) => {
             tracing::warn!(session_id = session.id, %label, %error, "spawn failed");
             release_reservation(inner, &session, None);
-            return Err(SpawnFailure::Failed { tuner: tuner_name });
+            let _ = notify.send(Err(SpawnFailure::Failed { tuner: tuner_name }));
+            return;
         }
     };
 
-    let ready = match await_readiness(inner, readiness).await {
+    let ready = match await_readiness(inner, readiness, &mut notify).await {
         Readiness::Ready => true,
         Readiness::Ended(reason) => {
             tracing::warn!(session_id = session.id, %label, %reason, "no output before EOF");
@@ -1696,13 +1895,42 @@ async fn spawn_and_promote(
             tracing::debug!(session_id = session.id, %label, "shutdown during readiness");
             session.stop_process().await;
             release_reservation(inner, &session, None);
-            return Err(SpawnFailure::ShuttingDown);
+            let _ = notify.send(Err(SpawnFailure::ShuttingDown));
+            return;
+        }
+        Readiness::Cancelled => {
+            // The requester dropped the acquire future (`timeout_at`, a client
+            // abort, `select!`). Stop the tree the reservation already spawned;
+            // `begin_stop` keeps it reachable by `shutdown` until the group is
+            // gone, and unregisters the reservation afterwards.
+            tracing::debug!(
+                session_id = session.id,
+                %label,
+                "request cancelled while waiting for readiness; stopping the tree"
+            );
+            session.set_phase(SessionPhase::Stopping);
+            session.close_broadcast();
+            let stopped = inner.begin_stop(&session);
+            let _ = stopped.await;
+            return;
         }
     };
     if !ready {
         session.stop_process().await;
         release_reservation(inner, &session, None);
-        return Err(SpawnFailure::Failed { tuner: tuner_name });
+        let _ = notify.send(Err(SpawnFailure::Failed { tuner: tuner_name }));
+        return;
+    }
+
+    if notify.is_closed() {
+        tracing::debug!(
+            session_id = session.id,
+            %label,
+            "request cancelled after readiness; releasing the tuner"
+        );
+        session.stop_process().await;
+        release_reservation(inner, &session, None);
+        return;
     }
 
     let promoted = {
@@ -1727,7 +1955,7 @@ async fn spawn_and_promote(
             })
         } else {
             session.set_phase(SessionPhase::Ready);
-            match attach(inner, &state, &session, user, tap) {
+            match attach(inner, &state, &session, &user, tap) {
                 None => Err(SpawnFailure::Failed {
                     tuner: tuner_name.clone(),
                 }),
@@ -1759,13 +1987,69 @@ async fn spawn_and_promote(
         Err(error) => {
             session.stop_process().await;
             release_reservation(inner, &session, None);
-            return Err(error);
+            let _ = notify.send(Err(error));
+            return;
         }
     };
 
     let (subscription, pump) = pump;
+    let session_for_release = Arc::clone(&session);
     spawn_subscriber_pump(Arc::clone(inner), Arc::clone(&session), pump);
-    Ok(subscription)
+    match notify.send(Ok(subscription)) {
+        Ok(()) => {}
+        Err(Ok(subscription)) => {
+            // The requester went away between promotion and delivery: nobody
+            // will ever read this subscription, so release it right away
+            // instead of waiting out the idle timeout with a live process tree.
+            tracing::debug!(
+                session_id = session_for_release.id,
+                "request cancelled after promotion; releasing the fresh session"
+            );
+            drop(subscription);
+            release_session_now(inner, &session_for_release);
+        }
+        Err(Err(_)) => {}
+    }
+}
+
+/// Releases a session that was just promoted for a requester that has already
+/// gone away: no subscriber will ever read it, so the tree is stopped instead of
+/// idling out.
+///
+/// The registry slot is kept as `Stopping` until the process group is gone, so
+/// the tuner is not reported free while the device is still held.
+fn release_session_now(inner: &Arc<Inner>, session: &Arc<Session>) {
+    session.set_phase(SessionPhase::Stopping);
+    session.close_broadcast();
+    inner.begin_stop(session);
+}
+
+/// Runs [`spawn_and_promote`] in a detached task and returns the receiver of its
+/// outcome.
+///
+/// This is what makes the acquisition cancellation-safe (see the module docs):
+/// the caller only awaits a `oneshot`, so its own future can be dropped at any
+/// point without interrupting the spawn. The detached task notices the dropped
+/// receiver (`Sender::is_closed`) and cleans up after itself: it releases the
+/// reservation and stops the process tree instead of leaving a `Starting` entry
+/// behind.
+fn spawn_detached(
+    inner: &Arc<Inner>,
+    session: Arc<Session>,
+    victim: Option<Arc<Session>>,
+    user: TunerUser,
+    tap: SessionTap,
+) -> oneshot::Receiver<Result<Subscription, SpawnFailure>> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(spawn_and_promote(
+        Arc::clone(inner),
+        session,
+        victim,
+        user,
+        tap,
+        tx,
+    ));
+    rx
 }
 
 /// Outcome of waiting for the first pipeline chunk.
@@ -1775,12 +2059,17 @@ enum Readiness {
     Ended(String),
     TimedOut,
     ShuttingDown,
+    /// The requester dropped the acquire future.
+    Cancelled,
 }
-/// Waits for the first chunk, aborting promptly when shutdown starts so a slow
-/// tuner cannot delay `SessionManager::shutdown`.
+
+/// Waits for the first chunk, aborting promptly when shutdown starts or the
+/// requester disappears, so a slow tuner cannot delay `SessionManager::shutdown`
+/// and a cancelled request releases its reservation at once.
 async fn await_readiness(
     inner: &Arc<Inner>,
     readiness: oneshot::Receiver<Option<String>>,
+    notify: &mut oneshot::Sender<Result<Subscription, SpawnFailure>>,
 ) -> Readiness {
     let mut readiness = readiness;
     let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
@@ -1791,6 +2080,7 @@ async fn await_readiness(
                 Ok(Some(reason)) => return Readiness::Ended(reason),
                 Err(_) => return Readiness::Ended("pipeline dropped readiness".to_string()),
             },
+            _ = notify.closed() => return Readiness::Cancelled,
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if inner.shutting_down.load(Ordering::SeqCst) {
                     return Readiness::ShuttingDown;
@@ -1868,6 +2158,50 @@ async fn wait_before_retry(
         _ = tokio::time::sleep(STARTUP_POLL) => {}
     }
     true
+}
+
+/// Owns a freshly built process tree until it is published to
+/// [`Session::process`].
+///
+/// If the spawning task is dropped between the spawn and the publication (a
+/// runtime shutdown, an aborted task), the tree would otherwise leak: the
+/// session's registry slot is cleaned up by [`ReservationGuard`], but the
+/// process group itself is only reachable through this guard at that moment.
+/// Dropping it therefore stops the tree in a detached task, or — when no runtime
+/// is left to run that task — signals the groups directly.
+struct TreeGuard(Option<ProcessTree>);
+
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        let Some(tree) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { tree.stop().await });
+            }
+            Err(_) => {
+                let mut pids = tree.tuner.pids().to_vec();
+                if let Some(pipeline) = &tree.pipeline {
+                    pids.extend_from_slice(pipeline.pids());
+                }
+                for pid in pids {
+                    signal_group(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
+/// Sends `signal` to the process group led by `pid`, ignoring an invalid PID.
+fn signal_group(pid: u32, signal: libc::c_int) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: `killpg` only takes a pgid and a signal number.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, signal);
+    }
 }
 
 /// Spawns the tuner and pipeline for a reserved session and starts the pump.
@@ -1954,13 +2288,18 @@ async fn start_process_tree(
     *lock(&session.broadcaster) = Some(sender.clone());
     let (readiness_tx, readiness_rx) = oneshot::channel();
 
+    // Owned by the guard until it is published below: a task dropped in the
+    // window between the spawn and the publication (a cancelled acquire that
+    // reaches `start_process_tree`'s awaits) must not leak the tree.
+    let mut tree = TreeGuard(Some(ProcessTree {
+        tuner,
+        pipeline,
+        stopped: AtomicBool::new(false),
+    }));
+
     {
         let mut slot = session.process.lock().await;
-        *slot = Some(ProcessTree {
-            tuner,
-            pipeline,
-            stopped: AtomicBool::new(false),
-        });
+        *slot = tree.0.take();
     }
     // Close the race with `shutdown` / `release_reservation`: both set a
     // non-`Starting` phase before draining, so a tree stored after their stop
@@ -2503,6 +2842,222 @@ mod tests {
             started_at: SystemTime::now(),
             tap: SessionTap::Raw,
         }
+    }
+
+    /// Waits until the reservation has spawned its process tree and returns the
+    /// PIDs of that tree.
+    async fn wait_for_pids(manager: &SessionManager) -> Vec<u32> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let pids: Vec<u32> = manager
+                .sessions_snapshot()
+                .iter()
+                .flat_map(|session| session.pids.clone())
+                .collect();
+            if !pids.is_empty() {
+                return pids;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session never spawned"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits until no session is registered and every PID is gone.
+    async fn wait_for_cleanup(manager: &SessionManager, pids: &[u32]) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if manager.sessions_snapshot().is_empty()
+                && pids.iter().all(|pid| !process_exists(*pid))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup did not finish: {:?}",
+                manager.sessions_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_acquire_releases_the_reservation_and_stops_the_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let marker = dir.path().join("signal");
+        // No output until the marker exists: the readiness gate stays closed,
+        // which is exactly the window a cancelled request used to leak in.
+        let command = format!(
+            "sh -c \"if test -f {}; then cat {}; else sleep 30; fi; sleep 30\"",
+            marker.display(),
+            path.display()
+        );
+        let tuners = tuner_yaml("t0", &["GR"], &command);
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        // Drop the acquire future while the detached spawn is still waiting for
+        // readiness: the requester is gone, so the reservation must be
+        // released and the tree stopped.
+        let acquire = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(400),
+                    manager.acquire("GR", "27", user("cancelled", 0), None, true),
+                )
+                .await
+            }
+        });
+        let pids = wait_for_pids(&manager).await;
+        let result = acquire.await.expect("acquire task");
+        assert!(result.is_err(), "the acquire must have been cancelled");
+
+        // (a) no `Starting` reservation may remain.
+        assert!(
+            manager
+                .sessions_snapshot()
+                .iter()
+                .all(|session| session.phase != SessionPhase::Starting),
+            "a Starting reservation leaked: {:?}",
+            manager.sessions_snapshot()
+        );
+        // (b) the process tree is stopped, (c) the tuner is free again.
+        wait_for_cleanup(&manager, &pids).await;
+        assert!(!manager.tuners_snapshot()[0].is_using);
+
+        // A subsequent acquire of the same tuner succeeds.
+        std::fs::write(&marker, b"go").expect("marker");
+        let mut subscription = manager
+            .acquire("GR", "27", user("later", 0), None, true)
+            .await
+            .expect("the tuner must be usable again");
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_takeover_does_not_orphan_the_victim_tree() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // Ignoring SIGTERM makes the teardown take the whole grace period
+        // before SIGKILL: that is the window in which a cancelled takeover used
+        // to leave a half-killed, unreachable tree behind. A script file keeps
+        // the quoting out of the YAML fixture.
+        let script = dir.path().join("stubborn.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap '' TERM\ncat {}\nsleep 30\n",
+                path.display()
+            ),
+        )
+        .expect("write tuner script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+        let tuners = tuner_yaml("t0", &["GR"], &script.display().to_string());
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let mut victim = manager
+            .acquire("GR", "27", user("low", 0), None, true)
+            .await
+            .expect("victim acquire");
+        let victim_pids = manager.sessions_snapshot()[0].pids.clone();
+        let _ = read_at_least(&mut victim.rx, PACKET, Duration::from_secs(5)).await;
+
+        let takeover = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(300),
+                    manager.acquire("GR", "28", user("high", 10), None, true),
+                )
+                .await
+            }
+        });
+        let result = takeover.await.expect("takeover task");
+        assert!(
+            result.is_err(),
+            "the takeover must have been cancelled mid-teardown"
+        );
+
+        // The victim is already out of the registry when the request is
+        // dropped, so only the detached teardown (which stays reachable by
+        // `shutdown`) can still kill it. It must.
+        wait_for_cleanup(&manager, &victim_pids).await;
+        for pid in &victim_pids {
+            assert!(
+                !process_exists(*pid),
+                "victim pid {pid} survived the cancelled takeover"
+            );
+        }
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_viewer_takeover_marks_the_scan_session_preempted() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27"), ("GR", "28")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+
+        let scan = manager
+            .acquire_scan(
+                "GR",
+                "27",
+                user("scan", SCAN_PRIORITY),
+                SessionTap::Raw,
+                false,
+            )
+            .await
+            .expect("scan acquire");
+        assert!(!scan.preempted.is_preempted());
+
+        // A legitimate viewer beats the scan: the viewer wins the tuner, and
+        // the scan can tell that it lost to a user rather than to no signal.
+        let mut viewer = manager
+            .acquire("GR", "28", user("viewer", 0), None, true)
+            .await
+            .expect("the viewer must win over the scan");
+        assert!(
+            scan.preempted.is_preempted(),
+            "a user takeover must be distinguishable from no signal"
+        );
+        let bytes = read_at_least(&mut viewer.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET, "the viewer must receive data");
+
+        manager.shutdown().await;
     }
 
     /// Receives chunks until `want` bytes arrived or the stream ended, returning
@@ -4156,16 +4711,17 @@ mod tests {
                 _ => panic!("expected a reservation"),
             }
         };
-        let result = spawn_and_promote(
-            &manager.inner,
+        let (notify, result) = oneshot::channel();
+        tokio::spawn(spawn_and_promote(
+            Arc::clone(&manager.inner),
             reservation,
             Some(Arc::clone(&selected_victim)),
-            &user("b", 0),
+            user("b", 0),
             SessionTap::Raw,
-        )
-        .await;
-        match result {
-            Err(SpawnFailure::Aborted(AcquireError::Busy)) => {}
+            notify,
+        ));
+        match result.await {
+            Ok(Err(SpawnFailure::Aborted(AcquireError::Busy))) => {}
             other => panic!("expected the takeover to be abandoned: {other:?}"),
         }
         assert_eq!(victim.phase(), SessionPhase::Ready);

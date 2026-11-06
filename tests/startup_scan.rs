@@ -35,6 +35,19 @@ fn packet(pid: u16, payload_unit_start: bool, cc: u8, payload: &[u8]) -> Vec<u8>
 }
 
 fn section(table_id: u8, id: u16, rest: &[u8]) -> Vec<u8> {
+    section_with(table_id, id, 0xC1, 0x00, 0x00, rest)
+}
+
+/// A section with explicit `version_and_current`, `section_number` and
+/// `last_section_number`.
+fn section_with(
+    table_id: u8,
+    id: u16,
+    version_and_current: u8,
+    section_number: u8,
+    last_section_number: u8,
+    rest: &[u8],
+) -> Vec<u8> {
     let section_length = 5 + rest.len() + 4;
     let mut bytes = vec![
         table_id,
@@ -42,9 +55,9 @@ fn section(table_id: u8, id: u16, rest: &[u8]) -> Vec<u8> {
         section_length as u8,
         (id >> 8) as u8,
         id as u8,
-        0xC1,
-        0x00,
-        0x00,
+        version_and_current,
+        section_number,
+        last_section_number,
     ];
     bytes.extend_from_slice(rest);
     let crc = crc32_mpeg2(&bytes);
@@ -64,6 +77,18 @@ fn pat_section(tsid: u16, programs: &[(u16, u16)]) -> Vec<u8> {
 }
 
 fn sdt_section(original_network_id: u16, tsid: u16, services: &[(u16, u8, &str)]) -> Vec<u8> {
+    sdt_section_with(0x42, original_network_id, tsid, 0, 0, services)
+}
+
+/// An SDT section with an explicit table id and section numbers.
+fn sdt_section_with(
+    table_id: u8,
+    original_network_id: u16,
+    tsid: u16,
+    section_number: u8,
+    last_section_number: u8,
+    services: &[(u16, u8, &str)],
+) -> Vec<u8> {
     let mut loop_rest = Vec::new();
     for &(service_id, service_type, name) in services {
         let mut encoded = vec![0x1B, 0x28, 0x4A];
@@ -84,7 +109,14 @@ fn sdt_section(original_network_id: u16, tsid: u16, services: &[(u16, u8, &str)]
         0xFF,
     ];
     rest.extend_from_slice(&loop_rest);
-    section(0x42, tsid, &rest)
+    section_with(
+        table_id,
+        tsid,
+        0xC1,
+        section_number,
+        last_section_number,
+        &rest,
+    )
 }
 
 fn nit_section(network_id: u16) -> Vec<u8> {
@@ -94,9 +126,16 @@ fn nit_section(network_id: u16) -> Vec<u8> {
 }
 
 fn section_packets(pid: u16, section: &[u8]) -> Vec<u8> {
+    section_packets_with_cc(pid, section, 0)
+}
+
+/// Like [`section_packets`] but starting at `cc`: two sections on the same PID
+/// need different continuity counters, or the assembler sees the second one as
+/// a retransmission of the first.
+fn section_packets_with_cc(pid: u16, section: &[u8], start_cc: u8) -> Vec<u8> {
     let mut packets = Vec::new();
     let mut remaining = section;
-    let mut cc = 0u8;
+    let mut cc = start_cc;
     let mut first = true;
     while first || !remaining.is_empty() {
         let capacity = TS_PACKET_SIZE - 4 - usize::from(first);
@@ -112,6 +151,23 @@ fn section_packets(pid: u16, section: &[u8]) -> Vec<u8> {
         first = false;
     }
     packets
+}
+
+/// Builds a TS stream from `(pid, section)` pairs, keeping one continuity
+/// counter per PID so consecutive sections on the same PID are not mistaken for
+/// retransmissions.
+fn stream_of(sections: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut counters: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
+    let mut stream = Vec::new();
+    for (pid, section) in sections {
+        let cc = counters.entry(*pid).or_insert(0);
+        let packets = section_packets_with_cc(*pid, section, *cc);
+        // Each emitted packet consumed one continuity counter value.
+        let count = packets.len() / TS_PACKET_SIZE;
+        *cc = (*cc + count as u8) & 0x0F;
+        stream.extend_from_slice(&packets);
+    }
+    stream
 }
 
 /// Two services on one multiplex: PAT, SDT and NIT.
@@ -340,5 +396,248 @@ async fn startup_scan_releases_the_tuner_for_the_next_channel() {
         "both channels must be scanned: {channels:?}"
     );
     assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_ignores_an_sdt_other_and_still_finds_the_real_services() {
+    // The stream starts with the SDT-other (0x46) of another transponder, then
+    // carries the real SDT-actual (0x42) of this multiplex. Only the latter may
+    // reach the service table.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let stream = stream_of(&[
+        (
+            0x0000,
+            pat_section(TSID, &[(0x0408, 0x01F0), (0x0409, 0x01F1)]),
+        ),
+        (
+            0x0011,
+            sdt_section_with(
+                0x46,
+                NETWORK_ID,
+                0x1111,
+                0,
+                0,
+                &[(0x7001, 0x01, "Wrong Transponder")],
+            ),
+        ),
+        (
+            0x0011,
+            sdt_section(
+                NETWORK_ID,
+                TSID,
+                &[(0x0408, 0x01, "NHK General"), (0x0409, 0x01, "NHK E")],
+            ),
+        ),
+        (0x0010, nit_section(NETWORK_ID)),
+    ]);
+    let ts = fixture.write_ts("mux.ts", &stream);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&streaming_command(&ts), "true"),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+
+    let services = manager.services().list();
+    let names: Vec<&str> = services.iter().map(|record| record.name.as_str()).collect();
+    assert_eq!(names, ["NHK General", "NHK E"], "{services:?}");
+    assert!(
+        !services
+            .iter()
+            .any(|record| record.name == "Wrong Transponder"),
+        "the SDT-other must not contribute services: {services:?}"
+    );
+    assert!(services.iter().all(|record| record.tsid == TSID));
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_collects_every_section_of_a_multi_section_sdt() {
+    // A 3-section SDT-actual. Sections 2 and 0 arrive before section 1, so the
+    // scan must not stop at the first SDT section it sees.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let stream = stream_of(&[
+        (
+            0x0000,
+            pat_section(
+                TSID,
+                &[
+                    (0x0408, 0x01F0),
+                    (0x0409, 0x01F1),
+                    (0x040A, 0x01F2),
+                    (0x040B, 0x01F3),
+                ],
+            ),
+        ),
+        (
+            0x0011,
+            sdt_section_with(
+                0x42,
+                NETWORK_ID,
+                TSID,
+                2,
+                2,
+                &[(0x040A, 0x01, "Service Two")],
+            ),
+        ),
+        (
+            0x0011,
+            sdt_section_with(
+                0x42,
+                NETWORK_ID,
+                TSID,
+                0,
+                2,
+                &[(0x0408, 0x01, "Service Zero")],
+            ),
+        ),
+        (
+            0x0011,
+            sdt_section_with(
+                0x42,
+                NETWORK_ID,
+                TSID,
+                1,
+                2,
+                &[(0x0409, 0x01, "Service One")],
+            ),
+        ),
+        (0x0010, nit_section(NETWORK_ID)),
+    ]);
+    let ts = fixture.write_ts("mux.ts", &stream);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&streaming_command(&ts), "true"),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+
+    let mut ids: Vec<u16> = manager
+        .services()
+        .list()
+        .iter()
+        .map(|record| record.service_id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [0x0408, 0x0409, 0x040A],
+        "every section of the SDT must contribute: {:?}",
+        manager.services().list()
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_scan_api_reports_a_user_takeover_as_preempted() {
+    // A viewer takes the tuner while the scan is reading the channel. The
+    // channel must be reported as preempted (the startup scan retries it with
+    // the busy backoff), never as "no signal", which would write the channel
+    // off for the lifetime of the process.
+    use unituner::scan::{run_scan, ScanQuery};
+
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    // A stream without SI: the scan keeps reading until its budget, which is
+    // the window a viewer takeover has to land in.
+    let mut packet = vec![0x11u8; TS_PACKET_SIZE];
+    packet[0] = 0x47;
+    let ts = fixture.write_ts(
+        "silent.ts",
+        &[packet.clone(), packet.clone(), packet].concat(),
+    );
+    let command = streaming_command(&ts);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: good\n  types: [GR]\n  command: '{command}'\n"),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let config = fixture.config();
+    let mut query = ScanQuery::from_params(&std::collections::HashMap::from([
+        ("type".to_string(), "GR".to_string()),
+        ("minCh".to_string(), "27".to_string()),
+        ("maxCh".to_string(), "27".to_string()),
+        ("scanMode".to_string(), "Channel".to_string()),
+        // The channel is already configured: scan it again, without writing.
+        ("refresh".to_string(), "true".to_string()),
+        ("dryRun".to_string(), "true".to_string()),
+    ]))
+    .expect("query");
+    query.timeout = Duration::from_secs(20);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let scan = tokio::spawn({
+        let manager = manager.clone();
+        let config = Arc::clone(&config);
+        let dir = fixture.path.clone();
+        async move { run_scan(&manager, &config, &dir, &query, tx, None).await }
+    });
+
+    // Take the tuner over once the scan is streaming on it (a takeover cannot
+    // replace a reservation that is still starting).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let streaming = manager.sessions_snapshot().iter().any(|session| {
+            session.type_name == "GR"
+                && session.channel == "27"
+                && session.phase == unituner::session::SessionPhase::Ready
+        });
+        if streaming {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scan never acquired the tuner: {:?}",
+            manager.sessions_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // A different channel: a same-channel request would just join the scan.
+    let viewer = manager
+        .acquire(
+            "GR",
+            "28",
+            unituner::session::TunerUser::new("viewer", 0),
+            None,
+            true,
+        )
+        .await
+        .expect("the viewer must win over the scan");
+
+    let result = tokio::time::timeout(Duration::from_secs(15), scan)
+        .await
+        .expect("the scan must finish")
+        .expect("scan task");
+    result.expect("the scan itself must not fail");
+
+    let mut progress = String::new();
+    while let Ok(line) = rx.try_recv() {
+        progress.push_str(&line);
+    }
+    assert!(
+        progress.contains("preempted"),
+        "the scan must report the preemption instead of no signal: {progress:?}"
+    );
+
+    drop(viewer);
     manager.shutdown().await;
 }
