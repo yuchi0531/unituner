@@ -271,17 +271,20 @@ async fn embedded_assets_have_their_content_types() {
         css.contains(".subtabs"),
         "the sub-tab bar reuses the tab styling"
     );
-    // Material Design 2 tokens: the palette, the app-bar elevation shadow and
-    // the snackbar binding for `#message`.
-    assert!(css.contains("--md-primary: #6200ee"), "{css}");
-    assert!(css.contains("--md-error: #b00020"), "{css}");
+    // Material Design 2 dark-theme tokens: the palette, the surface overlays and
+    // the snackbar binding for `#message`. The UI is dark unconditionally.
+    assert!(css.contains("--md-primary: #bb86fc"), "{css}");
+    assert!(css.contains("--md-surface: #121212"), "{css}");
+    assert!(css.contains("--md-on-primary: #000000"), "{css}");
+    assert!(css.contains("--md-error: #cf6679"), "{css}");
+    assert!(css.contains("--md-surface-1: #1e1e1e"), "{css}");
     assert!(css.contains("--md-elevation-4"), "app bar elevation token");
     assert!(css.contains(".message"), "the snackbar styles #message");
-    assert!(
-        css.contains("#323232"),
-        "the snackbar uses the MD2 dark surface"
-    );
+    assert!(css.contains("#333"), "the snackbar surface on dark");
     assert!(css.contains("prefers-reduced-motion"), "{css}");
+    // The light-theme values are gone: this is a dark-only stylesheet.
+    assert!(!css.contains("--md-primary: #6200ee"), "{css}");
+    assert!(!css.contains("--md-surface: #ffffff"), "{css}");
 }
 
 #[tokio::test]

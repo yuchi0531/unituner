@@ -1,31 +1,56 @@
-/* unituner management UI (SPEC §10) — Material Design 2, hand-written, no framework. */
+/* unituner management UI (SPEC §10) — Material Design 2 dark theme, hand-written,
+   no framework. Dark is unconditional: every token below is a dark value, so a
+   light theme would be a one-block addition (see the commented block after
+   :root) rather than a rewrite. */
 
 :root {
-  /* Material 2 baseline palette, light theme. */
-  --md-primary: #6200ee;
+  /* Material 2 dark-theme palette. */
+  color-scheme: dark;
+  --md-primary: #bb86fc;
   --md-primary-variant: #3700b3;
   --md-secondary: #03dac6;
-  --md-error: #b00020;
-  --md-on-primary: #ffffff;
-  --md-surface: #ffffff;
-  --md-background: #fafafa;
-  --md-appbar: #6200ee;
-  --md-divider: rgba(0, 0, 0, 0.12);
-  --md-text: rgba(0, 0, 0, 0.87);
-  --md-text-secondary: rgba(0, 0, 0, 0.6);
-  --md-text-disabled: rgba(0, 0, 0, 0.38);
-  --md-hover: rgba(0, 0, 0, 0.04);
+  --md-error: #cf6679;
+  --md-on-primary: #000000;
+  --md-surface: #121212;
+  --md-background: #121212;
+  --md-appbar: #1f1f1f;
+  /* Elevation overlays on #121212. Cards, tiles and tables use step 1 and the
+     table header one more step; 4 and 6 complete the scale. */
+  --md-surface-1: #1e1e1e;
+  --md-surface-2: #232323;
+  --md-surface-4: #272727;
+  --md-surface-6: #2c2c2c;
+  --md-divider: rgba(255, 255, 255, 0.12);
+  --md-text: rgba(255, 255, 255, 0.87);
+  --md-text-secondary: rgba(255, 255, 255, 0.6);
+  --md-text-disabled: rgba(255, 255, 255, 0.38);
+  --md-hover: rgba(255, 255, 255, 0.06);
   --md-radius: 4px;
-  --md-elevation-1: 0 1px 2px 0 rgba(0, 0, 0, 0.14), 0 1px 3px 0 rgba(0, 0, 0, 0.12);
-  --md-elevation-2: 0 2px 2px 0 rgba(0, 0, 0, 0.14), 0 3px 1px -2px rgba(0, 0, 0, 0.12), 0 1px 5px 0 rgba(0, 0, 0, 0.2);
-  --md-elevation-4: 0 2px 4px -1px rgba(0, 0, 0, 0.2), 0 4px 5px 0 rgba(0, 0, 0, 0.14), 0 1px 10px 0 rgba(0, 0, 0, 0.12);
-  --md-elevation-6: 0 3px 5px -1px rgba(0, 0, 0, 0.2), 0 6px 10px 0 rgba(0, 0, 0, 0.14), 0 1px 18px 0 rgba(0, 0, 0, 0.12);
+  /* Shadows stay black; on dark only the app bar, FAB and snackbar use them,
+     cards/tables/buttons use the surface overlays instead. */
+  --md-elevation-4: 0 2px 4px -1px rgba(0, 0, 0, 0.4), 0 4px 5px 0 rgba(0, 0, 0, 0.28), 0 1px 10px 0 rgba(0, 0, 0, 0.24);
+  --md-elevation-6: 0 3px 5px -1px rgba(0, 0, 0, 0.4), 0 6px 10px 0 rgba(0, 0, 0, 0.28), 0 1px 18px 0 rgba(0, 0, 0, 0.24);
   --md-ease: cubic-bezier(0.4, 0, 0.2, 1);
   --md-transition: 200ms var(--md-ease);
   --radius: var(--md-radius);
 }
 
+/*
+ * light theme override (unused)
+ *
+ * Dark is unconditional, so shipping a light mode means setting
+ * <html data-theme="light"> from a toggle before first paint, adding
+ * `color-scheme: light` and redeclaring the tokens above with the MD2 light
+ * palette (light primary/on-primary, white surface, primary app bar,
+ * black-based divider/text/hover). Nothing light is shipped today; this
+ * comment only marks where that block would go.
+ */
+
 * { box-sizing: border-box; }
+
+/* Paint the root canvas too: the scroll overscroll area otherwise shows the UA
+   default (white) behind the body. */
+html { background: var(--md-background); }
 
 body {
   margin: 0;
@@ -40,17 +65,33 @@ code {
   font-size: 0.875em;
   padding: 1px 4px;
   border-radius: 3px;
-  background: rgba(0, 0, 0, 0.06);
+  background: rgba(255, 255, 255, 0.08);
 }
 
-/* App bar: MD2 primary top app bar with text tabs. */
+/* Dark scrollbars: the tables scroll horizontally, and the UA default is a
+   bright light-theme bar on a dark surface. */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.24); }
+
+/* App bar: MD2 surface top app bar with text tabs. */
 
 .topbar {
   position: sticky;
   top: 0;
   z-index: 20;
   background: var(--md-appbar);
-  color: var(--md-on-primary);
+  color: var(--md-text);
   box-shadow: var(--md-elevation-4);
 }
 
@@ -71,7 +112,7 @@ code {
   letter-spacing: 0.0125em;
 }
 
-.version { margin-left: auto; font-size: 12px; color: rgba(255, 255, 255, 0.7); }
+.version { margin-left: auto; font-size: 12px; color: var(--md-text-secondary); }
 
 .tabs {
   display: flex;
@@ -95,7 +136,7 @@ code {
   border-radius: 0;
   background: transparent;
   box-shadow: none;
-  color: rgba(255, 255, 255, 0.7);
+  color: var(--md-text-secondary);
   font-size: 14px;
   font-weight: 500;
   text-transform: uppercase;
@@ -106,8 +147,8 @@ code {
 /* Line the first label up with the app-bar title above it. */
 .tabs button:first-child { padding-left: 16px; }
 
-.tabs button:hover { color: var(--md-on-primary); }
-.tabs button.active { color: var(--md-on-primary); }
+.tabs button:hover { color: var(--md-text); }
+.tabs button.active { color: var(--md-primary); }
 
 /* The 2px active-tab indicator. */
 .tabs button::after {
@@ -117,7 +158,7 @@ code {
   bottom: 0;
   left: 0;
   height: 2px;
-  background: var(--md-on-primary);
+  background: var(--md-primary);
   transform: scaleX(0);
   transform-origin: center;
   transition: transform var(--md-transition);
@@ -164,7 +205,9 @@ button {
     border-color var(--md-transition), color var(--md-transition);
 }
 
-/* Pure-CSS MD2 ripple: a currentColor overlay that scales in on press. */
+/* Pure-CSS MD2 ripple: a currentColor overlay that scales in on press. Text and
+   outlined buttons tint with their label; contained buttons switch to white so
+   the overlay is not black-on-purple. */
 button::before {
   content: "";
   position: absolute;
@@ -177,7 +220,8 @@ button::before {
   transition: opacity 150ms var(--md-ease), transform 200ms var(--md-ease);
 }
 
-button:hover::before { opacity: 0.06; }
+/* Hover fills the whole surface; the press overlay is a scaled-in ripple. */
+button:hover::before { opacity: 0.08; transform: scale(1); }
 button:active::before { opacity: 0.12; transform: scale(1); }
 
 button.primary,
@@ -185,12 +229,11 @@ button.danger {
   color: var(--md-on-primary);
   background: var(--md-primary);
   border-color: transparent;
-  box-shadow: var(--md-elevation-2);
 }
 
-button.primary:hover { background: var(--md-primary-variant); }
-button.primary:hover,
-button.danger:hover { box-shadow: var(--md-elevation-4); }
+button.primary::before,
+button.danger::before,
+.fab::before { background: #fff; }
 
 button.danger { background: var(--md-error); }
 
@@ -204,7 +247,7 @@ button.primary:disabled,
 button.danger:disabled {
   opacity: 1;
   color: var(--md-text-disabled);
-  background: rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.12);
 }
 
 button.icon {
@@ -221,7 +264,9 @@ button.icon {
 button.icon:hover { background: var(--md-hover); color: var(--md-text); }
 
 button.icon.danger { color: var(--md-error); background: transparent; }
-button.icon.danger:hover { background: rgba(176, 0, 32, 0.08); color: var(--md-error); }
+/* The hover tint darkens the surface just enough to cost contrast, so the label
+   lifts to the light error tone and stays above 4.5:1. */
+button.icon.danger:hover { background: rgba(207, 102, 121, 0.1); color: #ef9a9a; }
 
 /* Extended FAB for the global Restart action. */
 .fab {
@@ -239,7 +284,8 @@ button.icon.danger:hover { background: rgba(176, 0, 32, 0.08); color: var(--md-e
   box-shadow: var(--md-elevation-6);
 }
 
-.fab:hover { background: var(--md-primary-variant); box-shadow: var(--md-elevation-6); }
+/* The hover/press tint comes from the white ripple overlay above; shadows stay
+   at elevation 6 so the FAB keeps floating. */
 .fab:disabled { opacity: 0.38; }
 
 button:focus-visible,
@@ -248,7 +294,9 @@ button:focus-visible,
   outline-offset: 2px;
 }
 
-.topbar button:focus-visible { outline-color: var(--md-on-primary); }
+/* Purple is invisible against the purple-ish app bar tint, so focus rings there
+   are white. */
+.topbar button:focus-visible { outline-color: #fff; }
 
 /* Page and typography. */
 
@@ -297,9 +345,8 @@ h3 {
 .count {
   min-width: 112px;
   padding: 12px 16px;
-  background: var(--md-surface);
+  background: var(--md-surface-1);
   border-radius: var(--md-radius);
-  box-shadow: var(--md-elevation-1);
 }
 
 .count b { display: block; font-size: 24px; font-weight: 400; line-height: 1.2; }
@@ -315,9 +362,8 @@ h3 {
 
 .card {
   padding: 16px;
-  background: var(--md-surface);
+  background: var(--md-surface-1);
   border-radius: var(--md-radius);
-  box-shadow: var(--md-elevation-1);
 }
 
 .card.disabled { color: var(--md-text-secondary); }
@@ -349,12 +395,12 @@ h3 {
 
 .kv {
   padding: 16px;
-  background: var(--md-surface);
+  background: var(--md-surface-1);
   border-radius: var(--md-radius);
-  box-shadow: var(--md-elevation-1);
 }
 
-/* MD2 chips: 32px tall, 16px radius, tonal fill. */
+/* MD2 chips: 32px tall, 16px radius, tonal fill. The text tints are the light
+   variants so every chip keeps >=4.5:1 on its tonal fill. */
 .badge {
   display: inline-flex;
   align-items: center;
@@ -362,7 +408,7 @@ h3 {
   padding: 0 12px;
   border: 0;
   border-radius: 16px;
-  background: rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.08);
   color: var(--md-text-secondary);
   font-size: 12px;
   font-weight: 500;
@@ -371,9 +417,9 @@ h3 {
   white-space: nowrap;
 }
 
-.badge.ok { background: rgba(76, 175, 80, 0.16); color: #1b5e20; }
-.badge.warn { background: rgba(255, 193, 7, 0.18); color: #6b5200; }
-.badge.bad { background: rgba(176, 0, 32, 0.12); color: var(--md-error); }
+.badge.ok { background: rgba(76, 175, 80, 0.24); color: #81c784; }
+.badge.warn { background: rgba(255, 193, 7, 0.24); color: #ffd54f; }
+.badge.bad { background: rgba(207, 102, 121, 0.24); color: #ef9a9a; }
 
 /* Data tables. */
 
@@ -403,12 +449,14 @@ td.hint { height: 52px; }
 
 .scroll {
   margin-bottom: 16px;
-  background: var(--md-surface);
+  background: var(--md-surface-1);
   border-radius: var(--md-radius);
-  box-shadow: var(--md-elevation-1);
   overflow-x: auto;
   overflow-y: hidden;
 }
+
+/* The header row sits one elevation step above the table surface. */
+.scroll thead th { background: var(--md-surface-2); }
 
 .scroll table { min-width: 520px; }
 
@@ -434,9 +482,9 @@ select {
   font-family: inherit;
   font-size: 14px;
   color: var(--md-text);
-  background: rgba(0, 0, 0, 0.06);
+  background: rgba(255, 255, 255, 0.09);
   border: 0;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.42);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.42);
   border-radius: 4px 4px 0 0;
   transition: border-color var(--md-transition), box-shadow var(--md-transition),
     background-color var(--md-transition);
@@ -444,7 +492,7 @@ select {
 
 input[type="text"]:hover,
 input[type="number"]:hover,
-select:hover { background: rgba(0, 0, 0, 0.09); }
+select:hover { background: rgba(255, 255, 255, 0.13); }
 
 input:focus,
 select:focus {
@@ -453,7 +501,7 @@ select:focus {
   box-shadow: inset 0 -1px 0 var(--md-primary);
 }
 
-input::placeholder { color: var(--md-text-secondary); }
+input::placeholder { color: var(--md-text-disabled); }
 
 input[type="checkbox"] {
   width: 18px;
@@ -504,8 +552,8 @@ footer {
   max-width: min(560px, calc(100vw - 32px));
   padding: 14px 16px;
   border-radius: var(--md-radius);
-  background: #323232;
-  color: #ffffff;
+  background: #333;
+  color: #fff;
   font-size: 14px;
   line-height: 1.43;
   white-space: pre-wrap;
@@ -515,7 +563,7 @@ footer {
 }
 
 .message:empty { display: none; }
-.message.error { background: var(--md-error); }
+.message.error { background: #4a2229; color: #ffb4ab; }
 
 @keyframes snackbar-in {
   from { opacity: 0; transform: translateY(16px); }
