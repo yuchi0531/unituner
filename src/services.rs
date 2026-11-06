@@ -40,7 +40,7 @@
 //! maps to 404). Scanning is channel-scoped, so the scan path should use
 //! [`resolve_on_channel`](ServiceTable::resolve_on_channel) instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Identifier of a service: `network_id * 100_000 + service_id`.
@@ -577,10 +577,68 @@ impl ServiceTable {
     /// This is the refresh half of a re-scan: drop a channel's stale services,
     /// then repopulate them as the new SI arrives. Returns how many records
     /// were removed.
+    ///
+    /// Prefer [`retain_channel`](Self::retain_channel) when the new SI has
+    /// already been merged in: it does the same thing without dropping the
+    /// services the new scan just found.
     pub fn remove_channel(&self, channel_type: &str, channel: &str) -> usize {
         let mut records = self.write();
         let before = records.len();
         records.retain(|key, _| !key.is_on(channel_type, channel));
+        before - records.len()
+    }
+
+    /// Drops the records for `(channel_type, channel)` whose service id is not
+    /// in `keep`.
+    ///
+    /// This is what a refresh scan must call: after the new SI has been written
+    /// with [`upsert`](Self::upsert), the services that disappeared from the
+    /// multiplex are exactly those still stored on that channel whose sid is
+    /// not among the sids the scan just found. Unlike
+    /// [`remove_channel`](Self::remove_channel) it keeps the fresh records, so
+    /// there is no window where `/api/services/{id}/stream` answers 404 for a
+    /// service that is still on air.
+    ///
+    /// **Scan layer call site** (the scan owner must add it, `scan.rs`):
+    ///
+    /// ```text
+    /// // in update_service_table(), after the upsert loop:
+    /// let keep: HashSet<u16> = found.iter().map(|s| s.service_id).collect();
+    /// if mode == ScanMode::Channel {
+    ///     services.retain_channel(type_name, &entries[0].channel, &keep);
+    /// } else {
+    ///     for entry in entries {
+    ///         services.retain_channel(type_name, &entry.channel, &keep);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// (Only call it when the scan produced at least one service for the
+    /// channel: a no-signal result must not wipe the table.) Returns how many
+    /// records were removed.
+    pub fn retain_channel(&self, channel_type: &str, channel: &str, keep: &HashSet<u16>) -> usize {
+        let mut records = self.write();
+        let before = records.len();
+        records.retain(|key, record| {
+            !key.is_on(channel_type, channel) || keep.contains(&record.service_id)
+        });
+        before - records.len()
+    }
+
+    /// Removes records that are not bound to any channel (`channel == None`).
+    ///
+    /// Records are created unbound while the SI is being parsed and are moved
+    /// onto a channel by [`upsert`](Self::upsert) /
+    /// [`set_channel`](Self::set_channel). A record whose service never appears
+    /// on a scanned channel (SDT-other, a stale NIT, a channel that failed
+    /// mid-scan) would otherwise stay in the table for ever and keep showing up
+    /// in `/api/services`. The scan layer should call this once after a
+    /// completed, non-dry-run scan; the API keeps serving channel-less records
+    /// in the meantime. Returns how many records were removed.
+    pub fn prune_unbound(&self) -> usize {
+        let mut records = self.write();
+        let before = records.len();
+        records.retain(|key, _| key.channel_type.is_some());
         before - records.len()
     }
 
@@ -822,6 +880,73 @@ mod tests {
         assert!(table.get_on_channel("GR", "27", id).is_none());
         assert!(table.get_on_channel("CABLE_CATV", "C17", id).is_some());
         assert_eq!(table.remove_channel("GR", "27"), 0);
+    }
+
+    #[test]
+    fn retain_channel_drops_only_the_services_the_scan_no_longer_found() {
+        let table = ServiceTable::new();
+        table.insert(on_channel(1, 10, 27, "kept", "GR", "27"));
+        table.insert(on_channel(1, 10, 28, "stale", "GR", "27"));
+        table.insert(on_channel(1, 10, 28, "other channel", "GR", "28"));
+        table.insert(on_channel(1, 10, 29, "CATV copy", "CABLE_CATV", "C17"));
+
+        let keep: HashSet<u16> = HashSet::from([27]);
+        assert_eq!(table.retain_channel("GR", "27", &keep), 1);
+
+        assert_eq!(table.len(), 3);
+        assert!(table
+            .get_on_channel("GR", "27", ServiceItemId::new(1, 27))
+            .is_some());
+        assert!(table
+            .get_on_channel("GR", "27", ServiceItemId::new(1, 28))
+            .is_none());
+        // Other channels are untouched.
+        assert!(table
+            .get_on_channel("GR", "28", ServiceItemId::new(1, 28))
+            .is_some());
+        assert!(table
+            .get_on_channel("CABLE_CATV", "C17", ServiceItemId::new(1, 29))
+            .is_some());
+
+        // Idempotent: nothing left to drop.
+        assert_eq!(table.retain_channel("GR", "27", &keep), 0);
+    }
+
+    #[test]
+    fn retain_channel_keeps_fresh_records_without_a_drop_window() {
+        // The refresh order the scan uses: merge the new SI first, then prune.
+        let table = ServiceTable::new();
+        table.insert(on_channel(1, 10, 27, "same sid, old name", "GR", "27"));
+        table.upsert(on_channel(1, 10, 27, "same sid, new name", "GR", "27"));
+        table.upsert(on_channel(1, 10, 30, "brand new", "GR", "27"));
+
+        let keep: HashSet<u16> = HashSet::from([27, 30]);
+        assert_eq!(table.retain_channel("GR", "27", &keep), 0);
+        assert_eq!(
+            table
+                .get_on_channel("GR", "27", ServiceItemId::new(1, 27))
+                .expect("record")
+                .name,
+            "same sid, new name"
+        );
+        assert!(table
+            .get_on_channel("GR", "27", ServiceItemId::new(1, 30))
+            .is_some());
+    }
+
+    #[test]
+    fn prune_unbound_removes_only_channel_less_records() {
+        let table = ServiceTable::new();
+        table.insert(on_channel(1, 10, 27, "bound", "GR", "27"));
+        table.insert(record(1, 10, 40, "unbound one"));
+        table.insert(record(2, 20, 41, "unbound two"));
+
+        assert_eq!(table.prune_unbound(), 2);
+        assert_eq!(table.len(), 1);
+        assert!(table
+            .get_on_channel("GR", "27", ServiceItemId::new(1, 27))
+            .is_some());
+        assert_eq!(table.prune_unbound(), 0);
     }
 
     #[test]
