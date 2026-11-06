@@ -35,14 +35,28 @@ allowed_cidrs:                       # 許容 CIDR。既定は RFC1918 + loopbac
   - 127.0.0.0/8
   - 172.16.0.0/12
   - 192.168.0.0/16
+allowed_hosts: []                    # 任意。webui が追加で受け付ける Host 名（既定は空）
 idle_timeout_secs: 5                 # 既定 5。最後の購読者が抜けてからプロセス群を kill
 subscriber_buffer_chunks: 1024       # 既定 1024。購読者ごとの bounded queue 容量（chunks）
 chunk_size_bytes: 65536              # 既定 65536。購読者へ渡す chunk サイズ（64KB）
+max_subscribers_per_session: 32      # 既定 32。1 セッションの購読者上限。超過は 429
+max_subscribers_per_ip: 16           # 既定 16。1 クライアント IP の全セッション合計上限。超過は 429
+max_sessions: 16                     # 既定 16。同時セッション数（Starting/Stopping 含む）。超過は 429
+max_subscriber_buffer_bytes: 268435456   # 既定 256MiB。全購読者キューの合計上限。超過は 429
 ```
 
 - `addr` の既定値（loopback か全インタフェースか）は実装時に確定し、本書と README に記す。
   - 確定: 既定は `":40772"`（全インタフェース 0.0.0.0:40772）。`--config-dir` 既定は `/etc/unituner`。
 - `allowed_cidrs` はネットワーク制御であり認証ではない（webui も同じ）。README 制限欄に明記する。
+- `allowed_hosts` は webui の `Host` 許可リスト（任意・既定は空）。
+  - 空のときは loopback / `allowed_cidrs` 内の IP / `localhost` の `Host` だけを受け付ける。これは DNS リバインディング対策であり、名前や逆プロキシ経由で公開する配備では、そのホスト名を `allowed_hosts` に**必ず列挙する**。
+  - 値はポート・スキーム・ブラケットを含まないホスト名か IP リテラル。大文字小文字は区別しない。
+- 上限フィールド（`max_*`）はすべて 1 以上。0 は「無制限」ではなく設定エラーとして拒否する。
+  - `max_subscribers_per_session` は 1 セッションあたりの同時購読者数。
+  - `max_subscribers_per_ip` は 1 クライアント IP が**全セッション合計**で持てる購読者数。TCP 接続元 IP で数え、`X-Forwarded-For` は無視する（クライアントが詐称できるため）。
+  - `max_sessions` は同時に存在するセッションオブジェクト数（登録中の `Starting` / `Stopping` も含む）。奪取で退避した victim はレジストリから外れた時点で数えない（その購読者は EOF に向かう途中であり、置換の予約を妨げないため）。
+  - `max_subscriber_buffer_bytes` は全購読者キューの合計バイト上限。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約するため、既定 256 MiB では同時 4 購読者まで。`max_subscribers_per_session: 32` の 32 × 64 MiB = 2 GiB を防ぐための予算である。
+  - 上限を超えたストリーム要求は **429**（`{"code":429,"reason":"Too Many Requests"}`）。既存の購読者・セッションには影響しない。判定はチューナー選定より前（新規セッションは予約時、既存セッションへの参加は attach 時）に行うため、通常はチューナーを起動しない。
 - webui では **閲覧のみ**（編集不可。意図的に誤設定でロックアウトすることを防ぐ）。
 
 ### 3.2 `tuners.yml`
@@ -170,6 +184,7 @@ types:                                # チャンネルタイプ → pipeline �
 2. 完全フリーのタイプ適合チューナーがあれば、それで起動する。
 3. 空き無し → 6.1 の奪取条件を満たす使用中チューナーがあれば、最弱の victim を kill して奪取する。
 4. それ以外は HTTP **503** `{"code":503,"reason":"Tuner Resource Unavailable"}`。
+5. ただし `server.yml` の上限（§7）を超える要求は、チューナー選定より前に HTTP **429** `{"code":429,"reason":"Too Many Requests"}` で拒否する。
 
 - **原子的 pick-and-spawn**: pick→reserve→spawn は単一ロッカー（登録レジストリ）で原子化し、同時 spawn や二重 kill を防ぐ。「Starting」状態を導入して、pick されたチューナーは他要求から不可視にする。
 - **0-user セッションの再利用**: idle 期間中の 0-user セッションについて、同 `(type, channel)` なら再利用する。別 channel なら kill + 再起動する（SIGTERM の-latency が発生する点は仕様として記録）。
@@ -208,7 +223,20 @@ types:                                # チャンネルタイプ → pipeline �
   - broadcast チャンネルの容量（tokio broadcast の Lagged 発生可否）も定義する。mpsc 側の容量だけでなく broadcast 容量も budget に含める。
 - 最後の購読者が抜けた後、`idle_timeout`（既定 5 秒）でプロセス群を kill する。
   - idle timeout と subscriber 上限は `server.yml` で変更可能にする（webui では閲覧のみなので値は定義だけ行う）。
-- per-IP / per-session の購読者数・セッション数に cap を設け、DoS（subprocess 爆発・メモリ枯渇）を防ぐ。既定あり（実装時に設定し README に記す）。
+- per-IP / per-session の購読者数・セッション数に cap を設け、DoS（subprocess 爆発・メモリ枯渇）を防ぐ。
+  - **実装済み**。`server.yml` の次のフィールドで設定する（すべて任意、既定値あり、1 以上。0 は「無制限」ではなく設定エラー）。
+    | フィールド | 既定 | 意味 |
+    |---|---|---|
+    | `max_subscribers_per_session` | `32` | 1 セッションあたりの同時購読者数 |
+    | `max_subscribers_per_ip` | `16` | 1 クライアント IP が全セッション合計で持てる購読者数（TCP 接続元で数え、`X-Forwarded-For` は無視） |
+    | `max_sessions` | `16` | 同時に存在するセッション数（登録中の `Starting` / `Stopping` も含む） |
+    | `max_subscriber_buffer_bytes` | `268435456`（256 MiB） | 全購読者キューの合計バイト上限 |
+  - `max_sessions: 1` 相当の「1 チューナー 1 セッション」は既存の不変条件（`(tuner, type, channel)` ごとに 1 プロセス木、1 チャンネル 1 セッション）で保証されているため、`max_sessions_per_tuner` という独立フィールドは設けない。
+  - 購読者 1 人は `chunk_size_bytes × subscriber_buffer_chunks`（既定 65536 × 1024 ≈ 64 MiB）を worst-case で予約する。`max_subscribers_per_session: 32` をそのまま許すと 1 セッションで 2 GiB になるため、`max_subscriber_buffer_bytes` で合計を抑える。既定 256 MiB では同時 4 購読者まで。
+  - 上限は acquire 時にセッションレジストリのロック下で判定する（新規セッションは `reserve`、既存セッションへの参加は `attach`）。超過した要求は **429** `{"code":429,"reason":"Too Many Requests"}` を返し、既存の購読者はそのまま配信を続ける。参加の拒否は spawn 前に決まるため、拒否された要求がチューナーを起動することはない。
+  - カウンタは別カウンタではなく購読者リストから導出する。購読解除（クライアントの切断 / EOF / idle / 奪取による停止）は購読者エントリを消す同じ経路で行われるため、二重減算も取りこぼしもない。
+  - 予約中（`Starting`）のセッションは、まだ購読者がいなくても 1 人分として数える。これにより並行 acquire が同じ最後の 1 枠を同時に通過できない。
+  - 起動時 / 探索のスキャンも通常購読者と同じ枠を 1 つ使う（専用バッファ要件は未実装）。上限が厳しい構成ではスキャンが「no signal」としてスキップされうるため、同時視聴数を増やすときは `max_subscriber_buffer_bytes` も合わせて上げる。
 
 ## 8. スキャン（起動時サービス検出 / チャンネル探索 API）
 
@@ -298,7 +326,7 @@ Found 1 channels for 13
 ## 10. webui（フル管理 UI）
 
 - 埋め込み静的アセット + vanilla JS。フロントエンドビルド工程なし。axum で配信。
-- 認証なし（`allowed_cidrs` のみ）。単一バイナリに埋め込むため、遠隔コード実行面であることは README に明記する。
+- 認証なし（`allowed_cidrs` + `allowed_hosts`）。`allowed_hosts` は `Host` 許可リストで、空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理する（DNS リバインディング対策）。単一バイナリに埋め込むため、遠隔コード実行面であることは README に明記する。
 - 編集対象：**tuners / channels / pipelines**（追加・編集・削除）。**server.yml は閲覧のみ**。
 - 内部 API は mirakurun 互換外の独自名前空間 `/webui/api/*`：
   - `GET/PUT /webui/api/{tuners,channels,pipelines}`
@@ -360,6 +388,7 @@ unituner/
 - スキャンの定期 re-scan の要否・間隔
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` 同時指定時の優先規則
 - per-IP/per-session cap の既定値
+  - 確定: `max_subscribers_per_session: 32` / `max_subscribers_per_ip: 16` / `max_sessions: 16` / `max_subscriber_buffer_bytes: 268435456`（256 MiB）。超過は 429。詳細は §7。
 - `.bak` の世代管理方針
 - `PUT /api/config/channels/scan` の `skipCh` / `minSubCh` / `maxSubCh` のカンマ区切り入力の正規化
 
@@ -369,7 +398,7 @@ unituner/
 - priority の multi-header 集約は未対応（単一値前提）
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
-- webui は認証なし（allowed_cidrs のみ。LAN 内のみに配備すること）
+- webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
 - スキャン完了までは `/api/services/{id}/stream` が 404 しうる
 - `PUT /api/config/channels/scan` は curl 等で直接叩く（webui には出さない）。`async` / `GET` ポーリングは非対応。channels.yml 書き換え後は **RESTART REQUIRED**（自動再起動しない）
 - 探索 API は既存エントリを維持し、**追加のみ**行う（type 単位の完全置換はしない。`refresh=true` のときのみ既存を置換）

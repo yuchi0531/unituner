@@ -41,20 +41,36 @@ allowed_cidrs:
   - 127.0.0.0/8
   - 172.16.0.0/12
   - 192.168.0.0/16
+allowed_hosts: []                 # web UI が追加で受け付ける Host 名（任意）
 idle_timeout_secs: 5
 subscriber_buffer_chunks: 1024
 chunk_size_bytes: 65536
+max_subscribers_per_session: 32
+max_subscribers_per_ip: 16
+max_sessions: 16
+max_subscriber_buffer_bytes: 268435456
 ```
 
 | フィールド | 既定値 | 検証・挙動 |
 |---|---|---|
 | `addr` | `":40772"` | 空不可。`IP:port` として解釈できること。先頭 `:` は `0.0.0.0` を補う |
 | `allowed_cidrs` | RFC1918 + loopback の 4 件 | 各要素が CIDR として妥当であること。空リストは全拒否 |
+| `allowed_hosts` | `[]`（空） | web UI が `Host` として受け付けるホスト名の追加リスト。空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理。ポート・スキーム・ブラケットなしのホスト名か IP リテラル。逆プロキシや mDNS 名で公開する場合は必ず列挙する |
 | `idle_timeout_secs` | `5` | 検証なし（0 も受理）。最後の購読者が抜けてからこの秒数後にプロセス木を止める |
 | `subscriber_buffer_chunks` | `1024` | 1 以上。購読者ごとの bounded queue 容量（chunks） |
 | `chunk_size_bytes` | `65536` | 1 以上。実際の chunk は 188 の倍数に切り下げる（65536 → 65424） |
+| `max_subscribers_per_session` | `32` | 1 以上。1 セッションに同時接続できる購読者数。超えた要求は 429 |
+| `max_subscribers_per_ip` | `16` | 1 以上。1 クライアント IP が全セッション合計で持てる購読者数。超えた要求は 429 |
+| `max_sessions` | `16` | 1 以上。同時に存在できるセッション数（登録中の `Starting` / `Stopping` も含む）。超えた要求は 429。チューナー数が 16 を超える構成ではこの値も上げる |
+| `max_subscriber_buffer_bytes` | `268435456`（256 MiB） | 1 以上。全購読者キューの合計上限バイト数。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約するため、既定では同時 4 購読者まで。32 × 64 MiB を防ぐための予算 |
 
 `allowed_cidrs` はネットワーク制御であり認証ではない。API と web UI の両方に効く。
+
+#### アクセス制限
+
+- `allowed_cidrs` は TCP 接続元 IP の許可リスト。範囲外は API / web UI とも 403。
+- `allowed_hosts` は web UI の `Host` 許可リスト。空なら loopback / `allowed_cidrs` 内の IP / `localhost` だけを受け付け、DNS リバインディングを防ぐ。名前や逆プロキシ経由で公開するなら、そのホスト名を列挙する。
+- 購読者数とセッション数は `max_subscribers_per_session` / `max_subscribers_per_ip` / `max_sessions` / `max_subscriber_buffer_bytes` で制限する。上限を超えたストリーム要求は **429** `{"code":429,"reason":"Too Many Requests"}` を返し、既存の購読者とチューナーには影響しない（参加の判定はチューナー起動より前）。per-IP は `X-Forwarded-For` を無視し、TCP 接続元だけで数える。同時視聴を増やすには `max_subscriber_buffer_bytes` を上げるか `subscriber_buffer_chunks` を下げる。
 
 ### `tuners.yml`
 
@@ -204,11 +220,12 @@ decode モードはセッションの属性であり、同一チャンネルに 
 | 403 | `allowed_cidrs` 外からの接続、web UI の変更系 API の CSRF チェック失敗 |
 | 404 | 未知のチャンネル・サービス・プログラム・チューナー index・ルート、`GET /api/config/channels/scan` |
 | 409 | decode モードの衝突、探索の二重実行（`Already Scanning`）、web UI 保存の `If-Match` 不一致 |
+| 429 | 購読者数・セッション数の上限超過（`max_subscribers_per_session` / `max_subscribers_per_ip` / `max_sessions` / `max_subscriber_buffer_bytes`） |
 | 503 | チューナーなし・全 busy・起動失敗・シャットダウン中 |
 
 ## Web UI
 
-`http://host:40772/` を開く。認証はなく、`allowed_cidrs` だけが境界。同一バイナリに埋め込まれた 1 ページ（`/assets/style.css`, `/assets/app.js`）で、ビルド工程はない。
+`http://host:40772/` を開く。認証はなく、`allowed_cidrs` と `allowed_hosts` が境界。同一バイナリに埋め込まれた 1 ページ（`/assets/style.css`, `/assets/app.js`）で、ビルド工程はない。
 
 | タブ | 内容 |
 |---|---|
@@ -355,12 +372,12 @@ python3 -c "d=open('ch.ts','rb').read(); print(len(d), len(d)%188, hex(d[0]))"
 - チャンネル探索の `async` と `GET` ポーリングは非対応。`GET /api/config/channels/scan` は 404。
 - 複数の `X-Mirakurun-Priority` は集約しない（最後の非空値を使う）。
 - `decode=0` は pipeline **全段**バイパス。mirakurun の「B-25 デコーダのみスキップ」とは異なる。
-- web UI に認証はない。`allowed_cidrs` のみで、設定編集と再起動ができるため実質的に遠隔操作面になる。信頼できる LAN に置くこと。
+- web UI に認証はない。`allowed_cidrs` と `allowed_hosts` のみで、設定編集と再起動ができるため実質的に遠隔操作面になる。信頼できる LAN に置くこと。
 - スキャンが完了するまで `/api/services/{id}/stream` は 404 になりうる（サービス表は起動時スキャンで埋まる）。
 - スキャンは専用の大型購読バッファを持たず、通常購読者と同じ `subscriber_buffer_chunks` を使う（SPEC §8 の専用バッファ要件は未実装）。
 - pin 指定時、同じ `(type, channel)` が別チューナーで配信中なら 503。pin が既存セッションのチューナーと一致する場合のみ相乗りする。
 - チューナー出力のフレーミングは 188 / 204 のみ対応。192 は検出するが配信しない。
-- 購読者数・セッション数の per-IP 上限は未実装（セッション数はチューナー数で自然に制限される）。
+- 購読者数・セッション数には上限がある（`max_subscribers_per_session` / `max_subscribers_per_ip` / `max_sessions` / `max_subscriber_buffer_bytes`）。超過した要求は 429。per-IP は TCP 接続元のみで数え、`X-Forwarded-For` は無視する。
 - 奪取後の spawn 失敗時は、そのチャンネルが次回要求まで停止する（kill-first のトレードオフ）。
 
 ## ライセンス
