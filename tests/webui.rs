@@ -67,9 +67,13 @@ impl Fixture {
     }
 
     fn with(channels: &str) -> Self {
+        Self::with_server(SERVER, channels)
+    }
+
+    fn with_server(server: &str, channels: &str) -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
         for (name, body) in [
-            ("server.yml", SERVER),
+            ("server.yml", server),
             ("tuners.yml", TUNERS),
             ("channels.yml", channels),
             ("pipelines.yml", PIPELINES),
@@ -118,10 +122,13 @@ impl ExecCounter {
     }
 }
 
+/// A request with the host a loopback client would send, so the Host allowlist
+/// accepts it. Tests that exercise the allowlist build their own request.
 fn request(method: Method, uri: &str) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(uri)
+        .header("host", "127.0.0.1:40772")
         .body(Body::empty())
         .expect("request")
 }
@@ -130,6 +137,7 @@ fn json_request(method: Method, uri: &str, body: serde_json::Value) -> Request<B
     Request::builder()
         .method(method)
         .uri(uri)
+        .header("host", "127.0.0.1:40772")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("request")
@@ -498,6 +506,7 @@ async fn a_stale_if_match_is_a_conflict() {
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
         .header("content-type", "application/json")
         .header("if-match", etag)
         .body(Body::from(
@@ -625,10 +634,11 @@ async fn put_pipelines_writes_the_spec_shape_and_reads_it_back() {
 }
 
 #[tokio::test]
-async fn put_pipelines_accepts_an_empty_pipeline_list_only_when_validated() {
+async fn put_pipelines_accepts_an_empty_document_as_raw_ts() {
     let fixture = Fixture::new();
     let state = fixture.state();
 
+    // Raw-TS operation: no pipelines at all is a valid configuration.
     let (status, body) = put(
         &state,
         Webui::default(),
@@ -636,9 +646,111 @@ async fn put_pipelines_accepts_an_empty_pipeline_list_only_when_validated() {
         serde_json::json!({ "pipelines": {}, "types": {} }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    let yaml = fixture.read("pipelines.yml");
+    assert!(yaml.contains("pipelines: {}"), "{yaml}");
+    Config::load(&fixture.path).expect("raw-TS config loads");
+}
+
+#[tokio::test]
+async fn put_pipelines_still_rejects_an_empty_command_list() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let before = fixture.read("pipelines.yml");
+
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/pipelines",
+        serde_json::json!({ "pipelines": { "pass": [] }, "types": {} }),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
-    assert!(text(&body).contains("at least one pipeline"));
+    assert!(text(&body).contains("at least one command"));
+    assert_eq!(fixture.read("pipelines.yml"), before);
+}
+
+#[tokio::test]
+async fn put_pipelines_rejects_an_unknown_binding_field() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let before = fixture.read("pipelines.yml");
+
+    // A typo in the binding object used to be silently dropped by the untagged
+    // enum and then rejected as "unknown pipeline" (or worse, ignored when
+    // untagged fell through to a bare name). It is now a 400 at parse time.
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/pipelines",
+        serde_json::json!({
+            "pipelines": { "pass": ["cat"] },
+            "types": { "GR": { "pipelne": "pass" } }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
+    assert!(
+        text(&body).contains("invalid pipelines document"),
+        "{}",
+        text(&body)
+    );
+    assert_eq!(fixture.read("pipelines.yml"), before);
+}
+
+#[tokio::test]
+async fn put_pipelines_still_accepts_the_bare_pipeline_name() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/pipelines",
+        serde_json::json!({
+            "pipelines": { "pass": ["cat"] },
+            "types": { "GR": "pass" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert!(fixture.read("pipelines.yml").contains("pipeline: pass"));
+}
+
+#[tokio::test]
+async fn status_counts_follow_the_files_and_the_live_table() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    // The live service table is counted per request.
+    state
+        .manager
+        .services()
+        .upsert(unituner::services::ServiceRecord::new(
+            0x7FE0, 0x7FE0, 0x0408, 0x01, "NHK",
+        ));
+
+    // A hand edit of channels.yml is visible without a restart.
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        "- name: Only\n  type: GR\n  channel: \"27\"\n",
+    )
+    .expect("write channels");
+
+    let (status, _, body) = get(&state, "/webui/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["counts"]["services"], 1);
+    assert_eq!(value["counts"]["channels"], 1);
+
+    // An unreadable file falls back to the startup snapshot instead of 0.
+    std::fs::write(fixture.path.join("channels.yml"), "not: a list\n").expect("break file");
+    let (status, _, body) = get(&state, "/webui/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["counts"]["channels"], 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -660,10 +772,13 @@ async fn server_config_is_read_only_json() {
     let value = json(&body);
     assert_eq!(value["addr"], ":0");
     assert_eq!(value["allowed_cidrs"][0], "127.0.0.0/8");
+    assert_eq!(value["allowed_hosts"].as_array().expect("array").len(), 0);
     assert_eq!(value["idle_timeout_secs"], 7);
     assert_eq!(value["subscriber_buffer_chunks"], 64);
     assert_eq!(value["chunk_size_bytes"], 4096);
     assert_eq!(value["read_only"], true);
+    assert_eq!(value["source"], "file");
+    assert!(value.get("error").is_none(), "{value}");
 
     // No mutation endpoint: PUT is a method-not-allowed error, never a write.
     let (status, _) = put(
@@ -678,6 +793,36 @@ async fn server_config_is_read_only_json() {
         "unexpected status: {status}"
     );
     assert_eq!(fixture.read("server.yml"), before);
+}
+
+#[tokio::test]
+async fn server_config_reflects_a_hand_edit_and_flags_a_fallback() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    // Hand-edited after startup: the response must show the file, not the boot
+    // snapshot.
+    std::fs::write(
+        fixture.path.join("server.yml"),
+        "addr: \":0\"\nallowed_cidrs: [127.0.0.0/8]\nallowed_hosts: [tv.example.lan]\nidle_timeout_secs: 9\n",
+    )
+    .expect("edit server.yml");
+
+    let (status, _, body) = get(&state, "/webui/api/server-config").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["idle_timeout_secs"], 9);
+    assert_eq!(value["allowed_hosts"][0], "tv.example.lan");
+    assert_eq!(value["source"], "file");
+
+    // A broken file falls back to the in-memory value and says so.
+    std::fs::write(fixture.path.join("server.yml"), "addr: [unterminated\n").expect("break");
+    let (status, _, body) = get(&state, "/webui/api/server-config").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["source"], "memory");
+    assert_eq!(value["idle_timeout_secs"], 7);
+    assert!(value["error"].is_string(), "{value}");
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +912,7 @@ async fn mutating_requests_require_a_json_content_type() {
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
         .header("content-type", "text/plain")
         .body(Body::from(r#"{"channels":[]}"#))
         .expect("request");
@@ -778,6 +924,7 @@ async fn mutating_requests_require_a_json_content_type() {
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
         .body(Body::from(r#"{"channels":[]}"#))
         .expect("request");
     let (status, _, _) = send_body(&state, Webui::default(), request).await;
@@ -830,6 +977,7 @@ async fn a_foreign_origin_is_rejected_for_mutations() {
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/webui/api/channels")
+        .header("host", "127.0.0.1:40772")
         .header("origin", "null")
         .header("content-type", "application/json")
         .body(Body::from(r#"{"channels":[]}"#))
@@ -851,11 +999,233 @@ async fn the_restart_endpoint_is_guarded_too() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/webui/api/restart")
+        .header("host", "127.0.0.1:40772")
         .body(Body::empty())
         .expect("request");
     let (status, _, body) = send_body(&state, counter.hook(), request).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
     assert_eq!(counter.count(), 0, "a guarded restart must not exec");
+}
+
+// ---------------------------------------------------------------------------
+// Host allowlist (DNS rebinding)
+// ---------------------------------------------------------------------------
+
+async fn get_with_host(state: &AppState, uri: &str, host: &str) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("host", host)
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send_body(state, Webui::default(), request).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn the_host_allowlist_accepts_loopback_and_private_literals() {
+    // The default `allowed_cidrs` (RFC1918 + loopback), so 192.168.x.x is in.
+    let fixture = Fixture::with_server("addr: \":0\"\n", CHANNELS);
+    let state = fixture.state();
+
+    for host in [
+        "localhost",
+        "localhost:40772",
+        "127.0.0.1:40772",
+        "192.168.1.5:40772",
+        "[::1]:40772",
+    ] {
+        let (status, body) = get_with_host(&state, "/", host).await;
+        assert_eq!(status, StatusCode::OK, "Host: {host}: {}", text(&body));
+    }
+}
+
+#[tokio::test]
+async fn a_foreign_host_is_403_for_reads_and_writes() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let before = fixture.read("channels.yml");
+
+    // Rebinding: the Origin matches the Host, but the Host is not allowlisted.
+    let (status, body) = get_with_host(&state, "/", "evil.example").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(json(&body)["code"], 403);
+
+    for uri in [
+        "/",
+        "/assets/app.js",
+        "/assets/style.css",
+        "/webui/api/status",
+        "/webui/api/channels",
+        "/api/status",
+        "/api/channels",
+    ] {
+        let (status, _) = get_with_host(&state, uri, "evil.example").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri} must be rejected");
+    }
+
+    // Mutations with a matching Origin are rejected before anything is written.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/pipelines")
+        .header("host", "evil.example")
+        .header("origin", "http://evil.example")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "pipelines": {}, "types": {} }).to_string(),
+        ))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(json(&body)["code"], 403);
+    assert_eq!(fixture.read("channels.yml"), before);
+    assert_eq!(fixture.read("pipelines.yml"), PIPELINES);
+}
+
+#[tokio::test]
+async fn the_host_allowlist_covers_the_merged_api_router() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    let response = webui::app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/version")
+                .header("host", "evil.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = webui::app(state)
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/version")
+                .header("host", "127.0.0.1:40772")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn allowed_hosts_admits_a_name_that_is_not_localhost() {
+    let server = r#"
+addr: ":0"
+allowed_cidrs:
+  - 127.0.0.0/8
+allowed_hosts:
+  - tv.example.lan
+"#;
+    let fixture = Fixture::with_server(server, CHANNELS);
+    let state = fixture.state();
+
+    let (status, body) = get_with_host(&state, "/", "tv.example.lan:40772").await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    // Still case-insensitive, but nothing else sneaks in.
+    let (status, _) = get_with_host(&state, "/", "TV.EXAMPLE.LAN:40772").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get_with_host(&state, "/", "other.example.lan").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_missing_host_header_is_rejected() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    // HTTP/1.1 requires Host; refusing an empty one is the safe default.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, _) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent saves
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_concurrent_puts_to_the_same_file_both_succeed() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move {
+            put(
+                &state,
+                Webui::default(),
+                "/webui/api/channels",
+                serde_json::json!({
+                    "channels": [{ "name": "First", "type": "GR", "channel": "1" }]
+                }),
+            )
+            .await
+        }
+    });
+    let second = tokio::spawn({
+        let state = state.clone();
+        async move {
+            put(
+                &state,
+                Webui::default(),
+                "/webui/api/channels",
+                serde_json::json!({
+                    "channels": [{ "name": "Second", "type": "GR", "channel": "2" }]
+                }),
+            )
+            .await
+        }
+    });
+
+    let (first_status, first_body) = first.await.expect("join");
+    let (second_status, second_body) = second.await.expect("join");
+    assert_eq!(first_status, StatusCode::OK, "{}", text(&first_body));
+    assert_eq!(second_status, StatusCode::OK, "{}", text(&second_body));
+
+    // Both writes happened, serialised: the .bak holds the loser and the file
+    // holds the winner, and the result is still a valid configuration.
+    let file = fixture.read("channels.yml");
+    let bak = fixture.read("channels.yml.bak");
+    assert!(
+        (file.contains("First") && bak.contains("Second"))
+            || (file.contains("Second") && bak.contains("First")),
+        "file: {file}\nbak: {bak}"
+    );
+    Config::load(&fixture.path).expect("saved config is valid");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_put_to_another_file_is_not_blocked_by_a_slow_save() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+
+    // Hold channels.yml's lock, then save tuners.yml: the other file must not
+    // wait for it.
+    let guard = unituner::webui::store_lock_async("channels.yml").await;
+    let tuners = put(
+        &state,
+        Webui::default(),
+        "/webui/api/tuners",
+        serde_json::json!({
+            "tuners": [{ "name": "t0", "types": ["GR"], "command": "recpt1 {channel} -" }]
+        }),
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), tuners).await;
+    drop(guard);
+    let (status, body) = result.expect("a different file must not be blocked");
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
 }
 
 #[tokio::test]

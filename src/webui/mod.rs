@@ -59,19 +59,44 @@
 //! instead of leaving every stream at 503 until someone restarts it by hand; the
 //! failure is reported as a 500.
 //!
+//! # Host allowlist (DNS rebinding)
+//!
+//! Comparing `Origin` with `Host` alone does not stop DNS rebinding: an
+//! attacker's page can make `Host` be its own name, in which case the two match
+//! and the same-origin check passes. Every request — `GET` and mutation, `/`,
+//! `/assets/*`, `/webui/api/*` and, through [`app`], `/api/*` — therefore also
+//! has to carry a `Host` whose *host part* is
+//!
+//! * `localhost`, or
+//! * an IP literal inside `server.allowed_cidrs`, or
+//! * one of `server.allowed_hosts` (exact, ASCII-case-insensitive).
+//!
+//! Anything else (including a missing `Host`) is
+//! `403 {"code":403,…}`. The rebinding check is per request, not per method, so
+//! reads are covered too. A deployment behind a reverse proxy, or reached by a
+//! host name, must list that name in `allowed_hosts`: the peer-address guard
+//! cannot see the name the browser used.
+//!
 //! # CSRF hardening
 //!
-//! The UI has no authentication; access is limited by `server.allowed_cidrs`.
-//! To stop a page on another origin from driving it, every mutating request
-//! (`PUT /webui/api/*`, `POST /webui/api/restart`) must carry
-//! `Content-Type: application/json`, and a request that sends an `Origin`
-//! header must have it match the request `Host`; anything else is a
-//! `403 {"code":403,…}` and nothing is written or executed.
+//! The UI has no authentication; access is limited by `server.allowed_cidrs`
+//! and the `Host` allowlist above. To stop a page on another origin from
+//! driving it, every mutating request (`PUT /webui/api/*`,
+//! `POST /webui/api/restart`) must carry `Content-Type: application/json`, and a
+//! request that sends an `Origin` header must have it match the request `Host`;
+//! anything else is a `403 {"code":403,…}` and nothing is written or executed.
 
 // Shared with the channel scan so both take the same per-file lock (SPEC §10).
 pub(crate) mod store;
 
+/// Test hook: the async per-file save lock, so an integration test can hold a
+/// file while a second request is in flight (the `store` module is crate
+/// private).
+#[doc(hidden)]
+pub use store::lock_async as store_lock_async;
+
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -85,7 +110,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::api::{with_common_layers, AppState};
-use crate::config::{Config, ConfigError};
+use crate::config::{host_is_allowed, ChannelConfig, Config, ConfigError, ServerConfig};
 use crate::session::{SessionStatus, TunerStatus};
 
 use store::{CHANNELS_FILE, PIPELINES_FILE, SERVER_FILE, TUNERS_FILE};
@@ -141,12 +166,22 @@ impl Default for Webui {
 /// The whole application: the mirakurun-compatible API plus the management UI
 /// (SPEC §9, §10). `/api/*` keeps working exactly as before; `/` and
 /// `/webui/api/*` are added.
+///
+/// The `Host` allowlist is applied once more around the merged router: the API
+/// router is built in [`crate::api`] and cannot carry the guard itself, but
+/// DNS-rebinding protection has to cover `/api/*` too (the guard is per
+/// request, not per method). Applying it twice to the webui routes is harmless
+/// and idempotent.
 pub fn app(state: AppState) -> Router {
-    crate::api::router(state.clone()).merge(router_with(state, Webui::new()))
+    let api = crate::api::router(state.clone());
+    let webui = router_with(state.clone(), Webui::new());
+    api.merge(webui)
+        .layer(axum::middleware::from_fn_with_state(state, host_guard))
 }
 
 /// The management UI router with an explicit [`Webui`] state (the restart hook).
 pub fn router_with(state: AppState, webui: Webui) -> Router {
+    let guard_state = state.clone();
     let routes = Router::new()
         .route("/", get(index))
         .route("/assets/style.css", get(style_css))
@@ -161,10 +196,66 @@ pub fn router_with(state: AppState, webui: Webui) -> Router {
         .route("/webui/api/server-config", get(server_config))
         .route("/webui/api/restart", post(restart))
         // Mutating requests are guarded against cross-site use (the UI has no
-        // authentication; `allowed_cidrs` is the only other boundary).
+        // authentication; `allowed_cidrs` and the Host allowlist are the only
+        // other boundaries).
         .route_layer(axum::middleware::from_fn(csrf_guard))
         .layer(Extension(webui));
-    with_common_layers(&state, routes).with_state(state)
+    with_common_layers(&state, routes).with_state(state).layer(
+        axum::middleware::from_fn_with_state(guard_state, host_guard),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Host allowlist (DNS rebinding)
+// ---------------------------------------------------------------------------
+
+/// Rejects a request whose `Host` is not `localhost`, not an IP inside
+/// `allowed_cidrs` and not listed in `allowed_hosts` (SPEC §3.1).
+///
+/// This runs for every method and every path (the static page and assets
+/// included): a DNS-rebinding page reaches this server with its own name in
+/// `Host`, so it is rejected even though its `Origin` matches. Since the guard
+/// also wraps the merged router in [`app`], `/api/*` is covered as well. A
+/// deployment reached by a name (or behind a reverse proxy that forwards the
+/// browser's `Host`) must add it to `allowed_hosts`.
+///
+/// The allowlist comes from the configuration the process started with (there
+/// is no `PUT` for `server.yml`, so a hand edit needs the documented restart
+/// anyway); the read-only `server-config` view below does show the current
+/// file.
+async fn host_guard(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // HTTP/1.1 carries the authority in `Host`; HTTP/2 uses `:authority`, which
+    // hyper leaves in the request URI instead of synthesising a `Host` header.
+    let header_host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let uri_host = request
+        .uri()
+        .authority()
+        .map(|authority| authority.as_str());
+    let host = header_host.or(uri_host).unwrap_or_default();
+    if !host_is_allowed(
+        host,
+        &state.config.server.allowed_hosts,
+        &state.config.server.allowed_cidrs,
+    ) {
+        tracing::warn!(
+            host,
+            path = %request.uri().path(),
+            "request Host is not in allowed_hosts / allowed_cidrs"
+        );
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "Host is not allowed (see server.yml allowed_hosts)",
+            Vec::new(),
+        );
+    }
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -264,10 +355,22 @@ fn static_response(content_type: &'static str, body: &'static str) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Live state for the Status tab: tuners with their users, sessions, counts.
+///
+/// The counts are computed per request: `services` from the live
+/// [`ServiceTable`](crate::services::ServiceTable) and `channels` from the
+/// current `channels.yml` on disk (falling back to the startup snapshot when the
+/// file cannot be read or parsed, so a hand edit is reflected without a stale
+/// zero).
 async fn status(State(state): State<AppState>) -> Json<Value> {
     let tuners = state.manager.tuners_snapshot();
     let sessions = state.manager.sessions_snapshot();
     let users: usize = tuners.iter().map(|tuner| tuner.users.len()).sum();
+    let dir = state.config_dir.clone();
+    let channels = tokio::task::spawn_blocking(move || channels_on_disk(&dir))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(state.config.channels.len());
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "pid": std::process::id(),
@@ -278,7 +381,7 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
             "sessions": sessions.len(),
             "users": users,
             "services": state.manager.services().len(),
-            "channels": state.config.channels.len(),
+            "channels": channels,
         },
     }))
 }
@@ -372,21 +475,28 @@ struct PipelinesDoc {
     types: BTreeMap<String, BindingDoc>,
 }
 
-/// A `pipelines.types` value: `{ pipeline: name }` in YAML, but the UI may send
-/// the bare pipeline name as a convenience. It is always written as the object
-/// form, because that is the schema `config.rs` parses.
+/// A `pipelines.types` value. The UI accepts the bare pipeline name as a
+/// convenience, but the object form is parsed strictly: `deny_unknown_fields`
+/// stops a typo such as `{"pipelne": …}` from being silently dropped (the
+/// startup schema is equally strict).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum BindingDoc {
     Name(String),
-    Object { pipeline: String },
+    Object(BindingObject),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingObject {
+    pipeline: String,
 }
 
 impl BindingDoc {
     fn pipeline(&self) -> &str {
         match self {
             Self::Name(name) => name,
-            Self::Object { pipeline } => pipeline,
+            Self::Object(BindingObject { pipeline }) => pipeline,
         }
     }
 }
@@ -405,7 +515,7 @@ impl Serialize for BindingDoc {
 // ---------------------------------------------------------------------------
 
 async fn get_tuners(State(state): State<AppState>) -> Response {
-    let (text, etag) = match read_document(&state, TUNERS_FILE) {
+    let (text, etag) = match read_document_async(&state.config_dir, TUNERS_FILE).await {
         Ok(document) => document,
         Err(message) => return internal_error(message),
     };
@@ -416,7 +526,7 @@ async fn get_tuners(State(state): State<AppState>) -> Response {
 }
 
 async fn get_channels(State(state): State<AppState>) -> Response {
-    let (text, etag) = match read_document(&state, CHANNELS_FILE) {
+    let (text, etag) = match read_document_async(&state.config_dir, CHANNELS_FILE).await {
         Ok(document) => document,
         Err(message) => return internal_error(message),
     };
@@ -427,7 +537,7 @@ async fn get_channels(State(state): State<AppState>) -> Response {
 }
 
 async fn get_pipelines(State(state): State<AppState>) -> Response {
-    let (text, etag) = match read_document(&state, PIPELINES_FILE) {
+    let (text, etag) = match read_document_async(&state.config_dir, PIPELINES_FILE).await {
         Ok(document) => document,
         Err(message) => return internal_error(message),
     };
@@ -454,12 +564,24 @@ fn pipelines_json(document: &PipelinesDoc) -> Value {
 }
 
 /// Reads `file` from the config directory, returning the text and its ETag.
-fn read_document(state: &AppState, file: &str) -> Result<(String, String), String> {
-    let path = state.config_dir.join(file);
+///
+/// Blocking; called from a `spawn_blocking` task by the handlers.
+fn read_document(dir: &Path, file: &str) -> Result<(String, String), String> {
+    let path = dir.join(file);
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let etag = etag(&text);
     Ok((text, etag))
+}
+
+/// [`read_document`] on the blocking pool: even a small read can stall on a
+/// network or USB filesystem.
+async fn read_document_async(dir: &Path, file: &str) -> Result<(String, String), String> {
+    let dir = dir.to_path_buf();
+    let file = file.to_string();
+    tokio::task::spawn_blocking(move || read_document(&dir, &file))
+        .await
+        .map_err(|error| format!("read task failed: {error}"))?
 }
 
 fn document_response(body: Value, etag: &str) -> Response {
@@ -494,7 +616,7 @@ async fn put_tuners(State(state): State<AppState>, headers: HeaderMap, body: Byt
         Ok(yaml) => yaml,
         Err(reason) => return internal_error(reason),
     };
-    save_document(&state, &headers, TUNERS_FILE, &yaml)
+    save_document(state, headers, TUNERS_FILE, yaml).await
 }
 
 async fn put_channels(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -506,7 +628,7 @@ async fn put_channels(State(state): State<AppState>, headers: HeaderMap, body: B
         Ok(yaml) => yaml,
         Err(reason) => return internal_error(reason),
     };
-    save_document(&state, &headers, CHANNELS_FILE, &yaml)
+    save_document(state, headers, CHANNELS_FILE, yaml).await
 }
 
 async fn put_pipelines(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -518,7 +640,7 @@ async fn put_pipelines(State(state): State<AppState>, headers: HeaderMap, body: 
         Ok(yaml) => yaml,
         Err(reason) => return internal_error(reason),
     };
-    save_document(&state, &headers, PIPELINES_FILE, &yaml)
+    save_document(state, headers, PIPELINES_FILE, yaml).await
 }
 
 /// A list document: either the bare JSON array or `{"<key>": [...]}`.
@@ -547,65 +669,72 @@ fn to_yaml<T: Serialize>(value: &T) -> Result<String, String> {
     serde_yaml_ng::to_string(value).map_err(|error| format!("failed to build YAML: {error}"))
 }
 
-/// The `.bak` + `.tmp` + `rename` save path, guarded by the per-file mutex.
-fn save_document(
-    state: &AppState,
-    headers: &HeaderMap,
+/// The `.bak` + `.tmp` + `rename` save path, serialised by the per-file mutex.
+///
+/// The mutex is acquired asynchronously, then the guard is moved into a
+/// `spawn_blocking` closure that re-checks `If-Match` and writes the file (see
+/// the `store` module docs): the `fsync` cannot stall a runtime worker and no
+/// guard is held across an `await` by one.
+async fn save_document(
+    state: AppState,
+    headers: HeaderMap,
     file: &'static str,
-    yaml: &str,
+    yaml: String,
 ) -> Response {
-    let _guard = store::lock(file);
-    if let Err(rejection) = check_if_match(state, headers, file) {
-        return match rejection {
-            IfMatchError::BadRequest(reason) => bad_request(reason),
-            IfMatchError::Conflict => {
-                error_response(StatusCode::CONFLICT, "Configuration Changed", Vec::new())
+    let if_match = match headers.get(header::IF_MATCH) {
+        None => None,
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.trim().to_string()),
+            Err(_) => return bad_request("If-Match is not valid UTF-8"),
+        },
+    };
+    let dir = state.config_dir.clone();
+    let bytes = yaml.len();
+    let tag = etag(&yaml);
+    let guard = store::lock_async(file).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        if let Some(expected) = if_match {
+            if expected != "*" {
+                let (_, current) = read_document(&dir, file).map_err(SaveFailure::BadRequest)?;
+                if current != expected {
+                    return Err(SaveFailure::Conflict);
+                }
             }
-        };
-    }
-    match store::save(&state.config_dir, file, yaml) {
-        Ok(()) => {
-            tracing::info!(file, bytes = yaml.len(), "configuration saved");
-            let etag = etag(yaml);
-            document_response(json!({ "status": "saved", "file": file }), &etag)
         }
-        Err(store::SaveError::Invalid(issues)) => {
+        store::save(&dir, file, &yaml).map_err(SaveFailure::Save)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(())) => {
+            tracing::info!(file, bytes, "configuration saved");
+            document_response(json!({ "status": "saved", "file": file }), &tag)
+        }
+        Ok(Err(SaveFailure::BadRequest(reason))) => bad_request(reason),
+        Ok(Err(SaveFailure::Conflict)) => {
+            error_response(StatusCode::CONFLICT, "Configuration Changed", Vec::new())
+        }
+        Ok(Err(SaveFailure::Save(store::SaveError::Invalid(issues)))) => {
             tracing::warn!(file, issues = ?issues, "configuration rejected");
             error_response(StatusCode::BAD_REQUEST, "Invalid Configuration", issues)
         }
-        Err(store::SaveError::Internal(message)) => {
+        Ok(Err(SaveFailure::Save(store::SaveError::Internal(message)))) => {
             tracing::error!(file, %message, "configuration write failed");
             internal_error(format!("failed to write {file}: {message}"))
         }
+        Err(error) => internal_error(format!("save task failed: {error}")),
     }
 }
 
-/// Why an `If-Match` precondition failed.
-enum IfMatchError {
-    /// The header is not a valid string.
+/// Why the blocking save body failed.
+enum SaveFailure {
+    /// The `If-Match` header could not be checked (bad file read).
     BadRequest(String),
     /// The file changed since the client read it.
     Conflict,
-}
-
-/// Optional optimistic concurrency: a stale `If-Match` is a 409 (SPEC §10).
-fn check_if_match(state: &AppState, headers: &HeaderMap, file: &str) -> Result<(), IfMatchError> {
-    let Some(expected) = headers.get(header::IF_MATCH) else {
-        return Ok(());
-    };
-    let expected = expected
-        .to_str()
-        .map_err(|_| IfMatchError::BadRequest("If-Match is not valid UTF-8".to_string()))?;
-    let expected = expected.trim();
-    if expected == "*" {
-        return Ok(());
-    }
-    let (_, current) = read_document(state, file).map_err(IfMatchError::BadRequest)?;
-    if current == expected {
-        Ok(())
-    } else {
-        Err(IfMatchError::Conflict)
-    }
+    /// Validation or the write itself failed.
+    Save(store::SaveError),
 }
 
 // ---------------------------------------------------------------------------
@@ -614,22 +743,68 @@ fn check_if_match(state: &AppState, headers: &HeaderMap, file: &str) -> Result<(
 
 /// `server.yml` as read-only JSON (SPEC §3.1, §10). There is deliberately no
 /// `PUT`: a wrong `allowed_cidrs` would lock the operator out of the webui.
+///
+/// The file is re-read on every request (the webui's view is not a startup
+/// snapshot): a hand edit shows up without a restart. When the file is missing
+/// or unreadable the in-memory value the server started with is returned and
+/// `source` says `"memory"` (with `error` describing why) instead of pretending
+/// the file was read.
 async fn server_config(State(state): State<AppState>) -> Response {
-    let server = &state.config.server;
-    let mut response = Json(json!({
+    let dir = state.config_dir.clone();
+    let loaded = tokio::task::spawn_blocking(move || load_server_config(&dir)).await;
+    let (server, source, error) = match loaded {
+        Ok(Ok(server)) => (server, "file", None),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "server-config fell back to the in-memory value");
+            (state.config.server.clone(), "memory", Some(error))
+        }
+        Err(error) => {
+            let error = format!("failed to read server.yml: {error}");
+            tracing::warn!(%error, "server-config fell back to the in-memory value");
+            (state.config.server.clone(), "memory", Some(error))
+        }
+    };
+    let mut body = json!({
         "file": SERVER_FILE,
         "addr": server.addr,
         "allowed_cidrs": server.allowed_cidrs,
+        "allowed_hosts": server.allowed_hosts,
         "idle_timeout_secs": server.idle_timeout_secs,
         "subscriber_buffer_chunks": server.subscriber_buffer_chunks,
         "chunk_size_bytes": server.chunk_size_bytes,
         "read_only": true,
-    }))
-    .into_response();
+        // Extra, non-breaking fields: where the values came from.
+        "source": source,
+    });
+    if let Some(error) = error {
+        body["error"] = json!(error);
+    }
+    let mut response = Json(body).into_response();
     response
         .headers_mut()
         .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
     response
+}
+
+/// Reads and parses `server.yml` from `dir` (blocking; call from a blocking
+/// task).
+fn load_server_config(dir: &Path) -> Result<ServerConfig, String> {
+    let path = dir.join(SERVER_FILE);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_yaml_ng::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+/// The number of entries in the current `channels.yml` (blocking; call from a
+/// blocking task). `None` when the file cannot be read or parsed, so the caller
+/// can fall back to the startup snapshot.
+fn channels_on_disk(dir: &Path) -> Option<usize> {
+    let path = dir.join(CHANNELS_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_yaml_ng::from_str::<Vec<ChannelConfig>>(&text)
+        .ok()
+        .map(|channels| channels.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -648,9 +823,15 @@ async fn server_config(State(state): State<AppState>) -> Response {
 /// process keeps serving — the next request spawns a fresh tree instead of every
 /// stream answering 503 until a manual restart. The failure is reported as a 500.
 async fn restart(State(state): State<AppState>, Extension(webui): Extension<Webui>) -> Response {
-    if let Err(error) = Config::load(&state.config_dir) {
-        tracing::warn!(%error, "restart refused: configuration is invalid");
-        return config_error(response_issues(&error));
+    let dir = state.config_dir.clone();
+    let loaded = tokio::task::spawn_blocking(move || Config::load(&dir)).await;
+    match loaded {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "restart refused: configuration is invalid");
+            return config_error(response_issues(&error));
+        }
+        Err(error) => return internal_error(format!("config load task failed: {error}")),
     }
     if let Err(message) = preflight_exec() {
         tracing::error!(%message, "restart refused");

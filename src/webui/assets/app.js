@@ -570,6 +570,7 @@ async function loadServerConfig() {
   const rows = [
     ['addr', body.addr],
     ['allowed_cidrs', body.allowed_cidrs.join(', ')],
+    ['allowed_hosts', (body.allowed_hosts || []).join(', ') || '(none — reverse proxies must be listed)'],
     ['idle_timeout_secs', body.idle_timeout_secs],
     ['subscriber_buffer_chunks', body.subscriber_buffer_chunks],
     ['chunk_size_bytes', body.chunk_size_bytes],

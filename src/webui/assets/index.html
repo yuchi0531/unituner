@@ -76,14 +76,14 @@
 
   <section id="tab-server" class="tab">
     <h2>Server <small>server.yml</small></h2>
-    <p class="hint">Read-only by design: a wrong <code>allowed_cidrs</code> would lock you out of this page.</p>
+    <p class="hint">Read-only by design: a wrong <code>allowed_cidrs</code> or <code>allowed_hosts</code> would lock you out of this page.</p>
     <dl id="server-config" class="kv"></dl>
   </section>
 </main>
 
 <footer>
   <span id="message" class="message"></span>
-  <span class="note">No authentication — access is limited by <code>allowed_cidrs</code> only. Deploy on a trusted LAN.</span>
+  <span class="note">No authentication — access is limited by <code>allowed_cidrs</code> and the <code>allowed_hosts</code> allowlist. Deploy on a trusted LAN.</span>
 </footer>
 
 <script src="/assets/app.js"></script>

@@ -164,3 +164,46 @@ fn missing_config_dir_exits_nonzero() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("server.yml"), "stderr: {stderr}");
 }
+
+#[test]
+fn a_config_without_pipelines_streams_raw_ts_and_starts() {
+    // Raw-TS operation: an empty `pipelines` map is a valid configuration, so
+    // the server must start instead of refusing to boot.
+    let dir = config_dir(CHANNELS);
+    fs::write(
+        dir.path().join("pipelines.yml"),
+        "pipelines: {}\ntypes: {}\n",
+    )
+    .expect("write raw-TS pipelines");
+    let (stderr, status) = run_until_listening(&dir, libc::SIGTERM);
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("listening"), "stderr: {stderr}");
+}
+
+#[test]
+fn allowed_hosts_is_accepted_in_server_yml() {
+    let dir = config_dir(CHANNELS);
+    fs::write(
+        dir.path().join("server.yml"),
+        "addr: \":0\"\nallowed_hosts:\n  - tv.example.lan\n",
+    )
+    .expect("write server.yml");
+    let (stderr, status) = run_until_listening(&dir, libc::SIGTERM);
+    assert!(status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("listening"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_bad_allowed_hosts_entry_exits_nonzero() {
+    let dir = config_dir(CHANNELS);
+    fs::write(
+        dir.path().join("server.yml"),
+        "addr: \":0\"\nallowed_hosts: [\"tv.example.lan:40772\"]\n",
+    )
+    .expect("write server.yml");
+    let output = run(&dir);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("allowed_hosts[0]"), "stderr: {stderr}");
+    assert!(!stderr.contains("configuration loaded"));
+}
