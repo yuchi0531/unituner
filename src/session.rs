@@ -6,8 +6,9 @@
 //! A session owns one tuner process plus the type's pipeline stages. It is
 //! registered under the internal key `(tuner, type, channel)` — the tuner is
 //! fixed when the session starts — but **join search is by `(type, channel)`**
-//! (SPEC §6.2): at most one session exists for a channel, so two requests can
-//! never spawn two processes for it.
+//! (SPEC §6.2): at most one session exists for an effective `(type, channel)`,
+//! so two requests can never spawn two processes for it. For a routed channel
+//! that effective channel is the route's `channel` override (SPEC §6.4).
 //!
 //! The decode mode (`decode=0` versus the normal pipeline) is **not** part of
 //! the identity: it is a property of the one session for that channel. A
@@ -15,6 +16,31 @@
 //! joined and does not preempt it either — it fails with
 //! [`AcquireError::DecodeModeConflict`] (409), because taking the tuner over
 //! would let two alternating clients ping-pong the same channel.
+//!
+//! # Routed channels (SPEC §6.4)
+//!
+//! A channel with `routes` only ever considers the listed tuners, in order. For
+//! each route the steps are the same as §6.2, keyed by the route's **effective**
+//! `(type, channel)` (the route's `channel` override, or the channel's own).
+//! Fallback to the next route happens only on a start failure — a render/spawn
+//! error, or a process that exits before its first data within
+//! `server.tuner_startup_probe_ms` — and on the genuinely per-route
+//! "this route's tuner is unusable/busy" cases.
+//!
+//! Two errors end the request instead of falling through: a
+//! [`AcquireError::DecodeModeConflict`] and the SPEC §7 caps
+//! ([`AcquireError::TooManySessions`], [`AcquireError::TooManySubscribers`],
+//! [`AcquireError::TooManySubscribersForIp`]). The next route has a different
+//! effective channel/tuner, so continuing would start a second stream under the
+//! other decode mode or bypass the very limit that was just hit.
+//!
+//! **Effective-channel reuse outranks route order and the route's tuner**: step
+//! 1 joins a live session for the route's effective `(type, channel)` whatever
+//! tuner it runs on and whatever route originally created it. Route 1 can
+//! therefore join a session that route 2 (or a legacy/pinned request) started,
+//! and that route's `extra-args` are not re-applied. This is intended: the
+//! invariant "at most one session per effective `(type, channel)`" wins over
+//! per-route command arguments.
 //!
 //! # Selection and takeover
 //!
@@ -335,6 +361,27 @@ pub enum AcquireError {
     ShuttingDown,
 }
 
+impl AcquireError {
+    /// Whether this error ends the request no matter how many routes remain
+    /// (SPEC §6.4).
+    ///
+    /// A decode-mode conflict and the SPEC §7 caps are properties of the
+    /// request, not of one route: falling through to the next route would let
+    /// route 1's conflict start a second stream under the other decode mode on
+    /// route 2's different effective channel, and would let a cap rejection be
+    /// bypassed by another tuner. Both must be returned immediately.
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            AcquireError::DecodeModeConflict
+                | AcquireError::TooManySubscribers
+                | AcquireError::TooManySubscribersForIp
+                | AcquireError::TooManySessions
+                | AcquireError::ShuttingDown
+        )
+    }
+}
+
 /// What a subscriber receives from the shared post-pipeline broadcast.
 ///
 /// [`Raw`](Self::Raw) is the channel stream, [`Filtered`](Self::Filtered) the
@@ -559,6 +606,12 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
+    /// Whether any half of the tree is still running: the tuner, or a pipeline
+    /// stage. A `try_wait` on the direct children, so it never blocks.
+    fn is_alive(&self) -> bool {
+        self.tuner.is_alive() || self.pipeline.as_ref().is_some_and(PipelineHandle::is_alive)
+    }
+
     /// Stops both halves concurrently; stopping the whole tree takes at most
     /// one grace period.
     ///
@@ -632,6 +685,10 @@ struct Session {
     /// The stream ended before the session was promoted to `Ready`; the
     /// promoter removes the session instead of leaving a dead `Ready` entry.
     ended: AtomicBool,
+    /// At least one chunk was broadcast for this session. The promoter uses it
+    /// to tell a short stream (data, then EOF: still a valid 200) from a start
+    /// failure (no data at all: an empty 200 must never be returned).
+    had_data: AtomicBool,
     /// The stream ended without a read error (natural EOF). Such a session must
     /// not blacklist its tuner for the rest of the request.
     clean_eof: AtomicBool,
@@ -662,6 +719,7 @@ impl Session {
             reservation_peer: Mutex::new(None),
             takeover_pending: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            had_data: AtomicBool::new(false),
             clean_eof: AtomicBool::new(false),
             preempted: PreemptionFlag::default(),
             process: AsyncMutex::new(None),
@@ -767,6 +825,7 @@ impl Session {
     /// subscriber receives each chunk exactly once: from the broadcast if it
     /// subscribed in time, or from the replay window if it joined later.
     fn emit(&self, sender: &broadcast::Sender<Bytes>, chunk: Bytes) -> bool {
+        self.had_data.store(true, Ordering::SeqCst);
         let mut replay = lock(&self.replay);
         let first = replay.chunks.is_empty();
         if replay.first_attached {
@@ -822,6 +881,19 @@ impl Session {
         let slot = self.process.lock().await;
         if let Some(tree) = slot.as_ref() {
             tree.stop().await;
+        }
+    }
+
+    /// Whether the stored process tree is still running, without waiting for a
+    /// stop in progress.
+    ///
+    /// The process lock is only held while the tree is published (before the
+    /// pump starts) or stopped (`stream_ended`, a takeover, shutdown), so a
+    /// contended lock means a stop is under way and the tree is not alive.
+    fn process_tree_alive(&self) -> bool {
+        match self.process.try_lock() {
+            Ok(slot) => slot.as_ref().is_some_and(ProcessTree::is_alive),
+            Err(_) => false,
         }
     }
 }
@@ -1108,6 +1180,21 @@ impl SessionManager {
         &self.inner.services
     }
 
+    /// The effective channel(s) a request for `(type_name, channel)` resolves
+    /// to (SPEC §6.4).
+    ///
+    /// A routed channel resolves to its routes' effective channels (the route
+    /// override when present, otherwise the channel's own); any other channel
+    /// resolves to itself. The channel scan uses this to find the sessions such
+    /// a channel may have created, which are keyed by the effective channel and
+    /// not by the configured one.
+    pub fn effective_channels(&self, type_name: &str, channel: &str) -> Vec<String> {
+        match self.inner.route_targets(type_name, channel) {
+            Some(routes) => routes.into_iter().map(|route| route.channel).collect(),
+            None => vec![channel.to_string()],
+        }
+    }
+
     /// Joins or starts the session for `(type_name, channel)`.
     ///
     /// `pin` is the tuner name from `X-Mirakc-Tuner` / `X-Mirakurun-Tuner`
@@ -1313,7 +1400,8 @@ impl SessionManager {
                         Ok(Err(SpawnFailure::ShuttingDown)) => {
                             return Err(AcquireError::ShuttingDown)
                         }
-                        Ok(Err(SpawnFailure::Aborted(error))) => return Err(error),
+                        Ok(Err(SpawnFailure::TakeoverAbandoned)) => return Err(AcquireError::Busy),
+                        Ok(Err(SpawnFailure::Rejected(error))) => return Err(error),
                         Ok(Err(SpawnFailure::Failed { tuner })) => {
                             // Pinned requests never fall back to another tuner.
                             if pin.is_some() {
@@ -1408,20 +1496,25 @@ impl SessionManager {
                     Selection::Join(session) => {
                         match join(&inner, &session, &user, tap) {
                             Ok(subscription) => return Ok(subscription),
+                            // A SPEC §7 cap is terminal for the request.
                             Err(AttachError::Rejected(error)) => return Err(error),
                             Err(AttachError::Gone) => {}
                         }
                         if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
                             .await
                         {
-                            return Err(AcquireError::Unavailable);
+                            // This route's session is wedged; a later route may
+                            // still be free. The overall deadline still bounds
+                            // the request, because every later wait returns
+                            // immediately once it has passed.
+                            continue 'routes;
                         }
                     }
                     Selection::Wait(session) => {
                         if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
                             .await
                         {
-                            return Err(AcquireError::Unavailable);
+                            continue 'routes;
                         }
                         // The effective channel's stream died before data: this
                         // route cannot start, so move on to the next one.
@@ -1445,11 +1538,13 @@ impl SessionManager {
                             Ok(Err(SpawnFailure::ShuttingDown)) => {
                                 return Err(AcquireError::ShuttingDown)
                             }
-                            Ok(Err(SpawnFailure::Aborted(_))) => {
+                            Ok(Err(SpawnFailure::TakeoverAbandoned)) => {
                                 // The takeover was abandoned, but the next route
                                 // may still satisfy the request.
                                 continue 'routes;
                             }
+                            // A cap rejection during promotion is terminal.
+                            Ok(Err(SpawnFailure::Rejected(error))) => return Err(error),
                             Ok(Err(SpawnFailure::Failed { tuner })) => {
                                 tracing::warn!(
                                     tuner = %tuner,
@@ -1463,8 +1558,12 @@ impl SessionManager {
                             Err(_) => return Err(AcquireError::Unavailable),
                         }
                     }
-                    // Busy or otherwise unusable: the next route may work
-                    // (mirakc-BS4K treats this the same as a failed start).
+                    // A decode conflict or a SPEC §7 cap ends the request: the
+                    // next route has a different effective channel/tuner and
+                    // would either start a second stream under the other decode
+                    // mode or bypass the cap. The genuinely per-route cases
+                    // (busy, unusable, unsupported) fall through.
+                    Selection::Fail(error) if error.is_terminal() => return Err(error),
                     Selection::Fail(_) => continue 'routes,
                 }
             }
@@ -1573,8 +1672,16 @@ impl SessionManager {
             .collect()
     }
 
-    /// Stops the session for `(type_name, channel)` after `subscriber_id` (the
-    /// scan's own subscription) has been dropped, returning whether it did.
+    /// Stops the session for `(type_name, effective_channel)` after
+    /// `subscriber_id` (the scan's own subscription) has been dropped,
+    /// returning whether it did.
+    ///
+    /// `effective_channel` is what was actually acquired — the route's
+    /// effective channel for a routed channel, not the configured/logical one
+    /// (SPEC §6.4). Looking it up by the logical channel would miss the
+    /// scan's own session (keyed by the route's effective channel) and could
+    /// stop an unrelated session that happens to use the logical channel value.
+    /// Callers pass [`Subscription::channel`], which is exactly this identity.
     ///
     /// This is the channel scan's "release the scan session before the next
     /// channel" step (SPEC §8.1). Dropping a [`Subscription`] closes its mpsc
@@ -1591,10 +1698,12 @@ impl SessionManager {
     pub async fn release_session(
         &self,
         type_name: &str,
-        channel: &str,
+        effective_channel: &str,
         subscriber_id: u64,
     ) -> bool {
-        let lookup = |state: &State| Inner::session_for_channel(state, type_name, channel).cloned();
+        let lookup = |state: &State| {
+            Inner::session_for_channel(state, type_name, effective_channel).cloned()
+        };
         let deadline = tokio::time::Instant::now() + RELEASE_TIMEOUT;
         loop {
             let session = lookup(&lock(&self.inner.state));
@@ -1632,7 +1741,7 @@ impl SessionManager {
         tracing::debug!(
             session_id = session.id,
             type_name,
-            channel,
+            channel = effective_channel,
             "releasing session"
         );
         session.close_broadcast();
@@ -1754,8 +1863,14 @@ enum SpawnFailure {
         tuner: String,
     },
     /// The takeover stopped being legal (a subscriber joined the victim); the
-    /// request is answered with this error and the victim is left running.
-    Aborted(AcquireError),
+    /// victim is left running. A routed request may try the next route, while a
+    /// legacy request is answered with [`AcquireError::Busy`].
+    TakeoverAbandoned,
+    /// A SPEC §7 cap rejected the subscriber while the reservation was being
+    /// promoted. Terminal: the request is answered with the original 429
+    /// ([`AcquireError::TooManySubscribers`] / `TooManySubscribersForIp` /
+    /// `TooManySessions`) instead of falling through to another route.
+    Rejected(AcquireError),
 }
 
 /// What the registry re-check decided about a selected victim, just before the
@@ -1842,7 +1957,10 @@ fn select(
         // does not wait for a spawn it can never join. A routed request joins
         // the session for its effective channel whatever tuner it runs on: the
         // session identity is the effective (type, channel), so there is never
-        // more than one (SPEC §6.4).
+        // more than one (SPEC §6.4). Effective-channel reuse therefore outranks
+        // route order and the route's tuner: route 1 can join a session route 2
+        // (or a legacy/pinned request) started, and that route's `extra-args`
+        // are not re-applied.
         if let Some(name) = pin {
             if name != existing.key.tuner {
                 return Selection::Fail(AcquireError::Busy);
@@ -2351,7 +2469,7 @@ async fn spawn_and_promote(
                     "takeover abandoned: the victim changed before the kill"
                 );
                 release_reservation(inner, &session, Some(victim));
-                let _ = notify.send(Err(SpawnFailure::Aborted(AcquireError::Busy)));
+                let _ = notify.send(Err(SpawnFailure::TakeoverAbandoned));
                 return;
             }
             Takeover::Gone => {
@@ -2386,7 +2504,7 @@ async fn spawn_and_promote(
         }
     };
 
-    let ready = match await_readiness(inner, readiness, &mut notify, probe).await {
+    let ready = match await_readiness(inner, &session, readiness, &mut notify, probe).await {
         Readiness::Ready => true,
         Readiness::Ended(reason) => {
             tracing::warn!(session_id = session.id, %label, %reason, "no output before EOF");
@@ -2469,25 +2587,36 @@ async fn spawn_and_promote(
                 Err(AttachError::Gone) => Err(SpawnFailure::Failed {
                     tuner: tuner_name.clone(),
                 }),
-                Err(AttachError::Rejected(error)) => Err(SpawnFailure::Aborted(error)),
-                Ok(pump) => {
+                Err(AttachError::Rejected(error)) => Err(SpawnFailure::Rejected(error)),
+                Ok((subscription, pump)) => {
                     // The stream can end between the first chunk and the
-                    // promotion (a short recording). Promote, then remove the
-                    // session right away so the subscriber sees the replay
-                    // window followed by EOF and no request joins a dead
-                    // session.
-                    if session.ended.load(Ordering::SeqCst) {
-                        if state
-                            .sessions
-                            .get(&session.key)
-                            .is_some_and(|registered| Arc::ptr_eq(registered, &session))
-                        {
-                            state.sessions.remove(&session.key);
+                    // promotion (a short recording). When data was delivered,
+                    // promote the subscription (the replay window plus EOF) and
+                    // remove the session right away so no request joins a dead
+                    // session. When it ended with **no** data at all, this is a
+                    // start failure: returning the subscription would hand the
+                    // caller an empty 200 and hide the failure from the route
+                    // walker.
+                    if session.ended.load(Ordering::SeqCst)
+                        && !session.had_data.load(Ordering::SeqCst)
+                    {
+                        Err(SpawnFailure::Failed {
+                            tuner: tuner_name.clone(),
+                        })
+                    } else {
+                        if session.ended.load(Ordering::SeqCst) {
+                            if state
+                                .sessions
+                                .get(&session.key)
+                                .is_some_and(|registered| Arc::ptr_eq(registered, &session))
+                            {
+                                state.sessions.remove(&session.key);
+                            }
+                            session.set_phase(SessionPhase::Failed);
+                            session.close_broadcast();
                         }
-                        session.set_phase(SessionPhase::Failed);
-                        session.close_broadcast();
+                        Ok((subscription, pump))
                     }
-                    Ok(pump)
                 }
             }
         }
@@ -2587,6 +2716,7 @@ enum Readiness {
 /// start failure.
 async fn await_readiness(
     inner: &Arc<Inner>,
+    session: &Arc<Session>,
     readiness: oneshot::Receiver<Option<String>>,
     notify: &mut oneshot::Sender<Result<Subscription, SpawnFailure>>,
     probe: bool,
@@ -2600,6 +2730,10 @@ async fn await_readiness(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::select! {
+            // The readiness report wins over the timer. Without this, tokio may
+            // poll the timer first when both are ready at the deadline and
+            // return `Ready` for a process that already exited without data.
+            biased;
             result = &mut readiness => match result {
                 Ok(None) => return Readiness::Ready,
                 Ok(Some(reason)) => return Readiness::Ended(reason),
@@ -2611,11 +2745,25 @@ async fn await_readiness(
                     return Readiness::ShuttingDown;
                 }
                 if tokio::time::Instant::now() >= deadline {
+                    if !probe {
+                        return Readiness::TimedOut;
+                    }
                     // A routed tuner that is still alive but has not produced
                     // data within the probe window counts as started (SPEC
-                    // §6.4); the pump keeps running and a late first packet is
-                    // delivered normally.
-                    return if probe { Readiness::Ready } else { Readiness::TimedOut };
+                    // §6.4). The pump may not have reported the exit yet, so a
+                    // merely elapsed window is not enough: verify the process is
+                    // still alive and the session has not ended. A process that
+                    // exited without data is a start failure, and the walker
+                    // must fall back to the next route.
+                    if session.ended.load(Ordering::SeqCst) || !session.process_tree_alive() {
+                        return Readiness::Ended("stream ended before any data".to_string());
+                    }
+                    tracing::info!(
+                        session_id = session.id,
+                        timeout_ms = inner.config.server.tuner_startup_probe_ms,
+                        "startup probe timed out with the tuner still alive; treating it as started"
+                    );
+                    return Readiness::Ready;
                 }
             }
         }
@@ -5294,7 +5442,7 @@ mod tests {
             notify,
         ));
         match result.await {
-            Ok(Err(SpawnFailure::Aborted(AcquireError::Busy))) => {}
+            Ok(Err(SpawnFailure::TakeoverAbandoned)) => {}
             other => panic!("expected the takeover to be abandoned: {other:?}"),
         }
         assert_eq!(victim.phase(), SessionPhase::Ready);
@@ -5940,6 +6088,224 @@ mod tests {
         let seen = std::fs::read_to_string(&observed).expect("observed extra args");
         assert_eq!(seen.trim(), "--route-override");
 
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_routed_decode_conflict_is_terminal_and_does_not_try_another_route() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("t0", &["GR"], &streaming_command(&path)),
+            tuner_yaml("t1", &["GR"], &streaming_command(&path))
+        );
+        // Two routes with different effective channels: a conflict on route 1
+        // must not fall through to route 2, which would start a second stream
+        // under the other decode mode.
+        let channels = routed_channel(
+            "    - tuner: t0\n      channel: \"13\"\n    - tuner: t1\n      channel: \"14\"\n",
+        );
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        let _piped = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("the piped session starts on route 1");
+        let error = manager
+            .acquire_full("GR", "AT-X", user("raw", 50), None, SessionTap::Raw, true)
+            .await
+            .expect_err("decode=0 must conflict, not fall through");
+        assert_eq!(error, AcquireError::DecodeModeConflict);
+
+        let sessions = manager.sessions_snapshot();
+        assert_eq!(sessions.len(), 1, "no second session: {sessions:?}");
+        assert_eq!(sessions[0].tuner, "t0");
+        let t1 = manager
+            .tuners_snapshot()
+            .into_iter()
+            .find(|tuner| tuner.name == "t1")
+            .expect("t1");
+        assert!(t1.is_free, "route 2 must not have been started");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_routed_per_session_cap_is_returned_and_the_existing_subscribers_stream() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let channels = routed_channel("    - tuner: t0\n      channel: \"13\"\n");
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\ntuner_startup_probe_ms: 300\nmax_subscribers_per_ip: 1000\nmax_subscribers_per_session: 1\n";
+        let manager =
+            manager_with_server(&dir, server, &tuners, &channels, &pipelines_passthrough());
+
+        let mut first = manager
+            .acquire("GR", "AT-X", peer("a", [10, 0, 0, 1]), None, true)
+            .await
+            .expect("the first subscriber is accepted");
+        let rejected = manager
+            .acquire("GR", "AT-X", peer("b", [10, 0, 0, 2]), None, true)
+            .await;
+        assert_eq!(rejected.unwrap_err(), AcquireError::TooManySubscribers);
+
+        // The rejection did not disturb the accepted subscriber.
+        let bytes = read_at_least(&mut first.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        drop(first);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_routed_per_ip_cap_is_returned_not_treated_as_busy() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("t0", &["GR"], &streaming_command(&path)),
+            tuner_yaml("t1", &["GR"], &streaming_command(&path))
+        );
+        // The routed channel resolves to the free `t1`, so the per-IP cap is the
+        // only thing that can refuse the request; that refusal must be returned
+        // (429), not fall through to another route or become `Unavailable`.
+        let channels = format!(
+            "{}{}",
+            channels_yaml(&[("GR", "27")]),
+            routed_channel("    - tuner: t1\n      channel: \"14\"\n")
+        );
+        let server = "addr: \":40772\"\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\ntuner_startup_probe_ms: 300\nmax_subscribers_per_ip: 1\nmax_subscribers_per_session: 100\n";
+        let manager =
+            manager_with_server(&dir, server, &tuners, &channels, &pipelines_passthrough());
+
+        let mut first = manager
+            .acquire("GR", "27", peer("a", [10, 0, 0, 1]), None, true)
+            .await
+            .expect("the first subscriber is accepted");
+        let error = manager
+            .acquire("GR", "AT-X", peer("b", [10, 0, 0, 1]), None, true)
+            .await
+            .expect_err("the second request from the same IP is capped");
+        assert_eq!(error, AcquireError::TooManySubscribersForIp);
+
+        let t1 = manager
+            .tuners_snapshot()
+            .into_iter()
+            .find(|tuner| tuner.name == "t1")
+            .expect("t1");
+        assert!(t1.is_free, "the capped request spawned nothing");
+        let bytes = read_at_least(&mut first.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        drop(first);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_route_that_exits_without_data_at_the_probe_boundary_falls_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // The process stays alive for most of the probe window, then exits with
+        // no data: the readiness report may race the probe deadline, but the
+        // walker must still fall back (SPEC §6.4).
+        let tuners = format!(
+            "- name: boundary\n  types: [GR]\n  command: 'sh -c \"sleep 0.3\"'\n{}",
+            tuner_yaml("good", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: boundary\n    - tuner: good\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 500);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("an exit without data must fall back to route 2");
+        assert_eq!(subscription.tuner, "good");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_probe_timeout_delivers_late_data_to_the_subscriber() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // No output within the probe window, then the data arrives: the probe
+        // timeout counts as started (no fallback) and the running pump must
+        // still deliver the late bytes.
+        let command = format!("sh -c \"sleep 0.5; cat {}; sleep 5\"", path.display());
+        let tuners = tuner_yaml("late", &["GR"], &command);
+        let channels = routed_channel("    - tuner: late\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 200);
+
+        let mut subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("a live tuner without data counts as started");
+        assert_eq!(subscription.tuner, "late");
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(
+            bytes.len(),
+            2 * PACKET,
+            "late data after the probe must be delivered"
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stuck_route_does_not_prevent_the_next_route_from_starting() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("t0", &["GR"], &streaming_command(&path)),
+            tuner_yaml("t1", &["GR"], &streaming_command(&path))
+        );
+        // Only the held session's channel is configured; the routes are passed
+        // to `acquire_routed` directly below.
+        let channels = channels_yaml(&[("GR", "99")]);
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        // Occupy route 1's tuner with a session stuck in `Stopping`, so the walk
+        // would have to wait for it.
+        let held = manager
+            .acquire("GR", "99", user("held", 0), None, true)
+            .await
+            .expect("held session");
+        {
+            let state = lock(&manager.inner.state);
+            let session = state.sessions.values().next().expect("held session");
+            session.set_phase(SessionPhase::Stopping);
+        }
+
+        // An already-expired request deadline models a per-route wait that
+        // consumed the whole deadline; route 2 must still be tried.
+        let subscription = manager
+            .acquire_routed(
+                "GR",
+                vec![
+                    RouteTarget {
+                        tuner: "t0".to_string(),
+                        channel: "13".to_string(),
+                        extra_args: String::new(),
+                    },
+                    RouteTarget {
+                        tuner: "t1".to_string(),
+                        channel: "14".to_string(),
+                        extra_args: String::new(),
+                    },
+                ],
+                user("a", 0),
+                SessionTap::Raw,
+                false,
+                false,
+                tokio::time::Instant::now(),
+            )
+            .await
+            .expect("the free route 2 must be tried after route 1 waits out");
+        assert_eq!(subscription.tuner, "t1");
+
+        drop(held);
         manager.shutdown().await;
     }
 }

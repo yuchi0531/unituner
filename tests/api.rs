@@ -799,6 +799,137 @@ async fn a_routed_channel_head_is_validation_only() {
     }
 }
 
+/// Builds a fixture whose `channels.yml` is `channels_yml` and whose two GR
+/// tuners (`t0`, `t1`) stream `ts`, so routed tests can pick either.
+fn two_tuner_routed_fixture(server: &str, channels_yml: &str, ts: &[u8]) -> Fixture {
+    let fixture = Fixture::new_with_server(server, &tuners("true"), channels_yml, PIPELINE_CAT);
+    let path = fixture.write_ts("stream.ts", ts);
+    let command = streaming_command(&path);
+    let tuners_yml = format!(
+        "- name: t0\n  types: [GR]\n  command: '{command}'\n\
+         - name: t1\n  types: [GR]\n  command: '{command}'\n"
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners_yml).expect("rewrite tuners.yml");
+    fixture
+}
+
+#[tokio::test]
+async fn a_routed_decode_conflict_is_409_and_does_not_start_route_two() {
+    let ts = [packet_bytes(0x11), packet_bytes(0x22)].concat();
+    let channels_yml = routed_channels(
+        "    - tuner: t0\n      channel: \"13\"\n    - tuner: t1\n      channel: \"14\"\n",
+    );
+    let fixture = two_tuner_routed_fixture(SERVER, &channels_yml, &ts);
+    let state = fixture.state();
+
+    // A piped session starts on route 1 and stays alive while `first` is held.
+    let first = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // decode=0 for the same channel is a 409: it must not fall through to
+    // route 2 and start a second stream under the other decode mode.
+    let (status, headers, body) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream?decode=0"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+    assert_server_identity(&headers);
+    assert_eq!(json(&body)["code"], 409);
+
+    let tuners_json = json(
+        &send_body(&state, PEER, request(Method::GET, "/api/tuners"))
+            .await
+            .2,
+    );
+    assert_eq!(tuners_json[0]["isUsing"], true, "route 1 keeps its session");
+    assert_eq!(tuners_json[1]["isUsing"], false, "route 2 was not started");
+
+    drop(first);
+}
+
+#[tokio::test]
+async fn a_routed_per_session_cap_is_429_and_the_existing_subscriber_streams() {
+    let ts = [packet_bytes(0x11), packet_bytes(0x22)].concat();
+    let channels_yml = routed_channels("    - tuner: t0\n      channel: \"13\"\n");
+    let server = "addr: \":0\"\nallowed_cidrs:\n  - 127.0.0.0/8\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\ntuner_startup_probe_ms: 300\nmax_subscribers_per_ip: 1000\nmax_subscribers_per_session: 1\n";
+    let fixture = two_tuner_routed_fixture(server, &channels_yml, &ts);
+    let state = fixture.state();
+
+    let first = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body:?}");
+    assert_eq!(json(&body)["code"], 429);
+
+    // The accepted subscriber is unaffected.
+    let bytes = read_first_chunk(first.into_body()).await;
+    assert!(!bytes.is_empty(), "the accepted subscriber keeps streaming");
+    assert_eq!(bytes[0], 0x47, "the bytes are TS");
+}
+
+#[tokio::test]
+async fn a_routed_per_ip_cap_is_429() {
+    let ts = [packet_bytes(0x11), packet_bytes(0x22)].concat();
+    // A plain GR/27 on `t0` and a routed GR/AT-X on the free `t1`.
+    let channels_yml = format!(
+        "{}{}",
+        channels(&[("NHK", "27")]),
+        routed_channels("    - tuner: t1\n      channel: \"14\"\n")
+    );
+    let server = "addr: \":0\"\nallowed_cidrs:\n  - 127.0.0.0/8\nidle_timeout_secs: 30\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\ntuner_startup_probe_ms: 300\nmax_subscribers_per_ip: 1\nmax_subscribers_per_session: 100\n";
+    let fixture = two_tuner_routed_fixture(server, &channels_yml, &ts);
+    let state = fixture.state();
+
+    let first = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    // The routed channel resolves to the free `t1`, so the per-IP cap is the
+    // only refusal; it must be a 429, not a fall-through or a 503.
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body:?}");
+    assert_eq!(json(&body)["code"], 429);
+
+    let tuners_json = json(
+        &send_body(&state, PEER, request(Method::GET, "/api/tuners"))
+            .await
+            .2,
+    );
+    assert_eq!(
+        tuners_json[1]["isUsing"], false,
+        "the capped request spawned nothing"
+    );
+
+    drop(first);
+}
+
 #[tokio::test]
 async fn an_unconfigured_channel_stream_is_404_on_get_and_head() {
     let (fixture, marker) = marker_fixture();

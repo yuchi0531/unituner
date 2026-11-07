@@ -1135,8 +1135,8 @@ pub(crate) async fn scan_channel(
         .0
 }
 
-/// Waits (bounded) until no session for `(type_name, channel)` is still starting
-/// or stopping.
+/// Waits (bounded) until no session for the effective channel(s) of
+/// `(type_name, channel)` is still starting or stopping.
 ///
 /// A cancelled acquire stops its reservation in a detached task, which is
 /// asynchronous: the tuner stays `Starting`/`Stopping` until the process group
@@ -1144,11 +1144,14 @@ pub(crate) async fn scan_channel(
 /// report "busy" because of the channel it just gave up on. A `Ready` session is
 /// someone else's (a user joined first), so it is left alone.
 async fn wait_for_release(manager: &SessionManager, type_name: &str, channel: &str) {
+    // A routed channel's session is keyed by the route's effective channel, not
+    // by the configured `channel` (SPEC §6.4): wait for any of them.
+    let effective = manager.effective_channels(type_name, channel);
     let deadline = Instant::now() + RELEASE_WAIT;
     loop {
         let occupied = manager.sessions_snapshot().iter().any(|session| {
             session.type_name == type_name
-                && session.channel == channel
+                && effective.iter().any(|name| name == &session.channel)
                 && matches!(
                     session.phase,
                     crate::session::SessionPhase::Starting | crate::session::SessionPhase::Stopping
@@ -1180,11 +1183,14 @@ async fn scan_channel_watched(
 ) -> (ChannelOutcome, bool) {
     // SPEC §8: scan is a plain subscriber on the shared broadcast. Joining a
     // session a user already holds is therefore correct, and it must not be
-    // released afterwards.
-    let preexisting = manager
+    // released afterwards. The check is made against the **effective** channel
+    // after the acquire (below), because a routed channel's session is keyed by
+    // the route's effective channel, not by the configured one (SPEC §6.4).
+    let before: HashSet<(String, String)> = manager
         .sessions_snapshot()
-        .iter()
-        .any(|session| session.type_name == type_name && session.channel == channel);
+        .into_iter()
+        .map(|session| (session.type_name, session.channel))
+        .collect();
 
     let user = TunerUser::new("scan", SCAN_PRIORITY);
     // One budget per channel covers tuning *and* reading (SPEC §8). The
@@ -1251,8 +1257,13 @@ async fn scan_channel_watched(
     let mut cancelled = false;
     // Remembered before the subscription is dropped: it tells the release path
     // which subscriber was ours, so a client that attached meanwhile keeps the
-    // session alive while a stale scan subscriber does not wedge it.
+    // session alive while a stale scan subscriber does not wedge it. The
+    // effective channel is the session identity the release must use (SPEC
+    // §6.4); `preexisting` is decided against it too, so a routed channel does
+    // not mistake an unrelated session on the logical channel name for its own.
     let subscriber_id = subscription.subscriber_id;
+    let effective_channel = subscription.channel.clone();
+    let preexisting = before.contains(&(type_name.to_string(), effective_channel.clone()));
     let preempted = subscription.preempted.clone();
     loop {
         let chunk = match shutdown.as_deref_mut() {
@@ -1285,7 +1296,7 @@ async fn scan_channel_watched(
                         drop(subscription);
                         if !preexisting {
                             manager
-                                .release_session(type_name, channel, subscriber_id)
+                                .release_session(type_name, &effective_channel, subscriber_id)
                                 .await;
                         }
                         return (ChannelOutcome::Services(sink.found), cancelled);
@@ -1308,7 +1319,7 @@ async fn scan_channel_watched(
     drop(subscription);
     if !preexisting {
         manager
-            .release_session(type_name, channel, subscriber_id)
+            .release_session(type_name, &effective_channel, subscriber_id)
             .await;
     }
 
@@ -2953,6 +2964,87 @@ mod tests {
         );
 
         drop(viewer);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scan_releases_the_routed_channels_effective_session_only() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mux = dir.path().join("mux.bin");
+        let mut packet = vec![0x11u8; crate::tsframe::TS_PACKET_SIZE];
+        packet[0] = 0x47;
+        std::fs::write(&mux, [packet.clone(), packet.clone(), packet].concat()).expect("write mux");
+        let command = format!("sh -c \"cat {}; sleep 30\"", mux.display());
+        for (name, body) in [
+            (
+                "server.yml",
+                "addr: \":0\"\nidle_timeout_secs: 30\n".to_string(),
+            ),
+            (
+                "tuners.yml",
+                format!(
+                    "- name: t0\n  types: [GR]\n  command: '{command}'\n\
+                     - name: t1\n  types: [GR]\n  command: '{command}'\n"
+                ),
+            ),
+            (
+                "channels.yml",
+                "- name: AT-X\n  type: GR\n  channel: \"AT-X\"\n  routes:\n    - tuner: t0\n      channel: \"13\"\n"
+                    .to_string(),
+            ),
+            (
+                "pipelines.yml",
+                "pipelines:\n  pass:\n    - \"cat\"\ntypes: {}\n".to_string(),
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), body).expect("write config");
+        }
+        let config = Arc::new(Config::load(dir.path()).expect("config loads"));
+        let manager =
+            SessionManager::new(Arc::clone(&config), crate::services::ServiceTable::new());
+
+        // An unrelated session using the *logical* channel name, created by a
+        // pinned request on the other tuner (pinning ignores routes). It is left
+        // idle so nothing but the release path could stop it.
+        let pinned = manager
+            .acquire(
+                "GR",
+                "AT-X",
+                TunerUser::new("viewer", 0),
+                Some("t1".to_string()),
+                true,
+            )
+            .await
+            .expect("pinned acquire");
+        assert_eq!(pinned.channel, "AT-X");
+        drop(pinned);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while manager
+            .sessions_snapshot()
+            .iter()
+            .any(|session| session.channel == "AT-X" && session.users != 0)
+        {
+            assert!(std::time::Instant::now() < deadline, "session never idle");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The scan tunes the routed channel; its session is keyed by the route's
+        // effective channel "13", not by "AT-X".
+        let outcome = scan_channel(&manager, "GR", "AT-X", Duration::from_millis(200)).await;
+        assert!(matches!(outcome, ChannelOutcome::NoSignal), "{outcome:?}");
+
+        let sessions = manager.sessions_snapshot();
+        assert!(
+            sessions.iter().all(|session| session.channel != "13"),
+            "the routed scan session was not released: {sessions:?}"
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.channel == "AT-X" && session.tuner == "t1"),
+            "the unrelated logical-channel session was disturbed: {sessions:?}"
+        );
+
         manager.shutdown().await;
     }
 }
