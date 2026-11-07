@@ -201,12 +201,14 @@ pub fn rewrite_pat_for_service(section_bytes: &[u8], service_id: u16) -> Option<
     }
     let body = pat_body(section_bytes)?;
 
-    let mut entries: Vec<[u8; 4]> = Vec::new();
+    // Two passes over the (small) entry loop, no intermediate Vec: count
+    // the entries to keep and check the target exists, then copy directly.
+    let mut keep = 0usize;
     let mut found = false;
     for entry in body.chunks_exact(4) {
         let program_number = u16::from_be_bytes([entry[0], entry[1]]);
         if program_number == 0 || program_number == service_id {
-            entries.push([entry[0], entry[1], entry[2], entry[3]]);
+            keep += 1;
             found |= program_number == service_id;
         }
     }
@@ -216,7 +218,7 @@ pub fn rewrite_pat_for_service(section_bytes: &[u8], service_id: u16) -> Option<
 
     // 5 bytes: transport_stream_id (2), version/current_next (1),
     // section_number (1), last_section_number (1).
-    let section_length = 5 + entries.len() * 4 + 4;
+    let section_length = 5 + keep * 4 + 4;
     let mut out = Vec::with_capacity(3 + section_length);
     out.push(TABLE_ID_PAT);
     out.push(0xB0 | ((section_length >> 8) as u8 & 0x0F));
@@ -225,8 +227,11 @@ pub fn rewrite_pat_for_service(section_bytes: &[u8], service_id: u16) -> Option<
     out.push(section_bytes[5]); // reserved bits, version, current_next
     out.push(0x00); // section_number
     out.push(0x00); // last_section_number
-    for entry in &entries {
-        out.extend_from_slice(entry);
+    for entry in body.chunks_exact(4) {
+        let program_number = u16::from_be_bytes([entry[0], entry[1]]);
+        if program_number == 0 || program_number == service_id {
+            out.extend_from_slice(entry);
+        }
     }
     let crc = crc32_mpeg2(&out);
     out.extend_from_slice(&crc.to_be_bytes());
@@ -242,7 +247,9 @@ struct PatState {
     expected: Option<usize>,
     /// The packet that started the section, kept as the template for the
     /// rewritten output. `None` when no section is in progress.
-    template: Option<Vec<u8>>,
+    /// Stored inline (188 bytes) to avoid a heap allocation per multi-
+    /// packet PAT.
+    template: Option<[u8; TS_PACKET_SIZE]>,
     /// Payload offset of [`template`](Self::template).
     template_offset: usize,
     /// Continuity counter of the last PAT packet with a payload.
@@ -289,6 +296,10 @@ pub struct ServiceFilter {
     pmt_assembler: SectionAssembler,
     /// Bytes of a trailing partial packet, kept for the next push.
     buf: Vec<u8>,
+    /// O(1) allow-set for PIDs (8192 bits): fixed + PMT + PCR + ES.
+    /// Rebuilt only when the PAT/PMT changes the set, so the per-packet
+    /// hot path is a bit test instead of two linear scans.
+    allowed_bitmap: [u64; 128],
 
     /// Packets offered to the filter.
     pub packets_in: u64,
@@ -338,6 +349,13 @@ impl ServiceFilter {
             pat: PatState::default(),
             pmt_assembler: SectionAssembler::new(),
             buf: Vec::new(),
+            allowed_bitmap: {
+                let mut bm = [0u64; 128];
+                for &pid in &FIXED_PIDS {
+                    bm[(pid >> 6) as usize] |= 1u64 << (pid & 63);
+                }
+                bm
+            },
             packets_in: 0,
             packets_out: 0,
             packets_dropped_unknown_pid: 0,
@@ -377,17 +395,46 @@ impl ServiceFilter {
     /// (fewer than 188) are buffered and completed by a later call, so chunk
     /// boundaries never change the output.
     pub fn push(&mut self, packets: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(packets.len().min(1 << 20));
+        if self.buf.is_empty() {
+            // Fast path: process in place, only the trailing partial
+            // (<188 bytes) is ever copied into the buffer.
+            let complete = packets.len() - packets.len() % TS_PACKET_SIZE;
+            for packet in packets[..complete].chunks_exact(TS_PACKET_SIZE) {
+                self.process(packet, &mut out);
+            }
+            self.buf.extend_from_slice(&packets[complete..]);
+            return out;
+        }
         let mut buf = std::mem::take(&mut self.buf);
         buf.extend_from_slice(packets);
         let complete = buf.len() - buf.len() % TS_PACKET_SIZE;
-
-        let mut out = Vec::new();
         for packet in buf[..complete].chunks_exact(TS_PACKET_SIZE) {
             self.process(packet, &mut out);
         }
         buf.drain(..complete);
         self.buf = buf;
         out
+    }
+
+    fn rebuild_allowed(&mut self) {
+        self.allowed_bitmap = [0u64; 128];
+        let set = |bm: &mut [u64; 128], pid: u16| {
+            debug_assert!(pid <= NULL_PID, "PID out of the 13-bit range");
+            bm[(pid >> 6) as usize] |= 1u64 << (pid & 63);
+        };
+        for &pid in &FIXED_PIDS {
+            set(&mut self.allowed_bitmap, pid);
+        }
+        if let Some(pid) = self.pmt_pid {
+            set(&mut self.allowed_bitmap, pid);
+        }
+        if let Some(pid) = self.pcr_pid {
+            set(&mut self.allowed_bitmap, pid);
+        }
+        for &pid in &self.es_pids {
+            set(&mut self.allowed_bitmap, pid);
+        }
     }
 
     /// Handles one 188-byte packet.
@@ -430,11 +477,9 @@ impl ServiceFilter {
     }
 
     /// Whether `pid` should be forwarded according to the current knowledge.
+    #[inline]
     fn is_allowed(&self, pid: u16) -> bool {
-        FIXED_PIDS.contains(&pid)
-            || Some(pid) == self.pmt_pid
-            || Some(pid) == self.pcr_pid
-            || self.es_pids.contains(&pid)
+        (self.allowed_bitmap[(pid >> 6) as usize] >> (pid & 63)) & 1 == 1
     }
 
     /// Buffers PAT packets and emits the rewritten PAT once its section is
@@ -537,10 +582,10 @@ impl ServiceFilter {
             return used;
         }
 
-        let section = self.pat.partial[..expected].to_vec();
+        let section = std::mem::take(&mut self.pat.partial);
         let template = self.pat.template.take();
         let template_offset = self.pat.template_offset;
-        self.pat.abandon();
+        self.pat.expected = None;
         if let Some(template) = template {
             self.emit_pat(&section, &template, template_offset, out);
         }
@@ -561,7 +606,8 @@ impl ServiceFilter {
             if rest.len() < 3 {
                 // The header is split across packets: buffer what there is and
                 // let the continuation path compute the length.
-                self.pat.template = Some(packet.to_vec());
+                debug_assert_eq!(packet.len(), TS_PACKET_SIZE);
+                self.pat.template = packet.try_into().ok();
                 self.pat.template_offset = payload_offset;
                 self.pat.partial.extend_from_slice(rest);
                 return;
@@ -571,11 +617,16 @@ impl ServiceFilter {
                 return;
             }
             if rest.len() >= total {
-                self.emit_pat(&rest[..total], packet, payload_offset, out);
+                // Callers slice whole packets, so this cannot fail; making it a
+                // panic instead of a silent drop keeps a future caller honest.
+                let template: &[u8; TS_PACKET_SIZE] =
+                    packet.try_into().expect("callers pass whole packets");
+                self.emit_pat(&rest[..total], template, payload_offset, out);
                 rest = &rest[total..];
             } else {
+                debug_assert_eq!(packet.len(), TS_PACKET_SIZE);
                 self.pat.expected = Some(total);
-                self.pat.template = Some(packet.to_vec());
+                self.pat.template = packet.try_into().ok();
                 self.pat.template_offset = payload_offset;
                 self.pat.partial.extend_from_slice(rest);
                 return;
@@ -601,7 +652,7 @@ impl ServiceFilter {
     fn emit_pat(
         &mut self,
         section: &[u8],
-        template: &[u8],
+        template: &[u8; TS_PACKET_SIZE],
         payload_offset: usize,
         out: &mut Vec<u8>,
     ) {
@@ -620,21 +671,23 @@ impl ServiceFilter {
             self.dropped_pat_sections += 1;
             return;
         }
-        let mut packet = template.to_vec();
+        // Copy the template straight into `out` and patch it in place:
+        // one copy instead of template->Vec + Vec->out.
+        let base = out.len();
+        out.extend_from_slice(template);
         let cc = match self.pat.out_cc {
             Some(cc) => cc.wrapping_add(1) & 0x0F,
             None => 0,
         };
         self.pat.out_cc = Some(cc);
-        packet[3] = (packet[3] & 0xF0) | cc;
+        out[base + 3] = (out[base + 3] & 0xF0) | cc;
         // Every emitted packet begins a section, even when the template was a
         // continuation packet of the original (PUSI clear).
-        packet[1] |= 0x40;
-        packet[payload_offset] = 0x00;
-        packet[payload_offset + 1..payload_offset + 1 + rewritten.len()]
+        out[base + 1] |= 0x40;
+        out[base + payload_offset] = 0x00;
+        out[base + payload_offset + 1..base + payload_offset + 1 + rewritten.len()]
             .copy_from_slice(&rewritten);
-        packet[payload_offset + 1 + rewritten.len()..].fill(0xFF);
-        out.extend_from_slice(&packet);
+        out[base + payload_offset + 1 + rewritten.len()..base + TS_PACKET_SIZE].fill(0xFF);
         self.packets_out += 1;
         self.pat_rewrites += 1;
 
@@ -655,6 +708,7 @@ impl ServiceFilter {
         self.es_pids.clear();
         self.pmt_version = None;
         self.pmt_seen = false;
+        self.rebuild_allowed();
     }
 
     /// Applies a complete PMT section when it describes the target programme
@@ -674,24 +728,44 @@ impl ServiceFilter {
         }
 
         let version = Some(pmt.version_number);
-        let mut streams: Vec<u16> = pmt
-            .streams
-            .iter()
-            .map(|&(_, pid)| pid)
-            .filter(|&pid| pid != NULL_PID)
-            .collect();
-        streams.sort_unstable();
-        streams.dedup();
-
+        // Fast path: the common case is a retransmitted, unchanged PMT.
+        // Compare as sets without allocating (streams are few).
+        if self.pmt_seen && self.pmt_version == version && self.pcr_pid == Some(pmt.pcr_pid) {
+            let mut distinct = 0usize;
+            let mut all_known = true;
+            for (i, &(_, pid)) in pmt.streams.iter().enumerate() {
+                if pid == NULL_PID {
+                    continue;
+                }
+                if pmt.streams[..i].iter().any(|&(_, p)| p == pid) {
+                    continue;
+                }
+                distinct += 1;
+                if !self.es_pids.contains(&pid) {
+                    all_known = false;
+                }
+            }
+            if all_known && distinct == self.es_pids.len() {
+                return;
+            }
+        }
+        let mut streams: Vec<u16> = Vec::with_capacity(pmt.streams.len());
+        for &(_, pid) in &pmt.streams {
+            if pid != NULL_PID && !streams.contains(&pid) {
+                streams.push(pid);
+            }
+        }
         let changed = !self.pmt_seen
             || self.pmt_version != version
             || self.pcr_pid != Some(pmt.pcr_pid)
-            || self.es_pids != streams;
+            || self.es_pids.len() != streams.len()
+            || streams.iter().any(|pid| !self.es_pids.contains(pid));
         if changed {
             self.pmt_seen = true;
             self.pmt_version = version;
             self.pcr_pid = Some(pmt.pcr_pid);
             self.es_pids = streams;
+            self.rebuild_allowed();
             self.pmt_updates += 1;
         }
     }

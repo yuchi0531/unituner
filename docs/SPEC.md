@@ -170,6 +170,7 @@ types:                                # チャンネルタイプ → pipeline �
 - **204 → 188 正規化は pipeline 入力側**（tuner stdout 直後）で行う。204B は下位 16B の RS パリティを落とし、188B に揃えた上で pipeline に渡す。先頭 junk は最初の 0x47 まで読み飛ばす。
 - 子プロセスは setsid で専用プロセスグループに置き、SIGTERM→猶予→SIGKILL をグループ全体に送る。
 - プロセスツリーの部分的な spawn 失敗（tuner は起動したのに pipeline 段が起動しない等）は、セッションを「登録済みだが出力なし」にしないこと。起動失敗時は Session を作らずに落とし、tuner 側のプロセスも確実に kill する。
+- TS 正規化（`tsframe.rs`）は読み出し済みの先頭バイトをオフセットで進め、パケットを 1 個捨てるたびの `memmove` を避ける（バッファは全消費時、または未使用領域が 64 KiB 以上になったときに圧縮する）。188 バイトで連続する区間は 1 回のコピーでまとめて出力する。
 
 ### 4.1 `decode=0`
 
@@ -186,6 +187,10 @@ types:                                # チャンネルタイプ → pipeline �
   - PAT を対象プログラム 1 件のみに書き換え **+ CRC32 (MPEG-2) 再計算**
   - 対象 PMT（PCR_PID 含む）+ 対象 ES PIDs + 固定 PID (`0x0000` / `0x0001` / `0x0010` / `0x0011`) のみ通過
   - NULL (`0x1FFF`) と TEI 付きパケットは破棄
+- 実装メモ:
+  - PID の通過判定は 8192 bit のビットマップ（`allowed_bitmap: [u64; 128]`）で行い、PAT/PMT が PID 集合を変えたときだけ再構築する（パケットごとの線形探索をしない）。
+  - PAT 書き換えの CRC32 (MPEG-2) はテーブル駆動で計算する。書き換えは、188 バイト固定配列で保持したテンプレートを出力バッファへコピーし、その場でパッチする（テンプレート → `Vec` → 出力の二重コピーをしない）。
+  - 入力が 188 の倍数でバッファに端数が無い場合、パケットはコピーせず入力スライス上でそのまま処理する。
 - アクセスは ServiceItemId（`nid*1e5 + sid`）または sid 直指定の両方を許容する。ただし衝突回避：完全一致（ServiceItemId）を優先し、sid 直指定は一意な場合のみ解決する。複数 nid で同じ sid が存在する場合は 404。
 
 ## 6. チューナー選択・競合・奪取
@@ -303,6 +308,8 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 - テーブルが ready に至るまでは `/api/services/{id}/stream` が 404 を返してよい（README に記載）。
 - ARIB サービス名/SDT デコード：`siketyan/arib-rs`（MIT、STD-B24 text / STD-B10 TS SI tables）を第一候補とし、実 TS で早期検証する。動かなければ手書き SI パーサにフォールバックする。
 - スキャンのスケジュール（定期 re-scan の要否・間隔）は要定義。
+- ARIB テキストのデコードは「0x21..0x7E だけなら ASCII」というショートカットをしない。初期の GL は 2 バイト漢字であり、`25 46 25 6C 45 6C` は `%F%lEl` ではなく「テレ東」になる。現在の designation を知っているのはデコーダだけなので、常に arib デコーダを通す。
+- `SiParser` は PID ごとに最後にパースしたセクションをキャッシュし、同一バイト列の再送では CRC・パース・ARIB デコードを省略する。キャッシュヒットでも PAT の network id スタンプと NIT の副作用（network id / TSID 集合の更新）は再適用する。
 
 ### 8.1 チャンネル探索 API（mirakurun 本家の `PUT /api/config/channels/scan` 互換）
 
@@ -327,6 +334,9 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 - 実行中の重複リクエストは **409 `{"code":409,"reason":"Already Scanning"}`**。
 - 探索は「未登録のチャンネルを実際にチューニング → SDT/NIT から名前とサービスを取得 → channels.yml に追加」の流れ。既存の登録済みエントリには触れない。`refresh=true` のときだけ既存エントリを列挙し直して置き換える。
 - 完了後はユーザーに restart を案内する（`**RESTART REQUIRED**` を出力。自動再起動はしない）。
+- **早期終了**: 探索と起動時スキャンは、1 チャンネルにつき PAT + PMT + 完全な SDT-actual + NIT-actual が揃った時点でそのチャンネルの読み取りを打ち切る。SDT-actual の完了だけでは打ち切らない（NIT-actual が未着のまま終わると network id が SDT の `original_network_id` に落ちるため）。SDT 完了後は `SI_GRACE_AFTER_SDT`（1.5 秒）だけ残りのコアテーブルを待つ（実測で PAT は約 100 ms、PMT/SDT は約 200〜500 ms、NIT-actual は約 0.4〜0.8 秒で繰り返す。700 ms では NIT の 1 周期を取りこぼしうるため 1.5 秒とする）。猶予内に NIT-actual が来なければ SDT の `original_network_id` を使う。1 チャンネルが 25 秒の予算（`CHANNEL_TIMEOUT`）を最後まで使うことはない。
+- **並列度**: その type の**有効チューナー数**（`tuner_count_for`）を上限に並列でスキャンする。1 台なら従来どおり直列、N 台なら 1 パスが概ね「チャンネル数 / N」の時間で終わる。結果は設定順に畳み込むため、進捗テキストと再試行キューは完了順に依存しない。
+- 起動時スキャンのパスでは、busy / 奪取（preempted）のチャンネルは他のチャンネルを塞がず再試行キューへ回る。奪取されたチャンネルでも、部分受信の SDT から得られたサービスは捨てずに反映する。
 
 #### 使用例（curl）
 
@@ -375,6 +385,7 @@ Found 1 channels for 13
 - Stream 系は HEAD も可。`X-Mirakurun-Tuner-User-ID` ヘッダを付与する。
 - `decode=0` は 4.1 通り。
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` は 6.3 通り。
+- `/api/channels` は 1 リクエストにつきサービス表のスナップショット（`ServiceTable::list()`）を 1 回だけ取り、各チャンネルの services はそこから該当分をフィルタして埋める（チャンネル数ぶんの全件 clone + sort をしない）。`/api/channels/{type}/{channel}` は `list_by_channel` で該当チャンネル分だけを取得する。
 - 未実装（404 `{code,reason}`）: `/api/programs/{id}(/stream)`, jobs/events/log, config CRUD（mirakurun 互換外。`PUT /api/config/channels/scan` のみ例外）, `/api/config/channels/scan` の GET ポーリング, `/api/restart`, iptv/HDHR/websocket, logos, `/rpc`, `/docs`, mirakurun 静的 web UI。
   - `hasLogoData:false` なので KonomiTV は `/api/services/{id}/logo` を呼ばない。
 
@@ -391,6 +402,9 @@ Found 1 channels for 13
 - 保存フロー：入力バリデーション（3.6）→ `.bak` 世代管理付きコピー → tmp 書き込み → fsync → 原子的 rename。失敗時は書き戻さない。
   - 同時編集を防ぐ楽観排他（ETag / version）を持つ。1 世代のみの `.bak` は上書きで失われるため、時刻付き世代管理とするか否かは要定義。
 - 反映：「再起動」ボタン → サーバ側で新 config を再検証 → **自己再exec**（`std::env::current_exe()`、systemd 非依存）。再検証失敗なら再起動せずエラー返却（壊れた設定で自己再exec してループしない）。
+- CSRF ガード（変更系 API）は `Origin` と `Host` を比較する。`Host` が無い HTTP/2 では URI の authority を使い、ホスト名の比較は ASCII の大文字小文字を無視する。
+- 再起動はチャンネルスキャン実行中なら **409 `Already Scanning`** を返す（スキャンが `channels.yml` を read-merge-write している最中の `exec` を避ける）。
+- ステータス表示用の `channels.yml` エントリ数は `(path, mtime, size)` をキーにキャッシュし、ファイルが変わったときだけ再パース・再検証する。
 - `/api/config/{tuners,channels}`（Mirakurun 互換の mutation path）は実装しない。非対応は README 制限欄に明記する。
 
 ## 11. プロジェクト構成
@@ -423,7 +437,7 @@ unituner/
 4. HTTP API サブセット + streaming + ヘッダ + HEAD
 5. 内蔵 TSFilter（service stream 適用、pipeline 後段）
 6. webui（内部 CRUD API + 埋め込み SPA + 再起動ボタン自己再exec）
-7. 起動時サービススキャン + チャンネル探索 API（priority −1000、実行中チャンネルは共有 TS から更新、アイドルなら一時チューン、既定 timeout 10s/ch。探索結果は channels.yml へ追加のみ・手動再起動）
+7. 起動時サービススキャン + チャンネル探索 API（priority −1000、実行中チャンネルは共有 TS から更新、アイドルなら一時チューン、既定 25s/ch（SI が揃えば早期終了）。探索結果は channels.yml へ追加のみ・手動再起動）
 8. 統合テスト + README
 
 ## 13. 検証（end-to-end）
@@ -460,3 +474,5 @@ unituner/
 - webui の Channels は `routes` / `extra-args` も編集できる（route の追加・削除・並べ替えを含む）。
 - `PUT /api/config/channels/scan` は curl 等で直接叩く（webui には出さない）。`async` / `GET` ポーリングは非対応。channels.yml 書き換え後は **RESTART REQUIRED**（自動再起動しない）
 - 探索 API は既存エントリを維持し、**追加のみ**行う（type 単位の完全置換はしない。`refresh=true` のときのみ既存を置換）
+- スキャンの SDT 完了後の猶予（1.5 秒）は時間の上限であり保証ではない。SDT 完了から 1.5 秒以内に NIT-actual が送出されない多重では、そのチャンネルの network id は SDT の `original_network_id` 由来になる
+- DRCS グリフからデコードしたサービス名は U+FFFD になる（DRCS は Unicode に対応付けがない）

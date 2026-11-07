@@ -57,7 +57,30 @@ use crate::config::{validate_channel_value, validate_type_name, Config};
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How often a process group is polled while waiting for it to exit.
-const EXIT_POLL: Duration = Duration::from_millis(20);
+///
+/// 10 ms, not a full sleep: the loop checks the group *before* sleeping and
+/// returns as soon as the last member is gone, so a child that exits in
+/// ~10 ms costs ~0-10 ms of teardown instead of the whole `KILL_GRACE`.
+const EXIT_POLL: Duration = Duration::from_millis(10);
+
+/// Upper bound for [`PipelineHandle::wait`] before it escalates to `SIGKILL`
+/// and stops waiting. Without a bound, a child stuck in D-state (uninterruptible
+/// sleep, e.g. a wedged tuner driver) would hang `wait()` forever, and with it
+/// the spawn-failure cleanup path would hang too. 10 s is far above any normal
+/// exit latency but keeps a wedged child from wedging the caller.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to keep reaping after a `SIGKILL` issued by the `wait()` timeout
+/// or by [`PipelineHandle::kill_all`]. `SIGKILL` death is normally visible
+/// within one poll interval; this is only a ceiling for a D-state child that
+/// cannot die until its I/O completes.
+///
+/// It equals [`KILL_GRACE`] rather than being shorter: a leader in D-state
+/// (a wedged tuner driver) can outlive any bound, so shortening the wait after
+/// `SIGKILL` would only make it more likely that `kill_all` reports a dead
+/// group while the device is still held. The caller is told the truth either
+/// way (see the `bool` return).
+const POST_KILL_REAP: Duration = KILL_GRACE;
 
 /// Stages of one `pipelines.yml` entry, in stdin-to-stdout order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -336,7 +359,7 @@ impl PipelineHandle {
 
     /// Stops the chain with the SPEC §6.2 grace period.
     pub async fn stop(&self) {
-        self.kill_all(KILL_GRACE).await;
+        let _ = self.kill_all(KILL_GRACE).await;
     }
 
     /// Sends `SIGTERM` to every stage's process group, waits up to `grace` for
@@ -346,32 +369,66 @@ impl PipelineHandle {
     /// children: a grandchild that outlives its parent but ignores `SIGTERM` is
     /// still killed after the grace period. Returns as soon as the group is
     /// gone, without sleeping out the rest of `grace`.
-    pub async fn kill_all(&self, grace: Duration) {
+    ///
+    /// The `bool` result says whether **every** group is confirmed gone. A
+    /// `false` means a member survived even `SIGKILL` (a child stuck in
+    /// D-state), i.e. the device may still be held: the caller must not treat
+    /// the tuner as free. The direct parent-child fallback signal is used only
+    /// for the initial `SIGTERM`, before anything is reaped, so no recycled PID
+    /// can be hit.
+    pub async fn kill_all(&self, grace: Duration) -> bool {
         let pids = self.pids.clone();
         if pids.is_empty() {
-            return;
+            return true;
         }
         for pid in &pids {
-            signal_group(*pid, libc::SIGTERM);
+            signal_group(*pid, libc::SIGTERM, true);
         }
 
         let deadline = Instant::now() + grace;
         loop {
+            // Reap first: a zombie still counts as a process-group member for
+            // `killpg(pgid, 0)`, so checking the group before reaping would
+            // report "still alive" for a group whose leader already exited.
             reap(&self.children);
             if pids.iter().all(|pid| !group_exists(*pid)) {
-                return;
+                return true;
             }
             if Instant::now() >= deadline {
+                // Post-reap: the direct child may already be reaped and its
+                // pid recycled, so a `kill(pid)` fallback could hit a
+                // stranger. Only the process group is signalled here.
                 for pid in &pids {
-                    signal_group(*pid, libc::SIGKILL);
+                    signal_group(*pid, libc::SIGKILL, false);
                 }
-                // Bounded reap, so a stuck `wait` cannot hold the caller.
-                let reap_deadline = Instant::now() + grace;
-                while any_running(&self.children) && Instant::now() < reap_deadline {
+                // After SIGKILL there is no grace left to spend: reap direct
+                // children and confirm the group (incl. grandchildren) is
+                // gone, but only up to POST_KILL_REAP. Previously this waited
+                // another full `grace` (2 s) even though SIGKILLed children
+                // normally die within one poll interval, and it only checked
+                // direct children, so a surviving grandchild was neither
+                // waited for nor confirmed dead.
+                let reap_deadline = Instant::now() + POST_KILL_REAP;
+                loop {
+                    reap(&self.children);
+                    if !any_running(&self.children) && pids.iter().all(|pid| !group_exists(*pid)) {
+                        return true;
+                    }
+                    if Instant::now() >= reap_deadline {
+                        reap(&self.children);
+                        let alive: Vec<u32> = pids
+                            .iter()
+                            .copied()
+                            .filter(|pid| group_exists(*pid))
+                            .collect();
+                        tracing::warn!(
+                            ?alive,
+                            "process groups survived SIGKILL; the device may still be held"
+                        );
+                        return alive.is_empty();
+                    }
                     tokio::time::sleep(EXIT_POLL).await;
                 }
-                reap(&self.children);
-                return;
             }
             tokio::time::sleep(EXIT_POLL).await;
         }
@@ -379,7 +436,17 @@ impl PipelineHandle {
 
     /// Waits until every stage has exited and returns their exit statuses in
     /// pipeline order.
+    ///
+    /// Bounded by [`WAIT_TIMEOUT`]: if a stage is still running after that
+    /// (e.g. stuck in D-state, where even `SIGKILL` cannot take effect until
+    /// the I/O completes), the process groups are `SIGKILL`ed and a short
+    /// bounded reap follows, so this never hangs forever. The statuses of
+    /// the stages that did exit are returned; still-running stages contribute
+    /// nothing. The poll checks *before* sleeping, so a stage that exits
+    /// promptly returns promptly.
     pub async fn wait(&self) -> Vec<ExitStatus> {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let mut timed_out = false;
         loop {
             let (done, statuses) = {
                 let mut children = lock(&self.children);
@@ -392,13 +459,38 @@ impl PipelineHandle {
                             done = false;
                             statuses.push(None);
                         }
-                        Err(_) => statuses.push(None),
+                        // A `try_wait` error does not mean the stage exited,
+                        // so the loop must keep polling instead of returning
+                        // early with a short status list.
+                        Err(_) => {
+                            done = false;
+                            statuses.push(None);
+                        }
                     }
                 }
                 (done, statuses)
             };
             if done {
                 return statuses.into_iter().flatten().collect();
+            }
+            if !timed_out && Instant::now() >= deadline {
+                timed_out = true;
+                for pid in &self.pids {
+                    signal_group(*pid, libc::SIGKILL, false);
+                }
+                // Bounded reap after SIGKILL, so a D-state child cannot hold
+                // the caller past POST_KILL_REAP either.
+            }
+            if timed_out && Instant::now() >= deadline + POST_KILL_REAP {
+                reap(&self.children);
+                // Re-read the (now reaped) statuses: a stage that exited
+                // between the poll above and this return would otherwise lose
+                // its status. `std` caches the status after reaping.
+                let mut children = lock(&self.children);
+                return children
+                    .iter_mut()
+                    .filter_map(|child| child.try_wait().ok().flatten())
+                    .collect();
             }
             tokio::time::sleep(EXIT_POLL).await;
         }
@@ -644,9 +736,12 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
                     stdin: None,
                     stdout: None,
                 };
-                // Best-effort cleanup of the stages that did start.
+                // Best-effort cleanup of the stages that did start. Nothing
+                // has been reaped yet here, so the `kill(pid)` fallback is
+                // still safe (a child that has not reached `setsid` would
+                // otherwise be missed by `killpg`).
                 for pid in &handle.pids {
-                    signal_group(*pid, libc::SIGKILL);
+                    signal_group(*pid, libc::SIGKILL, true);
                 }
                 let _ = handle.wait().await;
                 return Err(PipelineError::Spawn {
@@ -697,13 +792,34 @@ fn spawn_stderr_logger(stderr: tokio::process::ChildStderr, label: String, stage
 }
 
 /// Sends `signal` to the process group led by `pid`, ignoring `ESRCH`.
-fn signal_group(pid: u32, signal: libc::c_int) {
+///
+/// Falls back to signalling the pid directly when `killpg` reports `ESRCH`.
+/// That covers the spawn race where the child has not run `setsid` yet (so
+/// no group with `pgid == pid` exists and the group signal would be lost
+/// entirely, leaving the process to survive the whole grace period), and it
+/// is also the only signal that reaches a leader whose group has already
+/// drained. The fallback is *not* used when `killpg` succeeds, so a leader
+/// that is a group member never gets the signal twice.
+fn signal_group(pid: u32, signal: libc::c_int, allow_pid_fallback: bool) {
     if pid == 0 || pid > i32::MAX as u32 {
         return;
     }
     // SAFETY: `killpg` only takes a pgid and a signal number.
-    unsafe {
-        libc::killpg(pid as libc::pid_t, signal);
+    let result = unsafe { libc::killpg(pid as libc::pid_t, signal) };
+    // The `kill(pid)` fallback covers a child spawned a moment ago that has not
+    // reached `setsid` yet: its group does not exist, so `killpg` is ESRCH and
+    // the leader would otherwise survive the whole grace period. It is only
+    // safe while the child is still unreaped, because after a reap the pid can
+    // be recycled and `kill(pid)` would hit an unrelated process; the
+    // post-reap `SIGKILL` paths therefore pass `false`.
+    if allow_pid_fallback
+        && result != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        // SAFETY: `kill` only takes a pid and a signal number.
+        unsafe {
+            libc::kill(pid as libc::pid_t, signal);
+        }
     }
 }
 

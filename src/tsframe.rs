@@ -140,6 +140,10 @@ fn count_syncs(buf: &[u8], stride: usize, offset: usize) -> usize {
 #[derive(Debug, Default)]
 pub struct TsNormalizer {
     buf: Vec<u8>,
+    /// Start of live bytes in `buf`. Advancing this instead of `drain(..n)`
+    /// avoids an O(remaining) memmove on every `push`/`discard`; the buffer
+    /// is compacted only when fully consumed or after a large skip.
+    start: usize,
     framing: Option<Framing>,
     /// Complete 188-byte packets emitted so far.
     pub packets_out: u64,
@@ -182,7 +186,27 @@ impl TsNormalizer {
 
     /// Bytes currently buffered awaiting more input.
     pub fn buffered(&self) -> usize {
-        self.buf.len()
+        self.buf.len() - self.start
+    }
+
+    /// Live view of the buffered bytes.
+    fn view(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// Compacts the buffer when the dead prefix is large or everything was
+    /// consumed, so the backing store does not grow/shift unnecessarily.
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start >= 65536 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
     }
 
     /// Feeds bytes and returns the complete 188-byte packets that became
@@ -192,12 +216,23 @@ impl TsNormalizer {
     /// Once an unsupported framing (192) is detected, every byte is discarded
     /// and counted, so the internal buffer never grows without bound.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        self.compact();
         self.buf.extend_from_slice(data);
         if self.framing.is_none() {
             self.detect(false);
         }
-        let mut out = Vec::new();
+        // Pre-size from the *decided* framing: one 188-byte packet per input
+        // packet is the ceiling. Reserving before a framing is known burned up
+        // to 12 MiB on junk or a 192-byte stream that yields nothing.
+        let cap = self
+            .framing
+            .and_then(Framing::packet_len)
+            .map_or(0, |packet_len| {
+                (self.buffered() / packet_len) * TS_PACKET_SIZE
+            });
+        let mut out = Vec::with_capacity(cap);
         self.drain_packets(&mut out, false);
+        self.compact();
         out
     }
 
@@ -213,14 +248,15 @@ impl TsNormalizer {
     /// [`finish_and_reset`](Self::finish_and_reset), or it would lock that
     /// guess in permanently.
     pub fn finish(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((self.buffered() / TS_PACKET_SIZE) * TS_PACKET_SIZE);
         if self.framing.is_none() {
             self.detect(true);
         }
         self.drain_packets(&mut out, true);
-        if !self.buf.is_empty() {
-            self.bytes_discarded += self.buf.len() as u64;
+        if self.buffered() > 0 {
+            self.bytes_discarded += self.buffered() as u64;
             self.buf.clear();
+            self.start = 0;
         }
         // End of stream terminates any resynchronisation: a later `push` on
         // this normalizer is a new stream segment, so its first bad sync byte
@@ -240,6 +276,7 @@ impl TsNormalizer {
         let out = self.finish();
         self.framing = None;
         self.buf.clear();
+        self.start = 0;
         out
     }
 
@@ -256,15 +293,16 @@ impl TsNormalizer {
     fn detect(&mut self, force: bool) {
         let mut start = 0usize;
         loop {
-            let Some(rel) = self.buf[start..].iter().position(|&b| b == SYNC_BYTE) else {
+            let Some(rel) = self.view()[start..].iter().position(|&b| b == SYNC_BYTE) else {
                 // No sync byte left: nothing here can start a packet.
-                self.bytes_discarded += self.buf.len() as u64;
+                self.bytes_discarded += self.buffered() as u64;
                 self.buf.clear();
+                self.start = 0;
                 return;
             };
             start += rel;
 
-            let window = &self.buf[start..];
+            let window = &self.view()[start..];
             let votes_188 = count_syncs(window, TS_PACKET_SIZE, 0);
             let votes_204 = count_syncs(window, TS_PACKET_SIZE_204, 0);
             let votes_192 = count_syncs(window, TS_PACKET_SIZE_192, 0);
@@ -320,12 +358,18 @@ impl TsNormalizer {
     }
 
     /// Drops and counts `len` bytes from the front of the buffer.
+    /// O(1): only advances the start offset; compaction is amortised.
     fn discard_prefix(&mut self, len: usize) {
         if len == 0 {
             return;
         }
+        debug_assert!(
+            len <= self.buffered(),
+            "cannot discard more than what is buffered"
+        );
         self.bytes_discarded += len as u64;
-        self.buf.drain(..len);
+        self.start += len;
+        self.compact();
     }
 
     /// Searches for a *confirmed* packet start at or after `from`.
@@ -337,11 +381,12 @@ impl TsNormalizer {
     /// says no more can arrive, in which case the first candidate with a whole
     /// packet buffered is taken.
     fn find_resync(&self, from: usize, packet_len: usize, eof: bool) -> Resync {
+        let buf = self.view();
         let mut candidate = from;
-        while let Some(rel) = self.buf[candidate..].iter().position(|&b| b == SYNC_BYTE) {
+        while let Some(rel) = buf[candidate..].iter().position(|&b| b == SYNC_BYTE) {
             candidate += rel;
-            if candidate + packet_len < self.buf.len() {
-                if self.buf[candidate + packet_len] == SYNC_BYTE {
+            if candidate + packet_len < buf.len() {
+                if buf[candidate + packet_len] == SYNC_BYTE {
                     return Resync::At(candidate);
                 }
                 // A false sync inside a payload: try the next candidate.
@@ -350,7 +395,7 @@ impl TsNormalizer {
             }
             if eof {
                 // No more input can confirm or refute this candidate.
-                return if self.buf.len() - candidate >= packet_len {
+                return if buf.len() - candidate >= packet_len {
                     Resync::At(candidate)
                 } else {
                     Resync::NotFound
@@ -373,8 +418,9 @@ impl TsNormalizer {
         };
         let Some(packet_len) = framing.packet_len() else {
             // Unsupported 192 framing: never emit misaligned bytes.
-            self.bytes_discarded += self.buf.len() as u64;
+            self.bytes_discarded += self.buffered() as u64;
             self.buf.clear();
+            self.start = 0;
             return;
         };
 
@@ -382,12 +428,12 @@ impl TsNormalizer {
         // One physical sync loss may span several `push` calls (the confirming
         // byte has not arrived yet), so the error is counted once.
         let mut resyncing = self.sync_error_pending;
-        while pos < self.buf.len() {
+        while pos < self.buffered() {
             // While resyncing, even a byte that *is* 0x47 is only a candidate:
             // it must be confirmed by the next packet's sync byte. Skipping
             // that check is exactly how a 0x47 in a payload becomes a
             // permanent misalignment.
-            if resyncing || self.buf[pos] != SYNC_BYTE {
+            if resyncing || self.view()[pos] != SYNC_BYTE {
                 if !resyncing {
                     self.sync_errors += 1;
                     resyncing = true;
@@ -405,21 +451,39 @@ impl TsNormalizer {
                         // yet (the stream has not resumed), so keep the event
                         // open to avoid counting the rest of this same loss as
                         // further errors.
-                        self.bytes_discarded += (self.buf.len() - pos) as u64;
-                        pos = self.buf.len();
+                        self.bytes_discarded += (self.buffered() - pos) as u64;
+                        pos = self.buffered();
                     }
                 }
                 continue;
             }
-            if self.buf.len() - pos < packet_len {
+            if self.buffered() - pos < packet_len {
                 break;
             }
-            out.extend_from_slice(&self.buf[pos..pos + TS_PACKET_SIZE]);
-            self.packets_out += 1;
-            pos += packet_len;
+            if packet_len == TS_PACKET_SIZE {
+                // Fast path: a whole run of aligned 188-byte packets is one
+                // contiguous copy instead of one extend per packet.
+                let buf = self.view();
+                let mut run = 1usize;
+                while pos + run * TS_PACKET_SIZE + TS_PACKET_SIZE <= buf.len()
+                    && buf[pos + run * TS_PACKET_SIZE] == SYNC_BYTE
+                {
+                    run += 1;
+                }
+                out.extend_from_slice(&buf[pos..pos + run * TS_PACKET_SIZE]);
+                self.packets_out += run as u64;
+                pos += run * TS_PACKET_SIZE;
+            } else {
+                // 204: strided copy, dropping the 16-byte parity tail.
+                let buf = self.view();
+                out.extend_from_slice(&buf[pos..pos + TS_PACKET_SIZE]);
+                self.packets_out += 1;
+                pos += packet_len;
+            }
         }
         self.sync_error_pending = resyncing;
-        self.buf.drain(..pos);
+        self.start += pos;
+        self.compact();
     }
 }
 

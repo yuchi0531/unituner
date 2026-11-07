@@ -916,6 +916,9 @@ struct Inner {
     /// shutdown returns.
     spawns_in_flight: AtomicUsize,
     spawn_finished: Notify,
+    /// Fired when `shutting_down` is set, so readiness waits can abort
+    /// immediately instead of polling the flag on a fixed interval.
+    shutdown_notify: Notify,
     /// Process trees that were unregistered (takeover, failed reservation) but
     /// are still being stopped. `shutdown` drains this set as well, so a tree
     /// whose takeover was cancelled mid-teardown can never survive: the stop
@@ -1164,6 +1167,7 @@ impl SessionManager {
                 shutting_down: AtomicBool::new(false),
                 spawns_in_flight: AtomicUsize::new(0),
                 spawn_finished: Notify::new(),
+                shutdown_notify: Notify::new(),
                 stopping: Mutex::new(Vec::new()),
                 next_session_id: AtomicU64::new(0),
             }),
@@ -1370,12 +1374,14 @@ impl SessionManager {
                         // miss.
                         Err(AttachError::Gone) => {}
                     }
-                    if !wait_before_retry(&session, wait_deadline, type_name, channel).await {
+                    if !wait_before_retry(&inner, &session, wait_deadline, type_name, channel).await
+                    {
                         return Err(AcquireError::Unavailable);
                     }
                 }
                 Selection::Wait(session) => {
-                    if !wait_before_retry(&session, wait_deadline, type_name, channel).await {
+                    if !wait_before_retry(&inner, &session, wait_deadline, type_name, channel).await
+                    {
                         return Err(AcquireError::Unavailable);
                     }
                     // Do not retry a tuner whose stream failed to start. A
@@ -1500,8 +1506,14 @@ impl SessionManager {
                             Err(AttachError::Rejected(error)) => return Err(error),
                             Err(AttachError::Gone) => {}
                         }
-                        if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
-                            .await
+                        if !wait_before_retry(
+                            &inner,
+                            &session,
+                            wait_deadline,
+                            type_name,
+                            &route.channel,
+                        )
+                        .await
                         {
                             // This route's session is wedged; a later route may
                             // still be free. The overall deadline still bounds
@@ -1511,8 +1523,14 @@ impl SessionManager {
                         }
                     }
                     Selection::Wait(session) => {
-                        if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
-                            .await
+                        if !wait_before_retry(
+                            &inner,
+                            &session,
+                            wait_deadline,
+                            type_name,
+                            &route.channel,
+                        )
+                        .await
                         {
                             continue 'routes;
                         }
@@ -1695,14 +1713,22 @@ impl SessionManager {
     /// The session stays registered (phase `Stopping`) until its process group
     /// has exited, so the tuner is not reported free while the old tree is
     /// still dying.
+    /// `session_id` is the id of the [`Subscription`] this release belongs to.
+    /// A session with a different id was started after the caller subscribed
+    /// (its teardown unregistered the old one), so a stale release must leave
+    /// it alone: "same channel, same subscriber id" alone could stop a live
+    /// client that happens to be subscriber 1 of the newer session.
     pub async fn release_session(
         &self,
         type_name: &str,
         effective_channel: &str,
+        session_id: u64,
         subscriber_id: u64,
     ) -> bool {
         let lookup = |state: &State| {
-            Inner::session_for_channel(state, type_name, effective_channel).cloned()
+            Inner::session_for_channel(state, type_name, effective_channel)
+                .filter(|session| session.id == session_id)
+                .cloned()
         };
         let deadline = tokio::time::Instant::now() + RELEASE_TIMEOUT;
         loop {
@@ -1721,7 +1747,15 @@ impl SessionManager {
             if session.users_is_empty() || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Event-driven: `detach` wakes the session when a subscriber
+            // leaves, so a scan switching channels does not poll every
+            // 10 ms (up to ~10 ms saved per release, and no busy loop when
+            // the pump is starved). `sleep_until` is only the backstop.
+            let changed = session.changed.notified();
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
         }
 
         let session = {
@@ -1775,6 +1809,10 @@ impl SessionManager {
     /// survives.
     pub async fn shutdown(&self) {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
+        // Wake readiness/shutdown waiters at once (leave a permit for one
+        // that has not polled yet); they re-check the flag and abort.
+        self.inner.shutdown_notify.notify_waiters();
+        self.inner.shutdown_notify.notify_one();
 
         // A spawn in progress is not visible to the stop pass below if it has
         // not stored its process tree yet. `SpawnGuard` publishes it, and the
@@ -2728,7 +2766,20 @@ async fn await_readiness(
         READINESS_TIMEOUT
     };
     let deadline = tokio::time::Instant::now() + timeout;
+    // Fast path: the pump may have emitted (or ended) before we even wait.
+    // The oneshot select below would return immediately anyway, but checking
+    // the shutdown flag up front avoids arming a timer for a dead manager.
+    if inner.shutting_down.load(Ordering::SeqCst) {
+        return Readiness::ShuttingDown;
+    }
     loop {
+        // Register the shutdown waiter *before* selecting, so it is armed when
+        // `shutdown()` fires `notify_waiters()`. A `Notified` created after the
+        // wake-up only sees the single sticky permit `notify_one` leaves, and a
+        // second concurrent waiter can consume it, leaving this one asleep
+        // until `sleep_until(deadline)` — up to the whole probe window or
+        // READINESS_TIMEOUT — while `shutdown()` waits on `spawns_in_flight`.
+        let shutdown_wait = inner.shutdown_notify.notified();
         tokio::select! {
             // The readiness report wins over the timer. Without this, tokio may
             // poll the timer first when both are ready at the deadline and
@@ -2740,7 +2791,18 @@ async fn await_readiness(
                 Err(_) => return Readiness::Ended("pipeline dropped readiness".to_string()),
             },
             _ = notify.closed() => return Readiness::Cancelled,
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            // Event-driven shutdown: no 50 ms poll. A spurious wake (e.g.
+            // `resume` racing a second `shutdown`) re-checks the flag.
+            _ = shutdown_wait => {
+                if inner.shutting_down.load(Ordering::SeqCst) {
+                    return Readiness::ShuttingDown;
+                }
+            },
+            // Single deadline timer instead of a 50 ms tick: the probe /
+            // readiness deadline is honoured to the millisecond, not up to
+            // 50 ms late, and an early first TS packet never waits for a tick
+            // (it arrives via the oneshot above).
+            _ = tokio::time::sleep_until(deadline) => {
                 if inner.shutting_down.load(Ordering::SeqCst) {
                     return Readiness::ShuttingDown;
                 }
@@ -2823,26 +2885,64 @@ fn wait_deadline() -> tokio::time::Instant {
 /// latest so a wakeup consumed by another waiter cannot strand this request.
 /// `false` means the request-wide deadline passed: the caller gives up.
 async fn wait_before_retry(
+    inner: &Arc<Inner>,
     session: &Arc<Session>,
     deadline: tokio::time::Instant,
     type_name: &str,
     channel: &str,
 ) -> bool {
-    if tokio::time::Instant::now() >= deadline {
-        tracing::warn!(
-            type_name,
-            channel,
-            session_id = session.id,
-            "gave up waiting for a concurrent spawn"
-        );
-        return false;
+    // Two states mean "go back to `select` and try again":
+    //
+    // 1. `Ready` without a pending takeover — the next `select` joins it.
+    // 2. The session is no longer registered — it is stopping (or its spawn
+    //    failed) and `unregister_stopped` removed it, so the next `select`
+    //    cannot return it again and can pick another tuner or spawn.
+    //
+    // Without (2) a waiter that landed on a `Stopping` session could never
+    // make progress: `unregister_stopped` removes the registry entry without
+    // changing the phase, so the old predicate stayed false until the whole
+    // `wait_deadline` (READINESS_TIMEOUT + 5 s) expired and turned a perfectly
+    // serviceable request, or a scan channel, into a 503 / `NoSignal`.
+    //
+    // Waiting is still correct for a *registered* `Stopping`/`Failed` session
+    // (its teardown publishes `Ready` or removes it, and the 250 ms
+    // `STARTUP_POLL` bounds the cadence), so this cannot spin.
+    let gone = || {
+        let state = lock(&inner.state);
+        !state
+            .sessions
+            .get(&session.key)
+            .is_some_and(|registered| Arc::ptr_eq(registered, session))
+    };
+    let retryable = || {
+        gone()
+            || (session.phase() == SessionPhase::Ready
+                && !session.takeover_pending.load(Ordering::SeqCst))
+    };
+    loop {
+        // Register before re-checking so a wake between the check and the
+        // wait is not lost (`wake` leaves a `notify_one` permit).
+        let changed = session.changed.notified();
+        if retryable() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                type_name,
+                channel,
+                session_id = session.id,
+                "gave up waiting for a concurrent spawn"
+            );
+            return false;
+        }
+        tokio::select! {
+            _ = changed => {}
+            _ = tokio::time::sleep(STARTUP_POLL) => {}
+        }
+        if retryable() {
+            return true;
+        }
     }
-    let changed = session.changed.notified();
-    tokio::select! {
-        _ = changed => {}
-        _ = tokio::time::sleep(STARTUP_POLL) => {}
-    }
-    true
 }
 
 /// Owns a freshly built process tree until it is published to
@@ -3363,6 +3463,11 @@ async fn detach(inner: &Arc<Inner>, session: &Arc<Session>, subscriber_id: u64) 
         last && live
     };
     tracing::debug!(session_id = session.id, subscriber_id, "unsubscribed");
+    // Wake `release_session` (and any concurrent acquire waiter) at once
+    // instead of leaving it to a poll interval. Subscriber pumps also listen
+    // on `changed` but only act on `Stopping`, so a spurious wake is a
+    // single extra loop iteration there.
+    session.wake();
     if last {
         // Bumped by a new subscriber, which invalidates this timer.
         let epoch = session.idle_epoch.fetch_add(1, Ordering::Relaxed) + 1;
@@ -5226,7 +5331,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(
             manager
-                .release_session("GR", "27", lingering.subscriber_id)
+                .release_session("GR", "27", lingering.session_id, lingering.subscriber_id)
                 .await,
             "the scan's own lingering subscriber must not keep the tuner"
         );
@@ -6306,6 +6411,189 @@ mod tests {
         assert_eq!(subscription.tuner, "t1");
 
         drop(held);
+        manager.shutdown().await;
+    }
+
+    fn bare_session() -> Arc<Session> {
+        Arc::new(Session::new(
+            1,
+            SessionKey {
+                tuner: "t0".into(),
+                type_name: "GR".into(),
+                channel: "27".into(),
+            },
+            PipelineMode::Piped,
+        ))
+    }
+
+    /// A manager plus a session that is registered under its own key, the way
+    /// [`select`] leaves one before it hands the session to a waiter.
+    fn manager_with_session() -> (TempDir, SessionManager, Arc<Session>) {
+        let dir = TempDir::new().expect("tempdir");
+        let tuners = tuner_yaml("t0", &["GR"], "cat /dev/zero");
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            65536,
+            1024,
+        );
+        let session = bare_session();
+        lock(&manager.inner.state)
+            .sessions
+            .insert(session.key.clone(), Arc::clone(&session));
+        (dir, manager, session)
+    }
+
+    #[tokio::test]
+    async fn wait_before_retry_returns_at_once_for_a_ready_session() {
+        let (_dir, manager, session) = manager_with_session();
+        session.set_phase(SessionPhase::Ready);
+        let start = std::time::Instant::now();
+        let ok = wait_before_retry(
+            &manager.inner,
+            &session,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            "GR",
+            "27",
+        )
+        .await;
+        assert!(ok);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "ready fast-path must not sleep out STARTUP_POLL: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_before_retry_waits_while_takeover_is_pending() {
+        let (_dir, manager, session) = manager_with_session();
+        session.set_phase(SessionPhase::Ready);
+        session.takeover_pending.store(true, Ordering::SeqCst);
+        let s2 = Arc::clone(&session);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            s2.takeover_pending.store(false, Ordering::SeqCst);
+            s2.wake();
+        });
+        let start = std::time::Instant::now();
+        let ok = wait_before_retry(
+            &manager.inner,
+            &session,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            "GR",
+            "27",
+        )
+        .await;
+        assert!(ok);
+        assert!(
+            start.elapsed() >= Duration::from_millis(20),
+            "must wait out takeover_pending, got {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "must wake on notify, not STARTUP_POLL: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_before_retry_wakes_on_notify_not_poll() {
+        let (_dir, manager, session) = manager_with_session();
+        let s2 = Arc::clone(&session);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            s2.set_phase(SessionPhase::Ready);
+        });
+        let start = std::time::Instant::now();
+        let ok = wait_before_retry(
+            &manager.inner,
+            &session,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            "GR",
+            "27",
+        )
+        .await;
+        assert!(ok);
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "notify wake must beat STARTUP_POLL: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_before_retry_returns_when_the_session_is_unregistered() {
+        // A `Stopping` session is removed from the registry by
+        // `unregister_stopped` without its phase changing. The waiter must go
+        // back to `select` (which then cannot pick the removed session again)
+        // instead of sleeping until the request deadline and answering 503.
+        let (_dir, manager, session) = manager_with_session();
+        session.set_phase(SessionPhase::Stopping);
+        let inner = Arc::clone(&manager.inner);
+        let s2 = Arc::clone(&session);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            unregister_stopped(&inner, &s2);
+        });
+        let start = std::time::Instant::now();
+        let ok = wait_before_retry(
+            &manager.inner,
+            &session,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            "GR",
+            "27",
+        )
+        .await;
+        assert!(
+            ok,
+            "an unregistered session must send the caller back to select"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "must wake on the registry change, not the 250 ms poll: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_at_once_on_first_packet_without_timer_tick() {
+        // oneshot already resolved: must return immediately, not after 50ms tick.
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11)]);
+        let tuners = tuner_yaml("t0", &["GR"], &streaming_command(&path));
+        let manager = manager(
+            &dir,
+            &tuners,
+            &channels_yaml(&[("GR", "27")]),
+            &pipelines_passthrough(),
+            5,
+            188,
+            8,
+        );
+        let session = bare_session();
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(None);
+        let (mut notify_tx, _notify_rx) = oneshot::channel::<Result<Subscription, SpawnFailure>>();
+        let start = std::time::Instant::now();
+        let r = await_readiness(
+            &Arc::clone(&manager.inner),
+            &session,
+            rx,
+            &mut notify_tx,
+            false,
+        )
+        .await;
+        assert!(matches!(r, Readiness::Ready));
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "first packet must not wait a tick: {:?}",
+            start.elapsed()
+        );
         manager.shutdown().await;
     }
 }

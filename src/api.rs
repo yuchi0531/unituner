@@ -170,23 +170,29 @@ impl AppState {
     /// explicit `::1/128` (or `::ffff:0:0/96`) entry works too. Deny-by-default
     /// is unchanged: no candidate form inside any CIDR is still a 403.
     fn allows(&self, ip: IpAddr) -> bool {
-        let mut candidates = vec![ip];
+        // At most two spellings of one address; a stack array avoids a heap
+        // allocation on every request for what is a pure check.
+        let mut candidates = [ip, ip, ip];
+        let mut count = 1usize;
         match ip {
             IpAddr::V6(v6) => {
                 if v6.is_loopback() {
-                    candidates.push(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                    candidates[count] = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                    count += 1;
                 }
                 if let Some(v4) = v6.to_ipv4_mapped() {
-                    candidates.push(IpAddr::V4(v4));
+                    candidates[count] = IpAddr::V4(v4);
+                    count += 1;
                 }
             }
             IpAddr::V4(v4) => {
                 // A v4 peer may arrive from a v4-mapped listener, so accept an
                 // explicit v4-mapped CIDR as well.
-                candidates.push(IpAddr::V6(v4.to_ipv6_mapped()));
+                candidates[count] = IpAddr::V6(v4.to_ipv6_mapped());
+                count += 1;
             }
         }
-        candidates
+        candidates[..count]
             .iter()
             .any(|candidate| self.allowed.iter().any(|net| net.contains(candidate)))
     }
@@ -299,13 +305,16 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 /// as configuration but does not hide the entry: mirakurun's channel list is
 /// the configured list, and SPEC §9 gives no filtering rule.
 async fn channels(State(state): State<AppState>) -> Json<Value> {
-    let services = state.manager.services();
+    // One table snapshot for the whole response: the previous shape called
+    // `ServiceTable::list()` once per configured channel, i.e. N full
+    // clone+sort passes over the table for N channels.
+    let records = state.manager.services().list();
     Json(Value::Array(
         state
             .config
             .channels
             .iter()
-            .map(|channel| channel_json(services, channel))
+            .map(|channel| channel_json(&records, channel))
             .collect(),
     ))
 }
@@ -317,13 +326,13 @@ async fn channels_by_type(
     if let Err(reason) = validate_type_name(&channel_type) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
-    let services = state.manager.services();
+    let records = state.manager.services().list();
     let list: Vec<Value> = state
         .config
         .channels
         .iter()
         .filter(|channel| channel.channel_type == channel_type)
-        .map(|channel| channel_json(services, channel))
+        .map(|channel| channel_json(&records, channel))
         .collect();
     Json(Value::Array(list)).into_response()
 }
@@ -336,16 +345,25 @@ async fn channel_detail(
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
     match find_channel(&state.config, &channel_type, &channel) {
-        Some(entry) => Json(channel_json(state.manager.services(), entry)).into_response(),
+        // Only this channel's records are cloned/sorted, not the whole table.
+        Some(entry) => Json(channel_json(
+            &state
+                .manager
+                .services()
+                .list_by_channel(&channel_type, &channel),
+            entry,
+        ))
+        .into_response(),
         None => error_response(StatusCode::NOT_FOUND, "Channel Not Found"),
     }
 }
 
 /// The channel's JSON, with its services embedded as a short list (SPEC §9).
-fn channel_json(services: &ServiceTable, channel: &ChannelConfig) -> Value {
-    let embedded: Vec<Value> = services
-        .list()
-        .into_iter()
+/// `records` is one already-sorted snapshot; filtering it in place keeps the
+/// per-channel cost at a scan with no clone or sort.
+fn channel_json(records: &[ServiceRecord], channel: &ChannelConfig) -> Value {
+    let embedded: Vec<Value> = records
+        .iter()
         .filter(|record| {
             record
                 .channel
@@ -957,9 +975,22 @@ async fn scan_channels(
     // The scan reads and rewrites channels.yml, so a corrupt file must fail the
     // request before the response starts streaming: once the body is a stream
     // the status is already 200 and an error can only be a progress line.
-    if let Err(reason) = check_scan_config(&state.config_dir) {
-        tracing::warn!(%reason, "channel scan rejected");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, reason);
+    // The check is filesystem I/O, so it runs on the blocking pool rather than
+    // parking an async worker (a slow USB/NFS config dir included).
+    let config_dir = state.config_dir.clone();
+    match tokio::task::spawn_blocking(move || check_scan_config(&config_dir)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => {
+            tracing::warn!(%reason, "channel scan rejected");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, reason);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "channel scan rejected");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("config check task failed: {error}"),
+            );
+        }
     }
     let scan_lease = match state.scan_lock.acquire() {
         Some(lease) => lease,
@@ -1003,6 +1034,7 @@ async fn scan_channels(
 }
 
 /// Checks the on-disk `channels.yml` the scan is about to read and rewrite.
+/// Blocking filesystem I/O; called from a `spawn_blocking` task.
 ///
 /// A missing or blank file is the normal "nothing configured yet" case (the
 /// scan creates it). Anything unreadable or unparseable is an error the caller

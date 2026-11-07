@@ -7,13 +7,14 @@
 //! manager and the shared table are all exercised together.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use unituner::config::Config;
 use unituner::scan::startup_scan;
 use unituner::services::ServiceTable;
-use unituner::session::SessionManager;
+use unituner::session::{SessionManager, SessionPhase};
 use unituner::si::crc32_mpeg2;
 use unituner::tsframe::TS_PACKET_SIZE;
 
@@ -187,6 +188,74 @@ fn multiplex() -> Vec<u8> {
     ));
     stream.extend_from_slice(&section_packets(0x0010, &nit_section(NETWORK_ID)));
     stream
+}
+
+/// PMT for `program_number` with one H.264 elementary stream per `es_pids`
+/// entry. The PMT PID is the one the PAT announced, so the scan's parser sees
+/// the table where the multiplex says it is.
+fn pmt_section(program_number: u16, pcr_pid: u16, es_pids: &[u16]) -> Vec<u8> {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+    rest.extend_from_slice(&[0xF0, 0x00]); // program_info_length 0
+    for &pid in es_pids {
+        rest.extend_from_slice(&[0x1B, (0xE0 | (pid >> 8)) as u8, pid as u8, 0xF0, 0x00]);
+    }
+    section(0x02, program_number, &rest)
+}
+
+/// The core tables of one multiplex for `services` (`(service_id, pmt_pid,
+/// name)`), split into "the PAT alone" and "everything else".
+///
+/// A fake tuner that hands the PAT over first and only streams the rest later
+/// stays inside the per-channel budget (and out of the SI grace) while the
+/// other channel is being observed, which is what makes the overlap of a
+/// parallel pass measurable from the timestamps each tuner command writes.
+fn core_tables(services: &[(u16, u16, &str)], pmt: bool, nit: bool) -> (Vec<u8>, Vec<u8>) {
+    let programs: Vec<(u16, u16)> = services
+        .iter()
+        .map(|&(service_id, pmt_pid, _)| (service_id, pmt_pid))
+        .collect();
+    let names: Vec<(u16, u8, &str)> = services
+        .iter()
+        .map(|&(service_id, _, name)| (service_id, 0x01, name))
+        .collect();
+    let pat = stream_of(&[(0x0000, pat_section(TSID, &programs))]);
+    let mut rest: Vec<(u16, Vec<u8>)> = Vec::new();
+    if pmt {
+        for (index, &(service_id, pmt_pid, _)) in services.iter().enumerate() {
+            rest.push((
+                pmt_pid,
+                pmt_section(service_id, pmt_pid, &[0x0100 + index as u16]),
+            ));
+        }
+    }
+    rest.push((0x0011, sdt_section(NETWORK_ID, TSID, &names)));
+    if nit {
+        rest.push((0x0010, nit_section(NETWORK_ID)));
+    }
+    (pat, stream_of(&rest))
+}
+
+/// [`core_tables`] concatenated into one stream.
+fn core_multiplex(services: &[(u16, u16, &str)], pmt: bool, nit: bool) -> Vec<u8> {
+    let (pat, rest) = core_tables(services, pmt, nit);
+    [pat, rest].concat()
+}
+
+/// Channel 27's two services (`multiplex()` without a PMT).
+const SERVICES_27: &[(u16, u16, &str)] =
+    &[(0x0408, 0x01F0, "NHK General"), (0x0409, 0x01F1, "NHK E")];
+/// A second multiplex for channel 28, with different service ids so both
+/// channels' results are distinguishable in the table.
+const SERVICES_28: &[(u16, u16, &str)] = &[(0x0410, 0x01F2, "BS1"), (0x0411, 0x01F3, "BS2")];
+
+/// Reads a one-line epoch-nanosecond timestamp written by a fake tuner.
+fn read_nanos(path: &Path) -> u128 {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} was never written: {error}", path.display()))
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| panic!("{} is not epoch nanos: {error}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -639,5 +708,219 @@ async fn a_scan_api_reports_a_user_takeover_as_preempted() {
     );
 
     drop(viewer);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_tunes_two_channels_on_two_tuners_at_once() {
+    // Two GR tuners and two channels. Each fake tuner writes the epoch
+    // nanoseconds of its own start, then streams only the PAT, waits 1 s,
+    // stamps a second marker and streams the rest of the multiplex (SDT + NIT,
+    // but no PMT, so the channel ends on the 700 ms SI grace).
+    //
+    // A sequential pass cannot start the second tuner before the first
+    // channel's grace expires, so `start_28 < sdt_27` can only hold when both
+    // channels are tuned concurrently. The session snapshot is sampled as well:
+    // two `GR` sessions must be `Ready` at the same instant.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    for (channel, services) in [("27", SERVICES_27), ("28", SERVICES_28)] {
+        let (pat, rest) = core_tables(services, false, true);
+        fixture.write_ts(&format!("{channel}-pat.ts"), &pat);
+        fixture.write_ts(&format!("{channel}-rest.ts"), &rest);
+    }
+
+    let dir = fixture.path.display().to_string();
+    // `{channel}` is substituted by the session layer before argv splitting, so
+    // one command template serves both channels. argv[0] is `sh` (executed
+    // directly, no implicit shell): the double-quoted argument is one token.
+    let command = format!(
+        "sh -c \"date +%s%N > {dir}/scan_{{channel}}.start; cat {dir}/{{channel}}-pat.ts; \
+         sleep 1.0; date +%s%N > {dir}/scan_{{channel}}.sdt; cat {dir}/{{channel}}-rest.ts; sleep 30\""
+    );
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: tuner-a\n  types: [GR]\n  command: '{command}'\n\
+             - name: tuner-b\n  types: [GR]\n  command: '{command}'\n"
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        format!("{GOOD_CHANNEL}{SECOND_CHANNEL}"),
+    )
+    .expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Sample the session table while the pass runs and remember whether both
+    // channels were `Ready` at the same instant.
+    let overlapping = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let manager = manager.clone();
+        let overlapping = Arc::clone(&overlapping);
+        tokio::spawn(async move {
+            loop {
+                let snapshot = manager.sessions_snapshot();
+                let ready = |channel: &str| {
+                    snapshot.iter().any(|session| {
+                        session.type_name == "GR"
+                            && session.channel == channel
+                            && session.phase == SessionPhase::Ready
+                    })
+                };
+                if ready("27") && ready("28") {
+                    overlapping.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+
+    let started = Instant::now();
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+    let elapsed = started.elapsed();
+    poller.abort();
+
+    let start_27 = read_nanos(&fixture.path.join("scan_27.start"));
+    let start_28 = read_nanos(&fixture.path.join("scan_28.start"));
+    let sdt_27 = read_nanos(&fixture.path.join("scan_27.sdt"));
+    let sdt_28 = read_nanos(&fixture.path.join("scan_28.sdt"));
+    assert!(
+        start_27 < sdt_28 && start_28 < sdt_27,
+        "the two tuners must run concurrently: 27 {start_27}..{sdt_27}, 28 {start_28}..{sdt_28}"
+    );
+    assert!(
+        overlapping.load(Ordering::SeqCst),
+        "two GR sessions must be Ready at the same instant"
+    );
+    // One channel costs ~1 s of stream + the 700 ms grace; a sequential pass
+    // would cost twice that.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the parallel pass took {elapsed:?}"
+    );
+
+    let mut found: Vec<(String, String)> = manager
+        .services()
+        .list()
+        .iter()
+        .map(|record| {
+            let channel = record
+                .channel
+                .as_ref()
+                .map(|(_, channel)| channel.clone())
+                .unwrap_or_default();
+            (channel, record.name.clone())
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("27".to_string(), "NHK E".to_string()),
+            ("27".to_string(), "NHK General".to_string()),
+            ("28".to_string(), "BS1".to_string()),
+            ("28".to_string(), "BS2".to_string()),
+        ],
+        "both channels' services must be in the table"
+    );
+    assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_exits_once_the_core_tables_are_complete() {
+    // PAT + PMT + SDT-actual + NIT-actual in one burst, then the tuner keeps
+    // the stream open (`sleep 30`): the scan must return as soon as the core
+    // tables are in, well before CHANNEL_TIMEOUT (25 s) and without waiting for
+    // the stream to end.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let ts = fixture.write_ts("mux.ts", &core_multiplex(SERVICES_27, true, true));
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&streaming_command(&ts), "true"),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let started = Instant::now();
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the scan waited {elapsed:?} for a stream that never ends"
+    );
+
+    let services = manager.services().list();
+    assert_eq!(services.len(), 2, "{services:?}");
+    assert_eq!(services[0].name, "NHK General");
+    assert_eq!(services[0].network_id, NETWORK_ID); // NIT-actual
+    assert_eq!(services[0].tsid, TSID);
+    assert_eq!(services[0].pmt_pid, Some(0x01F0)); // PAT
+    assert_eq!(services[1].name, "NHK E");
+    assert_eq!(services[1].pmt_pid, Some(0x01F1));
+    assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_falls_back_to_the_sdt_network_id_after_the_grace() {
+    // PAT + PMT + SDT-actual, but no NIT-actual, and the stream stays open. The
+    // scan must still finish on SI_GRACE_AFTER_SDT (700 ms) + slack instead of
+    // the channel budget, and the records must carry the SDT's
+    // original_network_id as their network id (the documented fallback).
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let (pat, rest) = core_tables(SERVICES_27, true, false);
+    let ts = fixture.write_ts("mux.ts", &[pat, rest].concat());
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&streaming_command(&ts), "true"),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let started = Instant::now();
+    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the scan waited {elapsed:?} after a complete SDT without a NIT"
+    );
+    // The grace really was waited out (a channel that exited earlier would have
+    // had every core table, which this stream never provides).
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "the SDT grace was not applied: {elapsed:?}"
+    );
+
+    let services = manager.services().list();
+    assert_eq!(services.len(), 2, "{services:?}");
+    assert_eq!(services[0].name, "NHK General");
+    assert_eq!(
+        services[0].network_id, NETWORK_ID,
+        "the SDT's original_network_id is the documented fallback"
+    );
+    assert_eq!(services[0].tsid, TSID);
+    assert_eq!(services[0].pmt_pid, Some(0x01F0));
+    assert_eq!(services[1].name, "NHK E");
+    assert!(manager.sessions_snapshot().is_empty());
     manager.shutdown().await;
 }

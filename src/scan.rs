@@ -581,7 +581,29 @@ struct ChannelSink {
     /// Whether a **complete** SDT-actual for [`expected_tsid`](Self::expected_tsid)
     /// has already been stored.
     complete: bool,
+    /// Whether a PAT has been seen (supplies the PMT PIDs of `found`).
+    seen_pat: bool,
+    /// Whether a PMT has been seen.
+    seen_pmt: bool,
+    /// Whether a NIT *actual* has been seen (supplies the network id and the
+    /// remote-control key id of `found`).
+    seen_nit_actual: bool,
 }
+
+/// How long a channel may linger after its SDT-actual completes to collect the
+/// remaining core tables (PAT / PMT / NIT-actual) before the scan finishes
+/// anyway. A channel that already has its SDT therefore leaves after at most
+/// this grace instead of burning the whole [`CHANNEL_TIMEOUT`]; a channel
+/// whose NIT never arrives still finishes on the SDT's
+/// `original_network_id` fallback when the grace expires.
+///
+/// Sized at more than one repetition of every table, not just "probably
+/// enough": measured on a real GR multiplex, NIT-actual repeats every
+/// ~0.4-0.8 s (and PAT/PMT/SDT faster), so a 700 ms window could still miss
+/// one NIT repetition — and with it the `network_id` and the
+/// `remote_control_key_id` of every service on that channel. 1.5 s covers at
+/// least one repetition while staying far below the 25 s budget.
+const SI_GRACE_AFTER_SDT: Duration = Duration::from_millis(1500);
 
 /// Accumulates SDT-actual sections until one table version is complete.
 #[derive(Debug, Default)]
@@ -592,6 +614,11 @@ struct SdtAccumulator {
     current: Option<(u16, u16, u8)>,
     /// `section_number -> services of that section`.
     sections: HashMap<u8, Vec<(u16, u8, String)>>,
+    /// The table version whose services are currently in
+    /// [`ChannelSink::found`]. A newer version that is still being assembled
+    /// must block the early exit, otherwise a half-received new table would be
+    /// discarded while the old one is reported as complete.
+    completed: Option<(u16, u16, u8)>,
 }
 
 impl SdtAccumulator {
@@ -615,7 +642,16 @@ impl SdtAccumulator {
         if !self.completeness.observe(sdt) {
             return None;
         }
+        self.completed = Some(table);
         Some(self.collect(sdt.last_section_number))
+    }
+
+    /// Whether a *newer* table version has started but not completed yet.
+    fn pending_new_version(&self) -> bool {
+        match self.current {
+            Some(current) => self.completed != Some(current) && !self.sections.is_empty(),
+            None => false,
+        }
     }
 
     /// Every collected service, in section order, up to `last_section_number`.
@@ -654,12 +690,14 @@ impl ChannelSink {
             SiEvent::Nit(nit) => {
                 // Only the NIT *actual* describes the multiplex being received.
                 if nit.is_actual {
+                    self.seen_nit_actual = true;
                     self.nit_network_id = Some(nit.network_id);
                     self.remote_control_key_id =
                         nit.remote_control_key_id.or(self.remote_control_key_id);
                 }
             }
             SiEvent::Pat(pat) => {
+                self.seen_pat = true;
                 for &(service_id, pmt_pid) in &pat.programs {
                     self.pmt_pids.insert(service_id, pmt_pid);
                 }
@@ -674,7 +712,9 @@ impl ChannelSink {
                 }
             }
             SiEvent::Sdt(sdt) => self.push_sdt(sdt),
-            SiEvent::Pmt(_) => {}
+            SiEvent::Pmt(_) => {
+                self.seen_pmt = true;
+            }
         }
     }
 
@@ -714,9 +754,18 @@ impl ChannelSink {
         self.complete = true;
     }
 
-    /// Whether a complete SDT-actual has been stored.
+    /// Whether a complete SDT-actual has been stored and no newer table
+    /// version is halfway through being received.
     fn is_complete(&self) -> bool {
-        self.complete && !self.found.is_empty()
+        self.complete && !self.found.is_empty() && !self.sdt.pending_new_version()
+    }
+
+    /// Whether every core table needed for a finished record has arrived:
+    /// PAT (PMT PIDs), a PMT, the complete SDT-actual (service names) and a
+    /// NIT-actual (network id / remote-control key id). The scan may exit as
+    /// soon as this holds instead of waiting out the channel budget.
+    fn has_all_core_tables(&self) -> bool {
+        self.is_complete() && self.seen_pat && self.seen_pmt && self.seen_nit_actual
     }
 
     /// Copies the NIT remote-control key id and the PAT PMT PIDs onto every
@@ -796,7 +845,79 @@ pub async fn run_scan(
     // signal" apart from "tuned but nothing kept").
     let mut scanned_channels = 0usize;
 
-    for (index, candidate) in candidates(query).enumerate() {
+    // With more than one tuner supporting this type, the channels are tuned
+    // in parallel (bounded by the tuner count) while the loop below still
+    // prints and processes them in candidate order. With a single tuner the
+    // scan stays sequential — parallel acquires would only report `Busy` for
+    // each other — and so does a scan whose client has already hung up.
+    let candidate_list: Vec<Candidate> = candidates(query).collect();
+    let mut parallel: Option<ParallelScan> = None;
+    if tuner_count_for(config, &query.type_name) > 1 {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(tuner_count_for(
+            config,
+            &query.type_name,
+        )));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut results: Vec<Option<tokio::sync::oneshot::Receiver<(ChannelOutcome, bool)>>> =
+            (0..candidate_list.len()).map(|_| None).collect();
+        let mut skipped = vec![false; candidate_list.len()];
+        for (index, candidate) in candidate_list.iter().enumerate() {
+            if skip_reason(query, &existing, candidate).is_some() {
+                skipped[index] = true;
+                continue;
+            }
+            // The client can hang up (and shutdown can fire) while the pre-pass
+            // is still spawning: without this check a detached scan would keep
+            // tuning every candidate for the whole scan budget.
+            if lines.is_closed() || cancelled(&shutdown) {
+                tasks.abort_all();
+                tracing::info!("channel scan cancelled");
+                return Ok(());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            results[index] = Some(rx);
+            let manager = manager.clone();
+            let semaphore = semaphore.clone();
+            let type_name = query.type_name.clone();
+            let channel = candidate.channel.clone();
+            let timeout = query.timeout;
+            let mut task_shutdown = shutdown.clone();
+            tasks.spawn(async move {
+                let acquired = match task_shutdown.as_mut() {
+                    Some(rx) => tokio::select! {
+                        permit = semaphore.clone().acquire_owned() => permit.ok(),
+                        _ = shutdown_fired(rx) => None,
+                    },
+                    None => semaphore.clone().acquire_owned().await.ok(),
+                };
+                let Some(_permit) = acquired else {
+                    return;
+                };
+                let report = match scan_channel_cancellable(
+                    &manager,
+                    &type_name,
+                    &channel,
+                    timeout,
+                    task_shutdown,
+                )
+                .await
+                {
+                    Some(outcome) => (outcome, false),
+                    // Shutdown cut the channel off before it reported: pass the
+                    // "cancelled" flag through so the loop stops too.
+                    None => (ChannelOutcome::NoSignal, true),
+                };
+                let _ = tx.send(report);
+            });
+        }
+        parallel = Some(ParallelScan {
+            tasks,
+            results,
+            skipped,
+        });
+    }
+
+    for (index, candidate) in candidate_list.into_iter().enumerate() {
         if lines.is_closed() || cancelled(&shutdown) {
             tracing::info!("channel scan cancelled");
             return Ok(());
@@ -822,37 +943,77 @@ pub async fn run_scan(
             ))
             .await;
 
-        if query.skip_channels.contains(&candidate.number) {
-            lines.push("skipped (skipCh)\n".to_string()).await;
+        if let Some(reason) = skip_reason(query, &existing, &candidate) {
+            lines.push(reason.to_string()).await;
             continue;
         }
-        // SPEC §8.1: an enabled entry is left alone unless `refresh=true`; a
-        // disabled one is a re-scan target.
-        if !query.refresh {
-            if let Some(entry) = existing.iter().find(|entry| {
-                entry.channel_type == query.type_name && entry.channel == candidate.channel
-            }) {
-                if !entry.disabled {
-                    lines
-                        .push("skipped (already configured)\n".to_string())
-                        .await;
-                    continue;
+
+        let mut outcome = match parallel.as_mut() {
+            Some(parallel) => {
+                // Disconnect/shutdown is re-checked per channel: the tasks that
+                // are still queued or running are aborted, so a detached scan
+                // stops tuning when nobody is listening.
+                if lines.is_closed() || cancelled(&shutdown) {
+                    parallel.abort();
+                    tracing::info!("channel scan cancelled");
+                    return Ok(());
+                }
+                match parallel.outcome(index).await {
+                    Some((outcome, channel_cancelled)) => {
+                        if channel_cancelled {
+                            parallel.abort();
+                            tracing::info!("channel scan cancelled");
+                            return Ok(());
+                        }
+                        outcome
+                    }
+                    None => {
+                        // Only reachable if the skip predicates disagreed; the
+                        // pre-pass and this loop share `skip_reason`.
+                        tracing::warn!(index, "parallel scan lost an outcome");
+                        ChannelOutcome::Failed
+                    }
+                }
+            }
+            None => {
+                let outcome = scan_channel_cancellable(
+                    manager,
+                    &query.type_name,
+                    &candidate.channel,
+                    query.timeout,
+                    shutdown.clone(),
+                )
+                .await;
+                let Some(outcome) = outcome else {
+                    tracing::info!("channel scan cancelled");
+                    return Ok(());
+                };
+                outcome
+            }
+        };
+
+        // A parallel pass can report `Busy` for a channel that was *itself* the
+        // reason: a routed channel is pinned to one tuner, and one tuner can
+        // serve several types, so two concurrent channels may fight over one
+        // device even though the semaphore counted more. Nothing else is
+        // running at this point, so retry the channel on its own before
+        // reporting it busy (a sequential scan would have done exactly that).
+        if matches!(outcome, ChannelOutcome::Busy) {
+            if let Some(parallel) = parallel.as_mut() {
+                parallel.wait_all().await;
+                if let Some(retry) = scan_channel_cancellable(
+                    manager,
+                    &query.type_name,
+                    &candidate.channel,
+                    query.timeout,
+                    shutdown.clone(),
+                )
+                .await
+                {
+                    outcome = retry;
                 }
             }
         }
-
-        let outcome = scan_channel_cancellable(
-            manager,
-            &query.type_name,
-            &candidate.channel,
-            query.timeout,
-            shutdown.clone(),
-        )
-        .await;
-        let Some(outcome) = outcome else {
-            tracing::info!("channel scan cancelled");
-            return Ok(());
-        };
         match outcome {
             ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
             ChannelOutcome::Preempted => {
@@ -861,6 +1022,7 @@ pub async fn run_scan(
                     .await
             }
             ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
+            ChannelOutcome::Failed => lines.push("error (scan task failed)\n".to_string()).await,
             ChannelOutcome::Services(services) => {
                 let services: Vec<FoundService> = services
                     .into_iter()
@@ -1046,6 +1208,82 @@ fn candidates(query: &ScanQuery) -> impl Iterator<Item = Candidate> + '_ {
     })
 }
 
+/// Why a candidate is not tuned by this scan, if it is skipped.
+///
+/// The parallel pre-pass and the printing loop must agree exactly: a
+/// disagreement would make the loop read an outcome index that was never
+/// spawned. One helper keeps them in step.
+fn skip_reason(
+    query: &ScanQuery,
+    existing: &[ChannelEntry],
+    candidate: &Candidate,
+) -> Option<&'static str> {
+    if query.skip_channels.contains(&candidate.number) {
+        return Some("skipped (skipCh)\n");
+    }
+    // SPEC §8.1: an enabled entry is left alone unless `refresh=true`; a
+    // disabled one is a re-scan target.
+    if !query.refresh
+        && existing.iter().any(|entry| {
+            entry.channel_type == query.type_name
+                && entry.channel == candidate.channel
+                && !entry.disabled
+        })
+    {
+        return Some("skipped (already configured)\n");
+    }
+    None
+}
+
+/// Channels tuned in the background for a parallel scan.
+///
+/// Results are delivered per index through a oneshot, so the printing loop can
+/// stay in candidate order while the tuners work concurrently, and a task that
+/// ends without reporting (a panic) is attributable to its index — a
+/// `JoinSet::join_next` error carries no index. `skipped` mirrors
+/// [`skip_reason`] so the loop never waits for a channel that was not spawned.
+struct ParallelScan {
+    tasks: tokio::task::JoinSet<()>,
+    /// Per candidate index: the channel outcome and whether the channel was
+    /// cut short by shutdown.
+    results: Vec<Option<tokio::sync::oneshot::Receiver<(ChannelOutcome, bool)>>>,
+    skipped: Vec<bool>,
+}
+
+impl ParallelScan {
+    fn abort(&mut self) {
+        self.tasks.abort_all();
+    }
+
+    /// Waits for the outcome of `index` (in candidate order): the channel
+    /// outcome plus whether shutdown cut that channel short. `None` only when
+    /// the channel was skipped.
+    async fn outcome(&mut self, index: usize) -> Option<(ChannelOutcome, bool)> {
+        if self.skipped.get(index).copied().unwrap_or(true) {
+            return None;
+        }
+        let Some(rx) = self.results[index].take() else {
+            // Already consumed: cannot happen, but reporting a failure is
+            // safer than panicking inside a scan.
+            return Some((ChannelOutcome::Failed, false));
+        };
+        match rx.await {
+            Ok(report) => Some(report),
+            // The sender was dropped: the task panicked (or was aborted).
+            Err(_) => {
+                tracing::warn!(index, "scan task ended without an outcome");
+                Some((ChannelOutcome::Failed, false))
+            }
+        }
+    }
+
+    /// Lets every remaining task finish, keeping their results in the oneshots,
+    /// so a channel can be retried without another task holding the tuner.
+    async fn wait_all(&mut self) {
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
 /// Why a channel produced no entries.
 #[derive(Debug)]
 pub(crate) enum ChannelOutcome {
@@ -1060,6 +1298,9 @@ pub(crate) enum ChannelOutcome {
     /// No output, or output without SI, within the per-channel budget (also
     /// what a tuner that failed to start is reported as).
     NoSignal,
+    /// Worse than "no signal": the scan task ended without reporting (a panic
+    /// or an aborted task). Never retried automatically.
+    Failed,
     /// SDT services seen on the channel.
     Services(Vec<FoundService>),
 }
@@ -1182,16 +1423,12 @@ async fn scan_channel_watched(
     mut shutdown: Option<&mut watch::Receiver<bool>>,
 ) -> (ChannelOutcome, bool) {
     // SPEC §8: scan is a plain subscriber on the shared broadcast. Joining a
-    // session a user already holds is therefore correct, and it must not be
-    // released afterwards. The check is made against the **effective** channel
-    // after the acquire (below), because a routed channel's session is keyed by
-    // the route's effective channel, not by the configured one (SPEC §6.4).
-    let before: HashSet<(String, String)> = manager
-        .sessions_snapshot()
-        .into_iter()
-        .map(|session| (session.type_name, session.channel))
-        .collect();
-
+    // session a user already holds is therefore correct, and the release path
+    // refuses to stop it (`release_session` checks for other users); it is
+    // asked for unconditionally, because a snapshot of "sessions that existed
+    // before" is racy while several scan tasks run in parallel. A routed
+    // channel's session is keyed by the route's effective channel, not by the
+    // configured one (SPEC §6.4), and the release uses that too.
     let user = TunerUser::new("scan", SCAN_PRIORITY);
     // One budget per channel covers tuning *and* reading (SPEC §8). The
     // acquire gets at most its own readiness gate plus the concurrent-wait
@@ -1259,17 +1496,31 @@ async fn scan_channel_watched(
     // which subscriber was ours, so a client that attached meanwhile keeps the
     // session alive while a stale scan subscriber does not wedge it. The
     // effective channel is the session identity the release must use (SPEC
-    // §6.4); `preexisting` is decided against it too, so a routed channel does
-    // not mistake an unrelated session on the logical channel name for its own.
+    // §6.4).
     let subscriber_id = subscription.subscriber_id;
+    let subscription_session_id = subscription.session_id;
     let effective_channel = subscription.channel.clone();
-    let preexisting = before.contains(&(type_name.to_string(), effective_channel.clone()));
     let preempted = subscription.preempted.clone();
+    // Once the SDT-actual is complete, only the remaining core tables are
+    // worth waiting for, and only for a short grace: the read deadline shrinks
+    // to `now + SI_GRACE_AFTER_SDT` so a channel finishes promptly instead of
+    // holding its tuner for the rest of the budget, while a PAT/PMT/NIT that
+    // is still in flight (repeating well within the grace) is not missed.
+    let mut read_deadline = deadline;
+    let mut sdt_complete = false;
+    // Diagnostics: when each core table first arrives relative to the start of
+    // the read loop. Debug-level only; it makes the SI grace measurable on a
+    // real tuner without guessing.
+    let trace_timing = tracing::enabled!(tracing::Level::DEBUG);
+    let read_started = Instant::now();
+    let mut first_pat = false;
+    let mut first_pmt = false;
+    let mut first_nit = false;
     loop {
         let chunk = match shutdown.as_deref_mut() {
             Some(rx) => {
                 let watched = tokio::select! {
-                    chunk = tokio::time::timeout_at(deadline, subscription.rx.recv()) => Some(chunk),
+                    chunk = tokio::time::timeout_at(read_deadline, subscription.rx.recv()) => Some(chunk),
                     _ = shutdown_fired(rx) => None,
                 };
                 match watched {
@@ -1280,31 +1531,65 @@ async fn scan_channel_watched(
                     }
                 }
             }
-            None => tokio::time::timeout_at(deadline, subscription.rx.recv()).await,
+            None => tokio::time::timeout_at(read_deadline, subscription.rx.recv()).await,
         };
         match chunk {
             Ok(Some(chunk)) => {
                 for event in parser.push_packets(&chunk) {
                     sink.push(&event, parser.network_id());
-                    // A complete SDT-actual (every section of one version)
-                    // supplies the names; there is no reason to keep the tuner
-                    // for the rest of the budget. A PAT seen before it also
-                    // supplied the PMT PIDs; if it did not, the record simply
-                    // has no PMT PID yet.
-                    if sink.is_complete() {
+                    let elapsed = if trace_timing {
+                        read_started.elapsed()
+                    } else {
+                        Duration::ZERO
+                    };
+                    if sink.seen_pat && !first_pat {
+                        first_pat = true;
+                        tracing::debug!(channel, ms = elapsed.as_millis() as u64, "scan: PAT");
+                    }
+                    if sink.seen_pmt && !first_pmt {
+                        first_pmt = true;
+                        tracing::debug!(channel, ms = elapsed.as_millis() as u64, "scan: PMT");
+                    }
+                    if sink.seen_nit_actual && !first_nit {
+                        first_nit = true;
+                        tracing::debug!(channel, ms = elapsed.as_millis() as u64, "scan: NIT");
+                    }
+                    if sink.is_complete() && !sdt_complete {
+                        sdt_complete = true;
+                        read_deadline = read_deadline.min(Instant::now() + SI_GRACE_AFTER_SDT);
+                        tracing::debug!(
+                            channel,
+                            ms = read_started.elapsed().as_millis() as u64,
+                            "scan: SDT complete"
+                        );
+                    }
+                    // All core tables arrived (PAT + PMT + complete SDT-actual
+                    // + NIT-actual for the network id / remote key): there is
+                    // no reason to keep the tuner for the rest of the budget.
+                    if sink.has_all_core_tables() {
                         sink.finish();
                         drop(subscription);
-                        if !preexisting {
-                            manager
-                                .release_session(type_name, &effective_channel, subscriber_id)
-                                .await;
-                        }
+                        // Always ask for a release: `release_session` itself
+                        // refuses when another user is watching, and the
+                        // `preexisting` snapshot is racy between parallel scan
+                        // tasks (a peer may have spawned this session after
+                        // `before` was taken, which used to leak it until the
+                        // idle timeout).
+                        manager
+                            .release_session(
+                                type_name,
+                                &effective_channel,
+                                subscription_session_id,
+                                subscriber_id,
+                            )
+                            .await;
                         return (ChannelOutcome::Services(sink.found), cancelled);
                     }
                 }
             }
             // The stream ended (a finite fake tuner, or a dead pipeline), or
-            // the per-channel budget ran out.
+            // the per-channel budget — or, after a complete SDT, the short
+            // grace for the remaining core tables — ran out.
             Ok(None) | Err(_) => break,
         }
     }
@@ -1317,20 +1602,33 @@ async fn scan_channel_watched(
     );
     // Release the scan session before the next channel is tuned (SPEC §8.1).
     drop(subscription);
-    if !preexisting {
-        manager
-            .release_session(type_name, &effective_channel, subscriber_id)
-            .await;
-    }
+    // Always ask for a release: `release_session` itself refuses when another
+    // user is watching (see the note at the early-return path above).
+    manager
+        .release_session(
+            type_name,
+            &effective_channel,
+            subscription_session_id,
+            subscriber_id,
+        )
+        .await;
+
+    // Fold in the partially received SDT first: a channel preempted after a
+    // partial table still produced services, which `finish` materialises —
+    // checking `preempted` against the not-yet-finished `found` would report
+    // those as "preempted" and drop them.
+    sink.finish();
 
     // A user request preempted the scan (its priority beats the scan's
     // `-1000`). That is not "no signal": the channel must be retried with the
-    // same backoff as a busy tuner, and the user keeps the tuner.
-    if preempted.is_preempted() && sink.found.is_empty() {
+    // same backoff as a busy tuner, and the user keeps the tuner. A *partial*
+    // SDT is not enough to report services either — `Preempted` is retried,
+    // whereas `Services` is final, so returning the partial list here would
+    // freeze an incomplete service table in `channels.yml`.
+    if preempted.is_preempted() && (!sink.complete || sink.found.is_empty()) {
         return (ChannelOutcome::Preempted, cancelled);
     }
 
-    sink.finish();
     let outcome = if sink.found.is_empty() {
         ChannelOutcome::NoSignal
     } else {
@@ -1630,6 +1928,24 @@ fn startup_channels(config: &Config) -> Vec<StartupChannel> {
         .collect()
 }
 
+/// Number of enabled tuners that support `type_name`.
+///
+/// This is the scan concurrency for that type: with one tuner (e.g. a single
+/// PX-S1UD) channels are necessarily scanned sequentially and the semaphore
+/// of one permit preserves that; with two or more tuners up to that many
+/// channels are scanned at once. A routed channel may in fact be pinned to a
+/// single tuner, so the count can overestimate for it — the extra contender
+/// then just reports `Busy` and is retried on the next pass, as before.
+fn tuner_count_for(config: &Config, type_name: &str) -> usize {
+    config
+        .tuners
+        .iter()
+        .filter(|tuner| {
+            !tuner.disabled && tuner.types.iter().any(|supported| supported == type_name)
+        })
+        .count()
+}
+
 /// How long the startup scan waits before its next retry pass.
 ///
 /// `pass` is the number of completed passes after the first one: 0 → 30 s,
@@ -1689,7 +2005,7 @@ pub async fn startup_scan(
             tracing::info!(pass, "startup scan stopped");
             return;
         }
-        let (summary, retry) = scan_pass(&manager, &pending, &mut shutdown).await;
+        let (summary, retry) = scan_pass(&manager, &config, &pending, &mut shutdown).await;
         tracing::info!(
             pass,
             attempted = summary.attempted,
@@ -1740,35 +2056,79 @@ fn retries(outcome: &ChannelOutcome) -> bool {
     matches!(outcome, ChannelOutcome::Busy | ChannelOutcome::Preempted)
 }
 
-/// Scans `pending` sequentially, returning the pass summary and the channels
-/// that should be retried (only those whose tuner was unavailable).
+/// Scans `pending`, returning the pass summary and the channels that should
+/// be retried (only those whose tuner was unavailable).
+///
+/// Channels are scanned **in parallel**, up to the number of enabled tuners
+/// supporting each channel's type (a per-type semaphore): with one tuner the
+/// pass is sequential exactly as before, with more tuners the pass takes
+/// roughly `channels / tuners` channel budgets. The first pass still attempts
+/// every channel once — a busy/preempted channel does not wait or block the
+/// others, it is collected into the retry queue for the next backoff pass.
+/// Results are folded in configuration order, so the retry queue and the
+/// summary are deterministic regardless of completion order.
 async fn scan_pass(
     manager: &SessionManager,
+    config: &Config,
     pending: &[StartupChannel],
     shutdown: &mut watch::Receiver<bool>,
 ) -> (PassSummary, Vec<StartupChannel>) {
+    // One semaphore per type, sized by that type's tuner count.
+    let mut permits: HashMap<String, Arc<tokio::sync::Semaphore>> = HashMap::new();
+    for channel in pending {
+        permits.entry(channel.type_name.clone()).or_insert_with(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                tuner_count_for(config, &channel.type_name).max(1),
+            ))
+        });
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, channel) in pending.iter().enumerate() {
+        let manager = manager.clone();
+        let channel = channel.clone();
+        let semaphore = permits[&channel.type_name].clone();
+        let mut shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            // Wait for this type's tuner slot, honouring shutdown promptly
+            // instead of queueing (and then tuning) after it fired.
+            let acquired = tokio::select! {
+                permit = semaphore.clone().acquire_owned() => permit.ok(),
+                _ = shutdown_fired(&mut shutdown) => None,
+            };
+            let Some(_permit) = acquired else {
+                return (index, None);
+            };
+            // Cancelled between reads (never by dropping an in-flight
+            // `acquire`, which could leave a reservation behind): shutdown
+            // must not wait for a channel's whole budget, let alone
+            // `timeout × channels`.
+            let outcome = scan_channel_cancellable(
+                &manager,
+                &channel.type_name,
+                &channel.channel,
+                CHANNEL_TIMEOUT,
+                Some(shutdown.clone()),
+            )
+            .await;
+            (index, outcome)
+        });
+    }
+
+    let mut outcomes: Vec<Option<ChannelOutcome>> = (0..pending.len()).map(|_| None).collect();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((index, outcome)) = joined {
+            outcomes[index] = outcome;
+        }
+    }
+
     let mut summary = PassSummary::default();
     let mut retry = Vec::new();
-    for channel in pending {
-        if *shutdown.borrow() {
-            break;
-        }
-        summary.attempted += 1;
-        // Cancelled between reads (never by dropping an in-flight `acquire`,
-        // which could leave a reservation behind): shutdown must not wait for a
-        // channel's whole budget, let alone `timeout × channels`.
-        let Some(outcome) = scan_channel_cancellable(
-            manager,
-            &channel.type_name,
-            &channel.channel,
-            CHANNEL_TIMEOUT,
-            Some(shutdown.clone()),
-        )
-        .await
-        else {
-            summary.attempted -= 1;
-            break;
+    for (channel, outcome) in pending.iter().zip(outcomes) {
+        let Some(outcome) = outcome else {
+            continue;
         };
+        summary.attempted += 1;
         let should_retry = retries(&outcome);
         let preempted = matches!(&outcome, ChannelOutcome::Preempted);
         match outcome {
@@ -1787,6 +2147,14 @@ async fn scan_pass(
                     type_name = %channel.type_name,
                     channel = %channel.channel,
                     "startup scan skipped the channel: no signal"
+                );
+            }
+            ChannelOutcome::Failed => {
+                summary.skipped += 1;
+                tracing::warn!(
+                    type_name = %channel.type_name,
+                    channel = %channel.channel,
+                    "startup scan task failed without an outcome"
                 );
             }
             ChannelOutcome::Services(services) => {
@@ -2804,6 +3172,44 @@ mod tests {
         sink.push(&sdt(3, 0x7FE0, 0x0408), Some(42));
         sink.finish();
         assert_eq!(sink.found[0].network_id, 42);
+    }
+
+    #[test]
+    fn core_tables_require_pat_pmt_and_nit_actual_besides_the_sdt() {
+        let mut sink = ChannelSink::default();
+        // SDT complete alone is not enough to finish early.
+        sink.push(&sdt(3, 0x7FE0, 0x0408), None);
+        assert!(sink.is_complete());
+        assert!(!sink.has_all_core_tables());
+        sink.push(
+            &SiEvent::Pat(crate::si::PatInfo {
+                transport_stream_id: 0x7FE0,
+                network_id: None,
+                network_pid: None,
+                programs: vec![(0x0408, 0x0100)],
+                version_number: 0,
+                current_next: true,
+                section_number: 0,
+                last_section_number: 0,
+            }),
+            None,
+        );
+        assert!(!sink.has_all_core_tables(), "PMT still missing");
+        sink.push(
+            &SiEvent::Pmt(crate::si::PmtInfo {
+                program_number: 0x0408,
+                pcr_pid: 0x0101,
+                version_number: 0,
+                current_next: true,
+                section_number: 0,
+                last_section_number: 0,
+                streams: Vec::new(),
+            }),
+            None,
+        );
+        assert!(!sink.has_all_core_tables(), "NIT-actual still missing");
+        sink.push(&nit(1, true, Some(7)), None);
+        assert!(sink.has_all_core_tables());
     }
 
     #[test]

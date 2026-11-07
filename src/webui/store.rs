@@ -119,11 +119,18 @@ pub async fn lock_async(file: &str) -> MutexGuard<'static, ()> {
 /// thread wait, which is why the scan should move to [`lock_async`].
 pub fn lock(file: &str) -> MutexGuard<'static, ()> {
     let mutex = file_mutex(file);
+    // Exponential backoff instead of a fixed 1 ms spin: a webui save holding
+    // the lock through a slow `fsync` can keep this waiter queued for a long
+    // time, and a 1 ms wakeup loop burns a core (and contends with the worker
+    // doing the save) for the whole wait. Still a spin — `blocking_lock`
+    // panics inside a runtime — but it parks progressively longer.
+    let mut backoff = Duration::from_millis(1);
     loop {
         if let Ok(guard) = mutex.try_lock() {
             return guard;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(backoff);
+        backoff = backoff.saturating_mul(2).min(Duration::from_millis(50));
     }
 }
 

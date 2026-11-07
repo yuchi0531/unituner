@@ -84,17 +84,33 @@ const DESCRIPTOR_TAG_TS_INFORMATION: u8 = 0xCD;
 /// ```
 /// assert_eq!(unituner::si::crc32_mpeg2(b"123456789"), 0x0376_E6E7);
 /// ```
-pub fn crc32_mpeg2(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
+const fn crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u32) << 24;
+        let mut j = 0;
+        while j < 8 {
             crc = if crc & 0x8000_0000 != 0 {
                 (crc << 1) ^ 0x04C1_1DB7
             } else {
                 crc << 1
             };
+            j += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+static CRC_TABLE: [u32; 256] = crc_table();
+
+pub fn crc32_mpeg2(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        let idx = ((crc >> 24) ^ u32::from(byte)) as usize;
+        crc = (crc << 8) ^ CRC_TABLE[idx];
     }
     crc
 }
@@ -116,21 +132,36 @@ pub fn crc32_mpeg2(bytes: &[u8]) -> u32 {
 /// input is routine here, and the default hook would print a backtrace to
 /// stderr for every corrupt name.
 pub fn decode_arib_text(bytes: &[u8]) -> String {
+    // No "plain ASCII" fast path here on purpose. ARIB 8-bit text starts with
+    // the *designated* graphic sets (the initial GL is two-byte Kanji for
+    // service names), so a byte string made only of 0x20..=0x7E is not
+    // necessarily ASCII: `25 46 25 6C 45 6C` is テレ東, not the literal
+    // "%F%lEl" that a raw-ASCII shortcut returns. Only the decoder knows the
+    // current designation, so every name goes through it.
     let decoded = catch_without_hook(|| {
         let mut decoder = Decoder::with_drcs_mapping(DrcsMapping::Replacement);
         decoder.decode(bytes)
     })
     .unwrap_or_default();
-    decoded
+    // Only pay for the replacement pass when a private-use code point exists.
+    let cleaned = if decoded
         .chars()
-        .map(|c| {
-            if ('\u{E000}'..='\u{F8FF}').contains(&c) {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect::<String>()
+        .any(|c| ('\u{E000}'..='\u{F8FF}').contains(&c))
+    {
+        decoded
+            .chars()
+            .map(|c| {
+                if ('\u{E000}'..='\u{F8FF}').contains(&c) {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect::<String>()
+    } else {
+        decoded
+    };
+    cleaned
         .trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_owned()
 }
@@ -368,9 +399,16 @@ impl TableCompleteness {
             seen.clear();
         }
 
+        // A section_number beyond last_section_number is corrupt: it must
+        // neither count towards nor complete the table.
+        if info.section_number > *last_section {
+            return false;
+        }
         // A duplicate is harmless: the set stays as it was.
         seen.insert(info.section_number);
-        (0..=*last_section).all(|number| seen.contains(&number))
+        // Every entry in `seen` is now known to be in 0..=*last_section, so
+        // the table is complete exactly when all slots are filled.
+        seen.len() == (*last_section as usize) + 1
     }
 
     /// Forgets every table.
@@ -861,22 +899,31 @@ impl SectionAssembler {
 
     /// Appends one 188-byte packet and returns every section it completed.
     pub fn push_packet(&mut self, packet: &[u8]) -> Vec<AssembledSection> {
+        let mut out = Vec::new();
+        self.push_packet_into(packet, &mut out);
+        out
+    }
+
+    /// Like [`push_packet`](Self::push_packet) but appends into `out` instead
+    /// of allocating a fresh `Vec` per packet (the hot path feeds thousands
+    /// of packets per scan, most completing no section).
+    fn push_packet_into(&mut self, packet: &[u8], out: &mut Vec<AssembledSection>) {
         let Some(header) = parse_header(packet) else {
-            return Vec::new();
+            return;
         };
         if header.transport_error {
-            return Vec::new();
+            return;
         }
         if !self.is_interested(header.pid) {
             self.non_si_packets += 1;
-            return Vec::new();
+            return;
         }
         let Some(offset) = header.payload_offset else {
-            return Vec::new();
+            return;
         };
         let payload = &packet[offset..];
         if payload.is_empty() {
-            return Vec::new();
+            return;
         }
 
         let tables = self.tables.as_ref();
@@ -884,7 +931,7 @@ impl SectionAssembler {
         if let Some(last) = state.last_cc {
             if header.continuity_counter == last {
                 // A retransmitted packet carries nothing new.
-                return Vec::new();
+                return;
             }
             if header.continuity_counter != last.wrapping_add(1) & 0x0F {
                 state.drop_partial();
@@ -901,7 +948,7 @@ impl SectionAssembler {
             if start > payload.len() {
                 // The pointer field points past the packet: unusable.
                 state.drop_partial();
-                return Vec::new();
+                return;
             }
             if !state.buf.is_empty() {
                 // A new section starts here, so whatever was being assembled
@@ -920,13 +967,10 @@ impl SectionAssembler {
             state.extend_and_collect(payload, tables, &mut sections);
         }
 
-        sections
-            .into_iter()
-            .map(|bytes| AssembledSection {
-                pid: header.pid,
-                bytes,
-            })
-            .collect()
+        out.extend(sections.into_iter().map(|bytes| AssembledSection {
+            pid: header.pid,
+            bytes,
+        }));
     }
 
     /// Appends a run of 188-byte packets (for example the output of
@@ -946,7 +990,7 @@ impl SectionAssembler {
         let mut sections = Vec::new();
         let mut leftover = std::mem::take(&mut self.leftover);
         for_each_packet(packets, &mut leftover, |packet| {
-            sections.extend(self.push_packet(packet));
+            self.push_packet_into(packet, &mut sections);
         });
         self.leftover = leftover;
         sections
@@ -1051,6 +1095,21 @@ pub struct SiParser {
     /// because this type parses packet by packet (a PAT must name its PMT PIDs
     /// before the PMTs in the same read are assembled).
     leftover: Vec<u8>,
+    /// Last successfully parsed section, keyed by `(PID, table_id,
+    /// section_number)`. Broadcast SI repeats the same section bytes many
+    /// times per second; re-running CRC + `arib` parse + ARIB text decode for
+    /// identical bytes is wasted work. A hit reuses the cached event (PAT
+    /// network-id stamping and NIT side effects are re-applied, so the cached
+    /// value can never go stale).
+    ///
+    /// The table id and section number are part of the key because one PID
+    /// carries several tables: SDT-actual (`0x42`) and SDT-other (`0x46`)
+    /// share PID 0x0011, and NIT-actual (`0x40`) shares PID 0x0010 with one
+    /// NIT-other (`0x41`) per foreign transport stream. With a PID-only key
+    /// those alternate and every section misses — exactly the expensive
+    /// tables. The full bytes are still compared, so a hit can never return an
+    /// event of a different table version.
+    last_section: HashMap<(u16, u8, u8), (Vec<u8>, SiEvent)>,
 }
 
 impl Default for SiParser {
@@ -1070,6 +1129,7 @@ impl SiParser {
             network_id: None,
             network_tsids: HashSet::new(),
             leftover: Vec::new(),
+            last_section: HashMap::new(),
         }
     }
 
@@ -1086,9 +1146,19 @@ impl SiParser {
 
     /// Parses one 188-byte packet and returns the tables it completed.
     pub fn push_packet(&mut self, packet: &[u8]) -> Vec<SiEvent> {
+        let mut events = Vec::new();
+        self.push_packet_into(packet, &mut events);
+        events
+    }
+
+    /// Like [`push_packet`](Self::push_packet) but appends into `events`
+    /// instead of allocating a fresh `Vec` (and an intermediate assembled
+    /// `Vec`) per packet.
+    fn push_packet_into(&mut self, packet: &[u8], events: &mut Vec<SiEvent>) {
         self.stats.packets += 1;
-        let assembled = self.assembler.push_packet(packet);
-        self.parse_assembled(assembled)
+        let mut assembled = Vec::new();
+        self.assembler.push_packet_into(packet, &mut assembled);
+        self.parse_assembled_into(assembled, events);
     }
 
     /// Parses a run of 188-byte packets and returns the tables it completed.
@@ -1105,7 +1175,7 @@ impl SiParser {
         let mut events = Vec::new();
         let mut leftover = std::mem::take(&mut self.leftover);
         for_each_packet(packets, &mut leftover, |packet| {
-            events.extend(self.push_packet(packet));
+            self.push_packet_into(packet, &mut events);
         });
         self.leftover = leftover;
         events
@@ -1145,10 +1215,14 @@ impl SiParser {
         self.leftover.clear();
         self.network_id = None;
         self.network_tsids.clear();
+        self.last_section.clear();
     }
 
-    fn parse_assembled(&mut self, assembled: Vec<AssembledSection>) -> Vec<SiEvent> {
-        let mut events = Vec::with_capacity(assembled.len());
+    fn parse_assembled_into(
+        &mut self,
+        assembled: Vec<AssembledSection>,
+        events: &mut Vec<SiEvent>,
+    ) {
         for section in assembled {
             self.stats.sections += 1;
             if !matches!(
@@ -1165,36 +1239,61 @@ impl SiParser {
                 self.stats.ignored_sections += 1;
                 continue;
             }
-            match parse_section(&section.bytes) {
+            // Identical bytes of the same table section were already parsed:
+            // reuse the cached event instead of CRC + arib parse + ARIB
+            // decode. Byte 6 of a long-form section is `section_number`.
+            let cache_key = (
+                section.pid,
+                section.bytes.first().copied().unwrap_or(0),
+                section.bytes.get(6).copied().unwrap_or(0),
+            );
+            let cached = self
+                .last_section
+                .get(&cache_key)
+                .filter(|(bytes, _)| *bytes == section.bytes)
+                .map(|(_, event)| event.clone());
+            let parsed = match cached {
+                Some(event) => Ok(event),
+                None => parse_section(&section.bytes),
+            };
+            match parsed {
                 Ok(event) if !is_current(&event) => {
                     // A next-version table: parsed but not yet applicable.
                     self.stats.ignored_sections += 1;
                 }
-                Ok(SiEvent::Pat(mut pat)) => {
-                    pat.network_id = self.network_id_for(pat.transport_stream_id);
-                    for &(_, pmt_pid) in &pat.programs {
-                        // A PAT names its PMT PIDs; assemble them from now on.
-                        self.assembler.add_interest(pmt_pid);
+                Ok(event) => {
+                    // Cache before PAT stamping / NIT side effects so a
+                    // cache hit re-derives those from current state.
+                    self.last_section
+                        .insert(cache_key, (section.bytes.clone(), event.clone()));
+                    match event {
+                        SiEvent::Pat(mut pat) => {
+                            pat.network_id = self.network_id_for(pat.transport_stream_id);
+                            for &(_, pmt_pid) in &pat.programs {
+                                // A PAT names its PMT PIDs; assemble them from now on.
+                                self.assembler.add_interest(pmt_pid);
+                            }
+                            if let Some(network_pid) = pat.network_pid {
+                                // ...and its NIT PID, which is only conventionally
+                                // 0x0010.
+                                self.assembler.add_interest(network_pid);
+                            }
+                            events.push(SiEvent::Pat(pat));
+                        }
+                        SiEvent::Nit(nit) => {
+                            if nit.is_actual {
+                                self.network_id = Some(nit.network_id);
+                                self.network_tsids =
+                                    nit.transport_stream_ids.iter().copied().collect();
+                            }
+                            events.push(SiEvent::Nit(nit));
+                        }
+                        event => events.push(event),
                     }
-                    if let Some(network_pid) = pat.network_pid {
-                        // ...and its NIT PID, which is only conventionally
-                        // 0x0010.
-                        self.assembler.add_interest(network_pid);
-                    }
-                    events.push(SiEvent::Pat(pat));
                 }
-                Ok(SiEvent::Nit(nit)) => {
-                    if nit.is_actual {
-                        self.network_id = Some(nit.network_id);
-                        self.network_tsids = nit.transport_stream_ids.iter().copied().collect();
-                    }
-                    events.push(SiEvent::Nit(nit));
-                }
-                Ok(event) => events.push(event),
                 Err(_) => self.stats.invalid_sections += 1,
             }
         }
-        events
     }
 
     /// The network id to stamp onto a PAT of `transport_stream_id`.
@@ -2014,6 +2113,24 @@ mod tests {
         let events = parser.push_packets(&section_packet(PAT_PID, &broken));
         assert!(events.is_empty());
         assert_eq!(parser.stats().invalid_sections, 1);
+    }
+
+    #[test]
+    fn ascii_looking_bytes_are_decoded_as_two_byte_kanji() {
+        // A service name may begin with no escape at all: the initial GL is
+        // two-byte Kanji, so every byte here is 0x21..=0x7E yet the text is
+        // テレ東 — a raw-ASCII shortcut would return the literal "%F%lEl".
+        // Captured from a real GR multiplex (sid 1072 and 1456).
+        assert_eq!(
+            decode_arib_text(&[0x25, 0x46, 0x25, 0x6C, 0x45, 0x6C]),
+            "テレ東"
+        );
+        assert_eq!(
+            decode_arib_text(&[0x25, 0x46, 0x25, 0x6C, 0x45, 0x6C, 0x37, 0x48, 0x42, 0x53]),
+            "テレ東携帯"
+        );
+        // Same bytes after an explicit Katakana designation stay Katakana.
+        assert_eq!(decode_arib_text(&[0x1B, 0x28, 0x4A, 0x25, 0x46]), "%F");
     }
 
     #[test]

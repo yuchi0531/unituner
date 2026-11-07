@@ -294,11 +294,17 @@ async fn csrf_guard(request: axum::extract::Request, next: axum::middleware::Nex
     }
     if let Some(origin) = headers.get(header::ORIGIN) {
         let origin = origin.to_str().unwrap_or_default();
+        // HTTP/2 carries the authority in the URI, not a `Host` header (the
+        // same fallback `host_guard` uses); comparing against an empty host
+        // would reject every legitimate same-origin HTTP/2 mutation.
         let host = headers
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri().authority().map(|a| a.as_str()))
             .unwrap_or_default();
-        if origin_host(origin) != Some(host) {
+        // Host names are ASCII-case-insensitive, so `LOCALHOST:40772` and
+        // `localhost:40772` are the same origin.
+        if !origin_host(origin).is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host)) {
             return error_response(
                 StatusCode::FORBIDDEN,
                 "Cross-origin request rejected",
@@ -727,7 +733,10 @@ async fn save_document(
         let _guard = guard;
         if let Some(expected) = if_match {
             if expected != "*" {
-                let (_, current) = read_document(&dir, file).map_err(SaveFailure::BadRequest)?;
+                // A read failure here is a server-side problem (unreadable
+                // file), not a malformed request: it must be a 500, not the
+                // 400 a client error would be.
+                let (_, current) = read_document(&dir, file).map_err(SaveFailure::Read)?;
                 if current != expected {
                     return Err(SaveFailure::Conflict);
                 }
@@ -742,7 +751,7 @@ async fn save_document(
             tracing::info!(file, bytes, "configuration saved");
             document_response(json!({ "status": "saved", "file": file }), &tag)
         }
-        Ok(Err(SaveFailure::BadRequest(reason))) => bad_request(reason),
+        Ok(Err(SaveFailure::Read(reason))) => internal_error(reason),
         Ok(Err(SaveFailure::Conflict)) => {
             error_response(StatusCode::CONFLICT, "Configuration Changed", Vec::new())
         }
@@ -760,8 +769,8 @@ async fn save_document(
 
 /// Why the blocking save body failed.
 enum SaveFailure {
-    /// The `If-Match` header could not be checked (bad file read).
-    BadRequest(String),
+    /// The `If-Match` header could not be checked (file read failed).
+    Read(String),
     /// The file changed since the client read it.
     Conflict,
     /// Validation or the write itself failed.
@@ -830,12 +839,35 @@ fn load_server_config(dir: &Path) -> Result<ServerConfig, String> {
 /// The number of entries in the current `channels.yml` (blocking; call from a
 /// blocking task). `None` when the file cannot be read or parsed, so the caller
 /// can fall back to the startup snapshot.
+///
+/// The Status tab polls this endpoint, and re-parsing (and fully validating)
+/// the whole document on every poll is pure waste when the file has not
+/// changed: the parsed count is cached behind its `(mtime, size)` stamp and
+/// only recomputed after a hand edit or a webui save changes the file, so
+/// the snapshot can neither go stale nor re-parse per request.
 fn channels_on_disk(dir: &Path) -> Option<usize> {
+    use std::sync::Mutex;
+    use std::time::SystemTime;
+
+    static CACHE: Mutex<Option<(std::path::PathBuf, SystemTime, u64, usize)>> = Mutex::new(None);
+
     let path = dir.join(CHANNELS_FILE);
+    let metadata = std::fs::metadata(&path).ok()?;
+    let stamp = (metadata.modified().ok()?, metadata.len());
+    let cached = CACHE.lock().ok().and_then(|guard| guard.clone());
+    if let Some((cached_path, mtime, len, count)) = cached {
+        if cached_path == path && mtime == stamp.0 && len == stamp.1 {
+            return Some(count);
+        }
+    }
     let text = std::fs::read_to_string(&path).ok()?;
-    serde_yaml_ng::from_str::<Vec<ChannelConfig>>(&text)
+    let count = serde_yaml_ng::from_str::<Vec<ChannelConfig>>(&text)
         .ok()
-        .map(|channels| channels.len())
+        .map(|channels| channels.len())?;
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((path, stamp.0, stamp.1, count));
+    }
+    Some(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -868,6 +900,23 @@ async fn restart(State(state): State<AppState>, Extension(webui): Extension<Webu
         tracing::error!(%message, "restart refused");
         return internal_error(message);
     }
+    // A running scan holds the channels.yml lock and is mid read-merge-write;
+    // exec'ing underneath it would kill it mid-save. *Take* the same lease the
+    // scan endpoint uses (an `is_running()` check would be a TOCTOU: a scan
+    // could start between the check and the exec) and hold it across the
+    // shutdown and the exec. A start-up scan does not take this lease, so it is
+    // covered only by the fact that it stops writing before the exec tears the
+    // process down.
+    let _scan_lease = match state.scan_lock.acquire() {
+        Some(lease) => lease,
+        None => {
+            tracing::warn!("restart refused: channel scan in progress");
+            return error_response(StatusCode::CONFLICT, "Already Scanning", Vec::new());
+        }
+    };
+    // Also serialise against a webui `channels.yml` save that is mid
+    // validate-and-write (it holds the store lock around its `fsync`).
+    let _channels_guard = store::lock_async(store::CHANNELS_FILE).await;
 
     tracing::info!("restart requested: stopping all tuner sessions");
     state.manager.shutdown().await;

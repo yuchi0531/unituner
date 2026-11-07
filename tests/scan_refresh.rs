@@ -780,3 +780,138 @@ async fn a_subchannel_scan_tunes_the_cross_product_and_says_so() {
     assert!(fixture.channels_yml().is_empty(), "dryRun writes nothing");
     manager.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Parallel pre-pass (two tuners, two channels)
+// ---------------------------------------------------------------------------
+
+/// Two tuners, two channels: the HTTP/`run_scan` parallel pre-pass must scan
+/// both at once, still fold the results in candidate order, and write both
+/// channels. Also checks that a `Busy` reported by the parallel pass is retried
+/// on its own before giving up (here it cannot be busy, so the assertion is
+/// that the retry path is not taken spuriously).
+/// A PMT section for one programme (`program_number == service_id`).
+fn pmt_section(program_number: u16, pcr_pid: u16, es_pids: &[u16]) -> Vec<u8> {
+    let mut rest = Vec::new();
+    rest.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+    rest.extend_from_slice(&[0xF0, 0x00]); // program_info_length 0
+    for &pid in es_pids {
+        rest.extend_from_slice(&[0x1B, (0xE0 | (pid >> 8)) as u8, pid as u8, 0xF0, 0x00]);
+    }
+    section(0x02, program_number, &rest)
+}
+
+/// Two tuners, two channels: the HTTP/`run_scan` parallel pre-pass must scan
+/// both at once, fold the results in candidate order, and write both channels.
+///
+/// Each tuner hands over the PAT/PMT first and only streams the SDT/NIT after
+/// `PARALLEL_DELAY`, so the scan cannot finish a channel before that: a
+/// sequential pass needs two delays, the parallel one a single delay.
+#[tokio::test]
+async fn a_parallel_scan_tunes_two_channels_at_once() {
+    const PARALLEL_DELAY: Duration = Duration::from_millis(1500);
+
+    let fixture = Fixture::new(
+        "",
+        "- name: NHK\n  type: GR\n  channel: \"27\"\n- name: NHK E\n  type: GR\n  channel: \"28\"\n",
+    );
+    let parts = |service_ids: &[(u16, u16, &str)]| {
+        let programs: Vec<(u16, u16)> = service_ids
+            .iter()
+            .map(|&(service_id, pmt_pid, _)| (service_id, pmt_pid))
+            .collect();
+        let names: Vec<(u16, u8, &str)> = service_ids
+            .iter()
+            .map(|&(service_id, _, name)| (service_id, 0x01, name))
+            .collect();
+        let mut prologue = section_packets(0x0000, &pat_section(TSID, &programs));
+        for &(service_id, pmt_pid, _) in service_ids {
+            prologue.extend_from_slice(&section_packets(
+                pmt_pid,
+                &pmt_section(service_id, pmt_pid + 1, &[pmt_pid + 2]),
+            ));
+        }
+        let mut epilogue = section_packets(0x0011, &sdt_section(NETWORK_ID, TSID, &names));
+        epilogue.extend_from_slice(&section_packets(0x0010, &nit_section(NETWORK_ID)));
+        (prologue, epilogue)
+    };
+
+    let (prologue_27, epilogue_27) =
+        parts(&[(0x0408, 0x0100, "NHK General"), (0x0409, 0x0101, "NHK E")]);
+    let (prologue_28, epilogue_28) = parts(&[(0x0409, 0x0100, "NHK E")]);
+    let a27 = fixture.stream("27-a.ts", &prologue_27);
+    let b27 = fixture.stream("27-b.ts", &epilogue_27);
+    let a28 = fixture.stream("28-a.ts", &prologue_28);
+    let b28 = fixture.stream("28-b.ts", &epilogue_28);
+    let delay = PARALLEL_DELAY.as_millis() as f64 / 1000.0;
+    let tuners = format!(
+        "- name: t0\n  types: [GR]\n  command: 'sh -c \"cat {}; sleep {delay}; cat {}; sleep 10\"'\n\
+         - name: t1\n  types: [GR]\n  command: 'sh -c \"cat {}; sleep {delay}; cat {}; sleep 10\"'\n",
+        a27.display(),
+        b27.display(),
+        a28.display(),
+        b28.display()
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners).expect("write tuners");
+
+    let manager = fixture.manager();
+    let config = fixture.config();
+    let query = query(&[
+        ("type", "GR"),
+        ("minCh", "27"),
+        ("maxCh", "28"),
+        ("refresh", "true"),
+    ]);
+    let started = Instant::now();
+    let text = run(&manager, &config, &fixture, &query).await;
+    let elapsed = started.elapsed();
+
+    let services = manager.services().list();
+    let channels: Vec<(String, String)> = services
+        .iter()
+        .map(|record| {
+            let (channel_type, channel) = record
+                .channel
+                .as_ref()
+                .map(|(channel_type, channel)| (channel_type.clone(), channel.clone()))
+                .unwrap_or_default();
+            (channel_type, channel)
+        })
+        .collect();
+    assert!(
+        channels.contains(&("GR".to_string(), "27".to_string())),
+        "channel 27 must be scanned: {channels:?} / {text}"
+    );
+    assert!(
+        channels.contains(&("GR".to_string(), "28".to_string())),
+        "channel 28 must be scanned: {channels:?} / {text}"
+    );
+    assert_eq!(
+        services.len(),
+        3,
+        "two services on 27 plus one on 28: {services:?}"
+    );
+    assert!(
+        text.matches("services found").count() >= 2,
+        "progress must report both channels: {text}"
+    );
+    assert!(
+        !text.contains("tuner busy"),
+        "two free tuners must not report a busy channel: {text}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2400),
+        "the two channels must be tuned concurrently (took {elapsed:?}): {text}"
+    );
+    manager.shutdown().await;
+
+    let written = fixture.channels_yml();
+    assert!(
+        written.contains("27"),
+        "channel 27 must be written: {written}"
+    );
+    assert!(
+        written.contains("28"),
+        "channel 28 must be written: {written}"
+    );
+}

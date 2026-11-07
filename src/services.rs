@@ -302,16 +302,17 @@ impl ServiceTable {
     /// one of them. Returns whether a record was found.
     pub fn modify<F: FnOnce(&mut ServiceRecord)>(&self, item_id: ServiceItemId, f: F) -> bool {
         let mut records = self.write();
-        let mut keys: Vec<ServiceKey> = records
-            .keys()
-            .filter(|key| key.item_id == item_id)
-            .cloned()
-            .collect();
-        keys.sort();
-        let Some(key) = keys.first() else {
+        // First record in list order (order_key, same as get()/list()),
+        // found in one pass without allocating/sorting a key Vec.
+        let best_key = records
+            .iter()
+            .filter(|(_, record)| record.item_id() == item_id)
+            .min_by(|(_, l), (_, r)| l.order_key().cmp(&r.order_key()))
+            .map(|(key, _)| key.clone());
+        let Some(key) = best_key else {
             return false;
         };
-        match records.get_mut(key) {
+        match records.get_mut(&key) {
             Some(record) => {
                 f(record);
                 true
@@ -454,7 +455,13 @@ impl ServiceTable {
     /// [`get_on_channel`](Self::get_on_channel) or
     /// [`get_all`](Self::get_all) when that matters.
     pub fn get(&self, item_id: ServiceItemId) -> Option<ServiceRecord> {
-        self.get_all(item_id).into_iter().next()
+        // One read lock, one pass, clone only the winner (previously
+        // get_all cloned+sorted every match). Winner is first in list order.
+        self.read()
+            .values()
+            .filter(|record| record.item_id() == item_id)
+            .min_by(|l, r| l.order_key().cmp(&r.order_key()))
+            .cloned()
     }
 
     /// Every record carrying `item_id`, across channels, in list order.
