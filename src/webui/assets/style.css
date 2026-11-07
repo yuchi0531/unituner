@@ -659,6 +659,26 @@ td input[type="checkbox"] { width: 18px; }
 .stage { display: flex; gap: 8px; align-items: center; }
 .stage input { flex: 1 1 auto; min-width: 0; }
 
+/* Channel route editor: revealed under a channel row as a full-width sub-row.
+   The tuner input suggests names from the shared <datalist>. */
+.routes-toggle { text-transform: none; letter-spacing: 0; white-space: nowrap; }
+.route-row > td {
+  height: auto;
+  padding: 0 16px 12px;
+  background: var(--md-surface-2);
+}
+.route-editor { display: grid; gap: 12px; padding: 12px 0; }
+.route-editor .hint { margin: 0; }
+.routes { display: grid; gap: 8px; }
+.route {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr auto;
+  gap: 8px;
+  align-items: end;
+}
+.route label { display: grid; gap: 4px; font-size: 12px; color: var(--md-text-secondary); }
+.route-actions { display: flex; gap: 4px; }
+
 /* Footer and snackbar. */
 
 footer {
@@ -724,6 +744,9 @@ footer {
      clipping them. */
   #channels-table,
   #bindings-table { min-width: 560px; }
+  /* The route editor stacks its three fields instead of crushing them. */
+  .route { grid-template-columns: 1fr; }
+  .route-actions { justify-content: flex-end; }
   #services-table th:nth-child(n + 5),
   #services-table td:nth-child(n + 5) { display: none; }
   .message { bottom: 16px; }
