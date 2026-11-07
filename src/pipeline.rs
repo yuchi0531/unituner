@@ -15,16 +15,24 @@
 //!
 //! # Placeholders (SPEC §3.5)
 //!
-//! `{channel}` and `{type}` are substituted before argv splitting. Any other
-//! `{...}` sequence is left **literally** in place instead of being blanked:
-//! a typo such as `{chanel}` reaches the command unchanged and fails visibly,
-//! rather than silently invoking the tuner without its channel argument.
-//! Substitution is textual, so a value must not be able to break out of the
-//! argv token it is written into; the values are therefore validated against
-//! the same charset the config layer enforces
-//! ([`crate::config::validate_channel_value`] /
+//! `{channel}`, `{type}` and `{extra_args}` are substituted before argv
+//! splitting. Any other `{...}` sequence is left **literally** in place
+//! instead of being blanked: a typo such as `{chanel}` reaches the command
+//! unchanged and fails visibly, rather than silently invoking the tuner without
+//! its channel argument. Substitution is textual, so a value must not be able
+//! to break out of the argv token it is written into; the `{channel}` / `{type}`
+//! values are therefore validated against the same charset the config layer
+//! enforces ([`crate::config::validate_channel_value`] /
 //! [`crate::config::validate_type_name`]) and contain neither whitespace nor
-//! quotes.
+//! quotes. `{extra_args}` is intentionally **not** validated: it is an argv
+//! fragment whose whole point is to expand to several tokens (e.g.
+//! `--lnb 15`), and its value comes from trusted config.
+//!
+//! An empty `{extra_args}` substitutes to nothing. Because argv splitting
+//! collapses the surrounding whitespace, an unquoted `cmd {channel}
+//! {extra_args}` with an empty `extra_args` yields `["cmd", "<channel>"]` —
+//! the token **disappears**. A quoted `"{extra_args}"` yields one empty token,
+//! exactly as a shell would. Both behaviors are asserted below.
 //!
 //! # Why argv splitting, not a shell
 //!
@@ -91,22 +99,35 @@ impl PipelineSpec {
     }
 }
 
-/// The `{channel}` and `{type}` values used for placeholder substitution.
+/// The `{channel}`, `{type}` and `{extra_args}` values used for placeholder
+/// substitution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandVars {
-    /// The channel value (`27`, `BS13_1`, `C17`, ...).
+    /// The channel value (`27`, `BS13_1`, `C17`, ...). For a routed channel
+    /// this is the **effective** channel of the route being tried.
     pub channel: String,
     /// The channel type (`GR`, `BS`, ...). Spelled without the `type` keyword.
     pub type_name: String,
+    /// Extra arguments for the tuner command (`--lnb 15`, ...). Empty unless
+    /// the channel or a route defines `extra-args`; an empty value substitutes
+    /// to nothing (see the module documentation).
+    pub extra_args: String,
 }
 
 impl CommandVars {
-    /// Builds the substitution variables for one session.
+    /// Builds the substitution variables for one session, with no extra args.
     pub fn new(channel: impl Into<String>, type_name: impl Into<String>) -> Self {
         Self {
             channel: channel.into(),
             type_name: type_name.into(),
+            extra_args: String::new(),
         }
+    }
+
+    /// Sets the `{extra_args}` value.
+    pub fn with_extra_args(mut self, extra_args: impl Into<String>) -> Self {
+        self.extra_args = extra_args.into();
+        self
     }
 }
 
@@ -217,8 +238,8 @@ pub fn shell_split(input: &str) -> Vec<String> {
     args
 }
 
-/// Replaces `{channel}` and `{type}` in `command`, leaving every other
-/// `{...}` sequence untouched (see the module documentation).
+/// Replaces `{channel}`, `{type}` and `{extra_args}` in `command`, leaving every
+/// other `{...}` sequence untouched (see the module documentation).
 pub fn substitute(command: &str, vars: &CommandVars) -> String {
     let mut out = String::with_capacity(command.len());
     let mut rest = command;
@@ -231,6 +252,7 @@ pub fn substitute(command: &str, vars: &CommandVars) -> String {
                 match key {
                     "channel" => out.push_str(&vars.channel),
                     "type" => out.push_str(&vars.type_name),
+                    "extra_args" => out.push_str(&vars.extra_args),
                     // Unknown placeholders stay literal on purpose.
                     _ => {
                         out.push('{');
@@ -776,6 +798,36 @@ mod tests {
         // Only exact `{channel}` / `{type}` keys are recognised; a nested brace
         // is an unknown placeholder and stays literal.
         assert_eq!(substitute("{{channel}}", &vars), "{{channel}}");
+    }
+
+    #[test]
+    fn extra_args_placeholder_is_substituted_and_defaults_to_empty() {
+        let vars = CommandVars::new("13", "CS").with_extra_args("--lnb 15");
+        assert_eq!(
+            substitute("tuner {channel} {extra_args} -", &vars),
+            "tuner 13 --lnb 15 -"
+        );
+
+        // Unset: the placeholder is replaced by nothing and the surrounding
+        // whitespace collapses, so the token disappears from the argv.
+        let vars = CommandVars::new("13", "CS");
+        assert_eq!(
+            substitute("tuner {channel} {extra_args} -", &vars),
+            "tuner 13  -"
+        );
+        assert_eq!(
+            shell_split(&substitute("tuner {channel} {extra_args} -", &vars)),
+            ["tuner", "13", "-"]
+        );
+
+        // Quoted, an empty substitution is one empty token, as in a shell.
+        assert_eq!(
+            shell_split(&substitute("tuner {channel} \"{extra_args}\" -", &vars)),
+            ["tuner", "13", "", "-"]
+        );
+
+        // Unknown placeholders still stay literal, including near extra_args.
+        assert_eq!(substitute("a {extra_argz} b", &vars), "a {extra_argz} b");
     }
 
     #[test]
