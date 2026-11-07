@@ -43,6 +43,7 @@ max_subscribers_per_session: 32      # 既定 32。1 セッションの購読者
 max_subscribers_per_ip: 16           # 既定 16。1 クライアント IP の全セッション合計上限。超過は 429
 max_sessions: 16                     # 既定 16。同時セッション数（Starting/Stopping 含む）。超過は 429
 max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キューの合計上限。超過は 429
+tuner_startup_probe_ms: 1000         # 既定 1000。routes 使用チャンネルの起動 probe 窓（ms）
 ```
 
 - `addr` の既定値（loopback か全インタフェースか）は実装時に確定し、本書と README に記す。
@@ -57,6 +58,7 @@ max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キュー�
   - `max_sessions` は同時に存在するセッションオブジェクト数（登録中の `Starting` / `Stopping` も含む）。奪取で退避した victim はレジストリから外れた時点で数えない（その購読者は EOF に向かう途中であり、置換の予約を妨げないため）。
   - `max_subscriber_buffer_bytes` は全購読者キューの合計バイト上限。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約する。既定 2 GiB は 32 購読者分にあたり、`max_subscribers_per_session: 32` と同じなので通常は per-session 上限の方が先に効く。この予算は「最悪ケースの予約」であり実使用量ではない（実際のキューはクライアントに配信中の分しか持たない）ため、2 GiB の予約は一般的なホストで許容できる。より多くの同時視聴が必要なら `max_subscriber_buffer_bytes` を上げ、メモリが制約されたホストでは `subscriber_buffer_chunks` を下げる。
   - 上限を超えたストリーム要求は **429**（`{"code":429,"reason":"Too Many Requests"}`）。既存の購読者・セッションには影響しない。判定はチューナー選定より前（新規セッションは予約時、既存セッションへの参加は attach 時）に行うため、通常はチューナーを起動しない。
+- `tuner_startup_probe_ms` は `routes` を持つチャンネルの**起動 probe 窓**（ミリ秒、既定 1000、1 以上）。詳細は §6.4。routes を持たないチャンネルには影響しない（従来の readiness gate のまま）。
 - webui では **閲覧のみ**（編集不可。意図的に誤設定でロックアウトすることを防ぐ）。
 
 ### 3.2 `tuners.yml`
@@ -64,7 +66,7 @@ max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キュー�
 ```yaml
 - name: pt3-gr0                      # 一意必須
   types: [GR]                        # このチューナーが扱えるタイプ（ユーザー定義名、完全一致）
-  command: "recpt1 --device /dev/pt3video0 {channel} -"   # {channel} / {type} プレースホルダ可
+  command: "recpt1 --device /dev/pt3video0 {channel} -"   # {channel} / {type} / {extra_args} プレースホルダ可
   disabled: false                    # ★追加。pinning の disabled→400 を実装可能にする
 ```
 
@@ -74,11 +76,24 @@ max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キュー�
 - name: ＮＨＫ総合
   type: GR                           # ユーザー定義の半角 ASCII 名。正規表現: ^[A-Za-z0-9][A-Za-z0-9_-]*$
   channel: "27"                      # チューナーコマンドの {channel} に入る値。数字以外（C17 等）も可
+  extra-args: ""                     # 任意・既定 ""。チューナーコマンドの {extra_args} に入る追加引数
   disabled: false                    # ★追加
+  routes:                            # 任意・既定 []（未指定は従来どおり全チューナーから選択）
+    - tuner: catv-tuner              # 必須: tuners.yml の name
+      channel: "13"                  # 任意: この route だけ channel を上書き
+      extra-args: "--lnb 15"         # 任意: この route だけ extra-args を上書き（extra_args 綴りも可）
+    - tuner: ptx-s110
 ```
 
 - チャンネルタイプは任意名（半角）。GR / BS / CS 等どんな名称でもよい。
 - `name`/`(type,channel)` の組み合わせは一意必須。
+- `extra-args` は任意・既定 `""`（未指定と同じ）。`extra_args`（アンダースコア）綴りも別名として受理する。値はチューナーコマンドの `{extra_args}` に置換される（§3.5）。
+- `routes` は任意・既定 `[]`。空（未指定）なら従来の選択（§6.2）、非空ならそのチャンネルは**列挙したチューナーだけ**を順に試す（§6.4）。`routes` はチャンネルタイプに依存しない。
+  - `route.tuner` は必須で、`tuners.yml` の `name` を指す。未知のチューナーは起動エラー。
+  - 同一チャンネルの `routes` に同じチューナーを 2 回書くことはできない（起動エラー）。
+  - `route.channel` を使う場合、`channel` と同じ文字種検証（§3.5）を通る必要がある。
+  - `route.extra-args` はチャンネルの `extra-args` をこの route だけ上書きする。未指定ならチャンネルの値を継承する。
+- 同一 `(type, channel)` の重複エントリは**起動エラー**とする。mirakc-BS4K は警告して最初の定義を採用する（first wins）が、unituner は既存の fail-fast 規則を維持する。したがって `(type, channel)` に対する `routes` の解決は常に一意である。
 
 ### 3.4 `pipelines.yml`
 
@@ -102,11 +117,14 @@ types:                                # チャンネルタイプ → pipeline �
 
 ### 3.5 プレースホルダとコマンド実行
 
-- チューナーコマンドと pipeline の各コマンドには `{channel}` と `{type}` のプレースホルダを使える。
-  - `{channel}`: 要求されたチャンネルの `channel` 値（例: `"27"`, `"BS13_1"`, `"C17"`）
+- チューナーコマンドと pipeline の各コマンドには `{channel}`、`{type}`、`{extra_args}` のプレースホルダを使える。
+  - `{channel}`: 要求されたチャンネルの `channel` 値（例: `"27"`, `"BS13_1"`, `"C17"`）。`routes` 使用時はその route の実効 channel（route の `channel` 上書きがあればそれ、なければチャンネルの `channel`）（§6.4）。
   - `{type}`: 要求されたチャンネルの `type` 値（例: `GR`, `BS`, `CABLE_CATV`）
+  - `{extra_args}`: チューナーコマンドの追加引数。`routes` 使用時はその route の実効 extra-args（route の上書きがあればそれ、なければチャンネルの `extra-args`）、それ以外はチャンネルの `extra-args`。既定は空文字列。
   - pipeline は既にタイプごとにバインドされているので `{type}` は実質不変だが、両コマンドで同じ規則にする。
-- 置換は Session の spawn 時に行う。Session キーが (tuner, type, channel) なので一意に決まる。
+- 置換は Session の spawn 時に行う。Session キーが (tuner, type, 実効 channel) なので一意に決まる。
+- `{extra_args}` はチャンネル/route 定義由来の信頼済み断片であり、`--lnb 15` のように複数 argv トークンへ展開することを意図するため、charset 検証は行わない。
+  - `{extra_args}` が空文字列のときは何も置換しない。argv 分割が周囲の空白を畳むため、引用符なしの `cmd {channel} {extra_args}` は `["cmd", "<channel>"]` となりトークンが消える。引用した `"{extra_args}"` は空トークン 1 個になる（シェルと同じ）。
 - コマンドは **argv 分割して直接 spawn** する（`/bin/sh -c` は使わない）。`{channel}`/`{type}` の値は生成時に charset 検証 + クォーティングを通す。
   - config 値と URL パス由来の値（`/api/channels/{type}/{channel}/stream`）は同じ検証関数に通す。URL 由来のメタ文字がシェルに流入しないこと（command injection 防止）。
   - 確定（Phase 1）: `{channel}` の許容文字は ASCII 英数字と `. _ + - : @ ,` のみ（空白・引用符・`\`・`/`・シェルメタ文字は拒否）。{type} は §3.3 の正規表現 `^[A-Za-z0-9][A-Za-z0-9_-]*$`。
@@ -178,7 +196,7 @@ types:                                # チャンネルタイプ → pipeline �
 
 ### 6.2 選択アルゴリズム（mirakurun の `_pickTunerDevice` 相当）
 
-参加検索は **(type, channel) 基準**で行う。Session の登録キーとして `(tuner, type, channel)` を持つが、「参加検索は type/channel で行う」と明記し、duplicate spawn を禁止する。
+参加検索は **(type, channel) 基準**で行う。Session の登録キーとして `(tuner, type, channel)` を持つが、「参加検索は type/channel で行う」と明記し、duplicate spawn を禁止する。`routes` を持つチャンネルでは、この `channel` は route の**実効 channel**（§6.4）である。
 
 1. 同 `(type, channel)` の使用中セッションがあれば、**priority 関係なく参加**する。
 2. 完全フリーのタイプ適合チューナーがあれば、それで起動する。
@@ -215,6 +233,30 @@ types:                                # チャンネルタイプ → pipeline �
   - pinned でもフォールバックしない（別 tuner を試さない）
   - service endpoint 側でも pinning が効くことは README 制限欄に明記する。
 - **エラー優先順位**：service 解決（404）が tuner 検証（400）より先。
+
+### 6.4 ルート（`routes`）
+
+mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネルは、**列挙したチューナーだけを、書いた順に**試す。`routes` はチャンネルタイプに依存せず（GR / BS / CS / 任意の type で使える）、type 適合の判定はこれまでどおり `tuners.types` で行う。
+
+- 選択の手順（route ごと、mirakc-BS4K と同じ順）:
+  1. その route の実効 `(type, channel)` のセッションが既にあれば、`priority` に関係なく**参加/再利用**する。
+  2. その route のチューナーが完全にフリーなら起動する。
+  3. その route のチューナーが下位 priority の利用者から奪えるなら、kill-first で奪取して起動する（§6.2）。
+  4. それ以外（busy・奪取不可・type 非対応・disabled・未知）は次の route へ。
+- **フォールバックは起動失敗のときだけ**次 route に進む:
+  - チューナーコマンドが render / spawn できない（`{channel}` 等の検証失敗、exec 失敗）。
+  - チューナーコマンドが**最初のデータを出す前に**終了した（起動 probe 窓内の early exit）。
+  - 起動 probe: spawn 後 `tuner_startup_probe_ms`（§3.1、既定 1000 ms）待つ。
+    - 窓内に最初のデータが来たら起動成功。
+    - 窓内にプロセスが終了（データなし）なら起動失敗 → 次 route。
+    - 窓を過ぎてもプロセスが生きていれば（データ未着でも）**起動成功とみなし**、probe を終了して通常の idle/EOF 処理に委ねる。**no signal はフォールバックの理由にしない**（mirakc の文書化された挙動）。
+  - 一度ストリームが始まった後に停止してもフォールバックしない。
+- route の `channel`/`extra-args` 上書きは**実効値**として、チューナーコマンドの `{channel}`/`{extra_args}` とセッション identity・再利用の両方に使う。不変条件「実効 `(type, channel)` ごとに最大 1 セッション」は維持される。2 つの route が異なる channel 文字列を持っても、session を誤って共有/衝突させない。
+- **全 route 失敗**は既存の `TunerUnavailable` 経路（HTTP **503**）。
+- **pinning は routes に優先する**（§6.3）。`X-Mirakc-Tuner` / `X-Mirakurun-Tuner` を指定した要求は routes を無視し、そのチューナーだけを使う。フォールバックは一切しない。
+- `disabled: true` のチャンネルは route を試す前に 404（§9）。routes は `disabled` 判定の後。
+- `routes` を持たないチャンネルは従来どおり §6.2 の選択（全 type 適合チューナーからの fall-through あり）で、起動 probe は使わず従来の readiness gate（10 秒）で成否を決める。
+- 起動 probe と readiness gate の関係: probe は**route フォールバックの可否**を決め、通常の readiness gate は**ストリーム開始**を決める。routes 使用時は probe のタイムアウトを「起動成功」として扱うため、10 秒の readiness gate は実質使われない。routes 非使用時は従来の readiness gate のみ。
 
 ## 7. バックプレッシャとリソース
 
@@ -391,6 +433,9 @@ unituner/
   - 確定: `max_subscribers_per_session: 32` / `max_subscribers_per_ip: 16` / `max_sessions: 16` / `max_subscriber_buffer_bytes: 2147483648`（2 GiB）。超過は 429。2 GiB は 32 購読者分（64 MiB × 32）にあたるため、通常は per-session 上限の方が先に効く。詳細は §7。
 - `.bak` の世代管理方針
 - `PUT /api/config/channels/scan` の `skipCh` / `minSubCh` / `maxSubCh` のカンマ区切り入力の正規化
+- `routes` の `(type, channel)` 重複と route 上書きの扱い
+  - 確定: 同一 `(type, channel)` の重複は起動エラー（fail-fast）。mirakc-BS4K の warn + first wins は採用しない。route の `channel`/`extra-args` はその route だけの実効値として、コマンドとセッション identity の両方に使う（§3.3, §6.4）。
+  - 確定: `tuner_startup_probe_ms` の既定は 1000、1 以上。route 使用時の timeout は「起動成功」扱い（§6.4）。
 
 ## 15. README 制限欄に必ず書くこと
 
@@ -400,5 +445,7 @@ unituner/
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
 - webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
 - スキャン完了までは `/api/services/{id}/stream` が 404 しうる
+- `routes` を持つチャンネルは**列挙したチューナーだけ**を使う（type 非依存）。フォールバックは起動失敗のときだけで、起動 probe（既定 1000 ms）のタイムアウトは「起動成功」として扱う（no signal はフォールバックしない）。pinning（`X-Mirakc-Tuner` / `X-Mirakurun-Tuner`）は routes を無視する
+- webui の Channels は現状 `routes` / `extra-args` を表示・編集せず、これらのフィールドを持つ `channels.yml` を読み込むとエラーになり、保存すると失われる。route 編集の追加は follow-up（§10 の編集対象に routes を含める改修が必要）
 - `PUT /api/config/channels/scan` は curl 等で直接叩く（webui には出さない）。`async` / `GET` ポーリングは非対応。channels.yml 書き換え後は **RESTART REQUIRED**（自動再起動しない）
 - 探索 API は既存エントリを維持し、**追加のみ**行う（type 単位の完全置換はしない。`refresh=true` のときのみ既存を置換）
