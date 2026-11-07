@@ -843,8 +843,13 @@ fn load_server_config(dir: &Path) -> Result<ServerConfig, String> {
 /// The Status tab polls this endpoint, and re-parsing (and fully validating)
 /// the whole document on every poll is pure waste when the file has not
 /// changed: the parsed count is cached behind its `(mtime, size)` stamp and
-/// only recomputed after a hand edit or a webui save changes the file, so
-/// the snapshot can neither go stale nor re-parse per request.
+/// only recomputed after a hand edit or a webui save changes the file.
+///
+/// The stamp is a heuristic, not a content hash: a same-size rewrite inside
+/// one coarse mtime tick (FAT/exFAT, a stale NFS attribute cache, `cp -p`)
+/// serves the previous count until the next change. That is a display value on
+/// the Status tab only; the file itself is re-read by every code path that
+/// writes or validates configuration.
 fn channels_on_disk(dir: &Path) -> Option<usize> {
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -852,10 +857,15 @@ fn channels_on_disk(dir: &Path) -> Option<usize> {
     static CACHE: Mutex<Option<(std::path::PathBuf, SystemTime, u64, usize)>> = Mutex::new(None);
 
     let path = dir.join(CHANNELS_FILE);
-    let metadata = std::fs::metadata(&path).ok()?;
-    let stamp = (metadata.modified().ok()?, metadata.len());
+    // The stamp is only used to *skip* re-parsing: a filesystem without mtime
+    // (some FUSE/virtual mounts) still parses the file every time instead of
+    // falling back to the startup snapshot.
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+
     let cached = CACHE.lock().ok().and_then(|guard| guard.clone());
-    if let Some((cached_path, mtime, len, count)) = cached {
+    if let (Some(stamp), Some((cached_path, mtime, len, count))) = (stamp, cached) {
         if cached_path == path && mtime == stamp.0 && len == stamp.1 {
             return Some(count);
         }
@@ -864,7 +874,7 @@ fn channels_on_disk(dir: &Path) -> Option<usize> {
     let count = serde_yaml_ng::from_str::<Vec<ChannelConfig>>(&text)
         .ok()
         .map(|channels| channels.len())?;
-    if let Ok(mut guard) = CACHE.lock() {
+    if let (Some(stamp), Ok(mut guard)) = (stamp, CACHE.lock()) {
         *guard = Some((path, stamp.0, stamp.1, count));
     }
     Some(count)
