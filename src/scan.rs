@@ -1802,7 +1802,9 @@ fn write_channels(
             name: entry.name.clone(),
             channel_type: entry.channel_type.clone(),
             channel: entry.channel.clone(),
+            extra_args: String::new(),
             disabled: entry.disabled,
+            routes: Vec::new(),
         })
         .collect();
     candidate.validate().map_err(|error| match error {

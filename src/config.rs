@@ -58,6 +58,16 @@ pub const DEFAULT_MAX_SESSIONS: usize = 16;
 /// further (or lower `subscriber_buffer_chunks`) on memory-constrained hosts.
 pub const DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Default startup probe window for a routed channel, in milliseconds
+/// (SPEC §3.1, §6.4).
+///
+/// While a route's tuner is being started, the session waits this long for the
+/// first data. A process that exits before any data is a start failure and the
+/// next route is tried; a timeout with the process still alive is **not** a
+/// failure — a tuner that has no data yet (e.g. no signal) is treated as
+/// successfully started, matching mirakc-BS4K.
+pub const DEFAULT_TUNER_STARTUP_PROBE_MS: u64 = 1000;
+
 /// `server.yml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +120,15 @@ pub struct ServerConfig {
     /// budget is a worst-case reservation and still prevents unbounded growth.
     #[serde(default = "default_max_subscriber_buffer_bytes")]
     pub max_subscriber_buffer_bytes: usize,
+    /// Startup probe window for a routed channel's tuner, in milliseconds
+    /// (SPEC §3.1, §6.4).
+    ///
+    /// Only `routes` fallback uses it: a tuner that exits before producing its
+    /// first data is a start failure and the next route is tried, while a
+    /// timeout with the process still alive counts as started. Channels without
+    /// `routes` keep the existing readiness gate and are unaffected.
+    #[serde(default = "default_tuner_startup_probe_ms")]
+    pub tuner_startup_probe_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -125,6 +144,7 @@ impl Default for ServerConfig {
             max_subscribers_per_ip: default_max_subscribers_per_ip(),
             max_sessions: default_max_sessions(),
             max_subscriber_buffer_bytes: default_max_subscriber_buffer_bytes(),
+            tuner_startup_probe_ms: default_tuner_startup_probe_ms(),
         }
     }
 }
@@ -168,6 +188,10 @@ fn default_max_subscriber_buffer_bytes() -> usize {
     DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
 }
 
+fn default_tuner_startup_probe_ms() -> u64 {
+    DEFAULT_TUNER_STARTUP_PROBE_MS
+}
+
 /// One entry of `tuners.yml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,8 +211,36 @@ pub struct ChannelConfig {
     #[serde(rename = "type")]
     pub channel_type: String,
     pub channel: String,
+    /// Extra arguments substituted for `{extra_args}` in the tuner command
+    /// (SPEC §3.3). Empty by default; a route may override it for itself.
+    ///
+    /// Both the `extra-args` spelling (canonical) and `extra_args` are accepted.
+    #[serde(default, rename = "extra-args", alias = "extra_args")]
+    pub extra_args: String,
     #[serde(default)]
     pub disabled: bool,
+    /// Optional list of tuner routes (SPEC §3.3, §6.4). Empty (the default)
+    /// keeps the type-independent selection behavior of SPEC §6.2; a non-empty
+    /// list restricts the channel to exactly the named tuners, in order.
+    #[serde(default)]
+    pub routes: Vec<ChannelRouteConfig>,
+}
+
+/// One entry of a channel's `routes`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelRouteConfig {
+    /// `name` of a tuner in `tuners.yml`.
+    pub tuner: String,
+    /// Channel value used for this route only, overriding the channel's
+    /// `channel` in the tuner command and in session identity.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Extra arguments used for this route only, overriding the channel's
+    /// `extra-args`. Both the `extra-args` spelling and `extra_args` are
+    /// accepted.
+    #[serde(default, rename = "extra-args", alias = "extra_args")]
+    pub extra_args: Option<String>,
 }
 
 /// `pipelines.yml`.
@@ -312,7 +364,7 @@ pub fn validate(config: &Config) -> Vec<Issue> {
     let mut issues = Vec::new();
     validate_server(&config.server, &mut issues);
     validate_tuners(&config.tuners, &mut issues);
-    validate_channels(&config.channels, &mut issues);
+    validate_channels(&config.channels, &config.tuners, &mut issues);
     validate_pipelines(&config.pipelines, &mut issues);
     issues
 }
@@ -368,6 +420,13 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
         if value == 0 {
             issues.push(Issue::new("server.yml", field, "must be greater than 0"));
         }
+    }
+    if server.tuner_startup_probe_ms == 0 {
+        issues.push(Issue::new(
+            "server.yml",
+            "tuner_startup_probe_ms",
+            "must be greater than 0",
+        ));
     }
 }
 
@@ -553,7 +612,8 @@ fn validate_tuners(tuners: &[TunerConfig], issues: &mut Vec<Issue>) {
     }
 }
 
-fn validate_channels(channels: &[ChannelConfig], issues: &mut Vec<Issue>) {
+fn validate_channels(channels: &[ChannelConfig], tuners: &[TunerConfig], issues: &mut Vec<Issue>) {
+    let tuner_names: HashSet<&str> = tuners.iter().map(|tuner| tuner.name.as_str()).collect();
     let mut seen_names = HashSet::new();
     let mut seen = HashSet::new();
     for (index, channel) in channels.iter().enumerate() {
@@ -585,12 +645,59 @@ fn validate_channels(channels: &[ChannelConfig], issues: &mut Vec<Issue>) {
         if !seen.insert((channel.channel_type.as_str(), channel.channel.as_str())) {
             issues.push(Issue::new(
                 "channels.yml",
-                label,
+                label.clone(),
                 format!(
                     "duplicate (type, channel) pair ({:?}, {:?})",
                     channel.channel_type, channel.channel
                 ),
             ));
+        }
+        validate_channel_routes(channel, &label, &tuner_names, issues);
+    }
+}
+
+/// Validates one channel's `routes` (SPEC §3.6): every route names a configured
+/// tuner, no tuner is listed twice for one channel, and a per-route `channel`
+/// passes the same value check as a channel's own.
+fn validate_channel_routes(
+    channel: &ChannelConfig,
+    label: &str,
+    tuner_names: &HashSet<&str>,
+    issues: &mut Vec<Issue>,
+) {
+    let mut seen_tuners = HashSet::new();
+    for (route_index, route) in channel.routes.iter().enumerate() {
+        let route_label = format!("{label}.routes[{route_index}]");
+        if route.tuner.trim().is_empty() {
+            issues.push(Issue::new(
+                "channels.yml",
+                format!("{route_label}.tuner"),
+                "tuner must not be empty",
+            ));
+        } else if !tuner_names.contains(route.tuner.as_str()) {
+            issues.push(Issue::new(
+                "channels.yml",
+                format!("{route_label}.tuner"),
+                format!(
+                    "references unknown tuner {:?} (channel {:?})",
+                    route.tuner, channel.name
+                ),
+            ));
+        } else if !seen_tuners.insert(route.tuner.as_str()) {
+            issues.push(Issue::new(
+                "channels.yml",
+                format!("{route_label}.tuner"),
+                format!("duplicate tuner {:?} in routes", route.tuner),
+            ));
+        }
+        if let Some(route_channel) = &route.channel {
+            if let Err(message) = validate_channel_value(route_channel) {
+                issues.push(Issue::new(
+                    "channels.yml",
+                    format!("{route_label}.channel"),
+                    message,
+                ));
+            }
         }
     }
 }
@@ -1337,6 +1444,210 @@ types:
         assert!(
             text.starts_with("tuners.yml: [0] (\"t\").types[0]: "),
             "{text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extra-args / routes (SPEC §3.3, §6.4)
+    // -----------------------------------------------------------------------
+
+    /// The route channels fixture: `CHANNELS` plus a routed channel that uses
+    /// the two tuners from `TUNERS` (GR + BS/CABLE_CATV).
+    fn routes_fixture(channels: &str) -> Fixture {
+        Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+    }
+
+    #[test]
+    fn extra_args_defaults_to_empty_and_is_parsed_on_the_channel() {
+        let config = Fixture::valid().load().expect("valid config");
+        assert!(config
+            .channels
+            .iter()
+            .all(|channel| channel.extra_args.is_empty()));
+        assert!(config
+            .channels
+            .iter()
+            .all(|channel| channel.routes.is_empty()));
+
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  extra-args: "--lnb 15"
+"#;
+        // The tuner set does not matter for parsing; use the default one.
+        let config = Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+            .load()
+            .expect("extra-args is accepted");
+        assert_eq!(config.channels[0].extra_args, "--lnb 15");
+    }
+
+    #[test]
+    fn extra_args_accepts_the_underscore_alias() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  extra_args: "--lnb 15"
+"#;
+        let config = Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+            .load()
+            .expect("extra_args alias is accepted");
+        assert_eq!(config.channels[0].extra_args, "--lnb 15");
+    }
+
+    #[test]
+    fn routes_parse_with_optional_channel_and_extra_args() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: pt3-gr0
+      channel: "13"
+      extra-args: "--lnb 15"
+    - tuner: pt3-bs0
+"#;
+        let config = routes_fixture(channels)
+            .load()
+            .expect("routes are accepted");
+        let routes = &config.channels[0].routes;
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].tuner, "pt3-gr0");
+        assert_eq!(routes[0].channel.as_deref(), Some("13"));
+        assert_eq!(routes[0].extra_args.as_deref(), Some("--lnb 15"));
+        assert_eq!(routes[1].tuner, "pt3-bs0");
+        assert!(routes[1].channel.is_none());
+        assert!(routes[1].extra_args.is_none());
+    }
+
+    #[test]
+    fn routes_accept_the_underscore_extra_args_alias() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: pt3-gr0
+      extra_args: "--lnb 15"
+"#;
+        let config = routes_fixture(channels)
+            .load()
+            .expect("extra_args route alias is accepted");
+        assert_eq!(
+            config.channels[0].routes[0].extra_args.as_deref(),
+            Some("--lnb 15")
+        );
+    }
+
+    #[test]
+    fn a_route_naming_an_unknown_tuner_is_rejected() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: nope
+"#;
+        let issues = routes_fixture(channels).issues();
+        assert_issue_contains(&issues, ".routes[0].tuner");
+        assert_issue_contains(&issues, "references unknown tuner");
+        assert_issue_contains(&issues, "\"nope\"");
+    }
+
+    #[test]
+    fn a_duplicate_tuner_in_routes_is_rejected() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: pt3-gr0
+    - tuner: pt3-gr0
+"#;
+        let issues = routes_fixture(channels).issues();
+        assert_issue_contains(&issues, "duplicate tuner");
+        assert_issue_contains(&issues, "pt3-gr0");
+    }
+
+    #[test]
+    fn a_bad_route_channel_value_is_rejected() {
+        // A space makes it two argv tokens, which the channel charset forbids.
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: pt3-gr0
+      channel: "13 14"
+"#;
+        let issues = routes_fixture(channels).issues();
+        assert_issue_contains(&issues, ".routes[0].channel");
+        assert_issue_contains(&issues, "channel value");
+    }
+
+    #[test]
+    fn unknown_fields_in_a_route_are_rejected() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tunerr: pt3-gr0
+"#;
+        match routes_fixture(channels).load() {
+            Err(ConfigError::Parse { path, source }) => {
+                assert!(path.ends_with("channels.yml"));
+                assert!(
+                    source.to_string().contains("unknown field"),
+                    "unexpected parse error: {source}"
+                );
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_fields_on_a_channel_are_still_rejected_with_routes_support() {
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  extra_argz: "--lnb 15"
+"#;
+        match routes_fixture(channels).load() {
+            Err(ConfigError::Parse { path, source }) => {
+                assert!(path.ends_with("channels.yml"));
+                assert!(source.to_string().contains("unknown field"));
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuner_startup_probe_defaults_to_1000_and_zero_is_rejected() {
+        let config = Fixture::valid().load().expect("valid config");
+        assert_eq!(config.server.tuner_startup_probe_ms, 1000);
+
+        let server = format!("{SERVER}\ntuner_startup_probe_ms: 0\n");
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "tuner_startup_probe_ms");
+        assert_issue_contains(&issues, "must be greater than 0");
+
+        let server = format!("{SERVER}\ntuner_startup_probe_ms: 250\n");
+        let config = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("a positive probe window is accepted");
+        assert_eq!(config.server.tuner_startup_probe_ms, 250);
+    }
+
+    #[test]
+    fn server_defaults_include_the_probe_window() {
+        let fixture = Fixture::new("{}", TUNERS, CHANNELS, PIPELINES);
+        let config = fixture.load().expect("valid config");
+        assert_eq!(
+            config.server.tuner_startup_probe_ms,
+            DEFAULT_TUNER_STARTUP_PROBE_MS
         );
     }
 }
