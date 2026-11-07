@@ -630,6 +630,83 @@ async fn a_user_defined_type_without_a_range_is_rejected_before_scanning() {
 }
 
 // ---------------------------------------------------------------------------
+// D: a routed channel survives a refresh scan
+// ---------------------------------------------------------------------------
+
+/// A routed GR channel plus an unrelated routed BS entry.
+const ROUTED_GR: &str = "\
+- name: NHK
+  type: GR
+  channel: \"24\"
+  extra-args: \"--lnb 15\"
+  routes:
+    - tuner: t0
+      channel: \"13\"
+";
+
+const ROUTED_BS: &str = "\
+- name: BS Relay
+  type: BS
+  channel: \"BS01_0\"
+  routes:
+    - tuner: t1
+";
+
+#[tokio::test]
+async fn a_refresh_scan_keeps_a_routed_channels_routes_and_other_entries() {
+    let fixture = Fixture::new("", &format!("{ROUTED_GR}{ROUTED_BS}"));
+    let ts = fixture.stream("mux.ts", &multiplex(&[(0x0408, 0x01, "NHK General")]));
+    let command = format!("sh -c \"cat {}; sleep 30\"", ts.display());
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: t0\n  types: [GR]\n  command: '{command}'\n\
+             - name: t1\n  types: [BS]\n  command: 'true'\n"
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    let manager = fixture.manager();
+
+    // A refresh re-enumerates the (already configured) routed channel.
+    let query = query(&[
+        ("type", "GR"),
+        ("minCh", "24"),
+        ("maxCh", "24"),
+        ("refresh", "true"),
+    ]);
+    let progress = run(&manager, &fixture.config(), &fixture, &query).await;
+    assert!(progress.contains("**RESTART REQUIRED**"), "{progress}");
+
+    let written: Vec<unituner::scan::ChannelEntry> =
+        serde_yaml_ng::from_str(&fixture.channels_yml()).expect("the written channels.yml parses");
+
+    // The scan discovers services, not routes: the refreshed GR channel keeps
+    // the hand-written route and extra-args.
+    let gr = written
+        .iter()
+        .find(|entry| entry.channel_type == "GR")
+        .expect("GR entry");
+    assert_eq!(gr.channel, "24");
+    assert_eq!(gr.extra_args, "--lnb 15");
+    assert_eq!(gr.routes.len(), 1);
+    assert_eq!(gr.routes[0].tuner, "t0");
+    assert_eq!(gr.routes[0].channel.as_deref(), Some("13"));
+
+    // The unrelated BS entry is untouched, routes included.
+    let bs = written
+        .iter()
+        .find(|entry| entry.channel_type == "BS")
+        .expect("BS entry");
+    assert_eq!(bs.channel, "BS01_0");
+    assert_eq!(bs.routes.len(), 1);
+    assert_eq!(bs.routes[0].tuner, "t1");
+
+    // The merged file still passes the startup validation.
+    fixture.config();
+    manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // D: subchannel expansion in the progress stream
 // ---------------------------------------------------------------------------
 

@@ -53,6 +53,33 @@ types:
   BS: { pipeline: cas }
 "#;
 
+/// A `channels.yml` with the SPEC §3.3 routes / extra-args fields. Two routes
+/// are listed `t1` then `t0` on purpose: the webui must keep that order.
+const ROUTED_CHANNELS: &str = r#"
+- name: NHK General
+  type: GR
+  channel: "27"
+  extra-args: "--lnb 15"
+  routes:
+    - tuner: t1
+      channel: "13"
+      extra-args: "--lnb 20"
+    - tuner: t0
+- name: NHK BS
+  type: BS
+  channel: "BS13_1"
+"#;
+
+/// The default two-type tuner plus a second tuner, so a route can name either.
+const TUNERS_TWO: &str = r#"
+- name: t0
+  types: [GR, BS]
+  command: "recpt1 {channel} -"
+- name: t1
+  types: [GR, BS]
+  command: "recpt1 --device /dev/x {channel} {extra_args} -"
+"#;
+
 const PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const OUTSIDE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 0);
 
@@ -101,6 +128,13 @@ impl Fixture {
     fn exists(&self, name: &str) -> bool {
         self.path.join(name).exists()
     }
+}
+
+/// The default fixture with a routed `channels.yml` and a second tuner.
+fn routed_fixture() -> Fixture {
+    let fixture = Fixture::with(ROUTED_CHANNELS);
+    std::fs::write(fixture.path.join("tuners.yml"), TUNERS_TWO).expect("write tuners.yml");
+    fixture
 }
 
 /// A restart hook that records how often it ran, so a test can assert that a
@@ -288,6 +322,25 @@ async fn embedded_assets_have_their_content_types() {
     assert!(script.contains("channel-subtabs"), "{script}");
     assert!(script.contains("channelType"), "{script}");
     assert!(script.contains("aria-selected"), "{script}");
+    // Per-channel route editing: a toggle reveals a nested editor with a
+    // tuner datalist, add/remove/move controls and a client-side tuner check.
+    for identifier in [
+        "routeEditor",
+        "renderTunerDatalist",
+        "routesProblem",
+        "routes-toggle",
+        "tuner-names",
+        "'extra-args'",
+        "Add route",
+        "Move route up",
+        "Move route down",
+    ] {
+        assert!(script.contains(identifier), "missing {identifier}");
+    }
+    assert!(
+        script.contains("setAttribute('list', 'tuner-names')"),
+        "the tuner input is a datalist suggestion: {script}"
+    );
     // Theme wiring: the toggle persists the choice and keeps its label in sync.
     assert!(script.contains("unituner-theme"), "{script}");
     assert!(script.contains("theme-toggle"), "{script}");
@@ -375,6 +428,10 @@ async fn the_index_has_a_channel_subtab_container() {
     // Rendered by app.js from the model, never hardcoded in the document.
     assert!(html.contains("id=\"channel-subtabs\""), "{html}");
     assert!(html.contains("role=\"tablist\""), "{html}");
+    // The Channels table grew the route editor's columns.
+    assert!(html.contains("id=\"channels-table\""), "{html}");
+    assert!(html.contains("<th>Extra-args</th>"), "{html}");
+    assert!(html.contains("<th>Routes</th>"), "{html}");
 }
 
 #[tokio::test]
@@ -516,6 +573,134 @@ async fn put_channels_writes_the_yaml_and_keeps_a_backup() {
 
     // The result still loads through the startup path.
     Config::load(&fixture.path).expect("saved config is valid");
+}
+
+#[tokio::test]
+async fn get_channels_returns_routes_and_extra_args() {
+    let fixture = routed_fixture();
+    let state = fixture.state();
+    let (status, _, body) = get(&state, "/webui/api/channels").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    let channels = value["channels"].as_array().expect("channels");
+    assert_eq!(channels.len(), 2);
+    let routed = &channels[0];
+    assert_eq!(routed["extra-args"], "--lnb 15");
+    let routes = routed["routes"].as_array().expect("routes");
+    assert_eq!(routes.len(), 2, "both routes are returned, in order");
+    assert_eq!(routes[0]["tuner"], "t1");
+    assert_eq!(routes[0]["channel"], "13");
+    assert_eq!(routes[0]["extra-args"], "--lnb 20");
+    assert_eq!(routes[1]["tuner"], "t0");
+    assert!(routes[1]["channel"].is_null(), "{value}");
+    // A channel without the fields simply omits them.
+    assert!(channels[1].get("routes").is_none(), "{value}");
+    assert!(channels[1].get("extra-args").is_none(), "{value}");
+}
+
+#[tokio::test]
+async fn a_routed_channel_round_trips_through_put_and_get() {
+    let fixture = routed_fixture();
+    let state = fixture.state();
+
+    // GET the file, PUT it back: the routed fields and their order survive and
+    // the second write is byte-identical (the YAML is stable, not just equal
+    // after a re-quote).
+    let (_, _, body) = get(&state, "/webui/api/channels").await;
+    let document = json(&body);
+    let (status, put_body) = put(&state, Webui::default(), "/webui/api/channels", document).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&put_body));
+    let first = fixture.read("channels.yml");
+
+    let (_, _, body) = get(&state, "/webui/api/channels").await;
+    let (status, put_body) =
+        put(&state, Webui::default(), "/webui/api/channels", json(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&put_body));
+    let second = fixture.read("channels.yml");
+    assert_eq!(first, second, "a GET/PUT round trip must be byte-stable");
+
+    // The routes are written verbatim, in the author's order.
+    let written: Vec<unituner::scan::ChannelEntry> =
+        serde_yaml_ng::from_str(&first).expect("the written channels.yml parses");
+    let routed = &written[0];
+    assert_eq!(routed.extra_args, "--lnb 15");
+    assert_eq!(routed.routes.len(), 2);
+    assert_eq!(routed.routes[0].tuner, "t1");
+    assert_eq!(routed.routes[0].channel.as_deref(), Some("13"));
+    assert_eq!(routed.routes[0].extra_args.as_deref(), Some("--lnb 20"));
+    assert_eq!(routed.routes[1].tuner, "t0");
+    assert!(routed.routes[1].channel.is_none());
+
+    // The written file still passes the startup validation.
+    Config::load(&fixture.path).expect("the written config is valid");
+}
+
+#[tokio::test]
+async fn an_unknown_route_tuner_is_rejected_with_a_useful_message() {
+    let fixture = routed_fixture();
+    let state = fixture.state();
+    let before = fixture.read("channels.yml");
+
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/channels",
+        serde_json::json!({
+            "channels": [
+                {
+                    "name": "NHK General",
+                    "type": "GR",
+                    "channel": "27",
+                    "routes": [{ "tuner": "ghost" }]
+                }
+            ]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
+    let value = json(&body);
+    let errors = value["errors"].as_array().expect("errors list");
+    assert!(
+        errors.iter().any(|issue| issue
+            .as_str()
+            .is_some_and(|text| text.contains("references unknown tuner"))),
+        "{value}"
+    );
+    assert_eq!(fixture.read("channels.yml"), before, "nothing was written");
+}
+
+/// Accepts the `extra_args` alias on channels and routes, exactly like the
+/// startup schema (SPEC §3.3).
+#[tokio::test]
+async fn put_channels_accepts_the_extra_args_alias() {
+    let fixture = routed_fixture();
+    let state = fixture.state();
+
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/channels",
+        serde_json::json!({
+            "channels": [
+                {
+                    "name": "NHK General",
+                    "type": "GR",
+                    "channel": "27",
+                    "extra_args": "--lnb 15",
+                    "routes": [{ "tuner": "t0", "extra_args": "--lnb 20" }]
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    let written: Vec<unituner::scan::ChannelEntry> =
+        serde_yaml_ng::from_str(&fixture.read("channels.yml")).expect("parse written yaml");
+    assert_eq!(written[0].extra_args, "--lnb 15");
+    assert_eq!(written[0].routes[0].extra_args.as_deref(), Some("--lnb 20"));
 }
 
 #[tokio::test]

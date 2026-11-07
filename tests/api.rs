@@ -1851,6 +1851,60 @@ async fn a_scan_appends_entries_and_keeps_other_types() {
 }
 
 #[tokio::test]
+async fn a_scan_on_a_routed_channels_yml_no_longer_fails() {
+    let (fixture, _) = scan_fixture();
+    // A routed channel used to make the scan 500: `ChannelEntry`'s
+    // `deny_unknown_fields` rejected the `routes` / `extra-args` fields while
+    // reading the file. It must now parse, complete and preserve the route.
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        "- name: Existing GR\n  type: GR\n  channel: \"99\"\n  extra-args: \"--lnb 15\"\n  routes:\n    - tuner: t0\n      channel: \"13\"\n",
+    )
+    .expect("seed a routed channels.yml");
+    let state = fixture.state();
+
+    let (status, headers, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a routed config must scan: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_server_identity(&headers);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(text.contains("**RESTART REQUIRED**"), "{text}");
+
+    // The routed entry is preserved and the scan appends channel 24.
+    let file = fixture.channels_yml();
+    let written: Vec<unituner::scan::ChannelEntry> =
+        serde_yaml_ng::from_str(&file).expect("parse written channels.yml");
+    let existing = written
+        .iter()
+        .find(|entry| entry.channel == "99")
+        .expect("the routed entry survives");
+    assert_eq!(existing.extra_args, "--lnb 15");
+    assert_eq!(existing.routes.len(), 1);
+    assert_eq!(existing.routes[0].tuner, "t0");
+    assert_eq!(existing.routes[0].channel.as_deref(), Some("13"));
+    assert!(
+        written.iter().any(|entry| entry.channel == "24"),
+        "{written:?}"
+    );
+    // The appended channel's empty optionals are omitted, so the file stays
+    // clean (only the routed entry carries a `routes:` / `extra-args:` value).
+    assert!(!file.contains("routes: []"), "{file}");
+    assert!(!file.contains("extra-args: ''"), "{file}");
+}
+
+#[tokio::test]
 async fn a_scan_that_finds_nothing_new_does_not_rewrite_channels_yml() {
     let (fixture, _) = scan_fixture();
     // Exactly what the scan will produce for channel 24: same values, but with
