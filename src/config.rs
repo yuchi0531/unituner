@@ -68,6 +68,15 @@ pub const DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// successfully started, matching mirakc-BS4K.
 pub const DEFAULT_TUNER_STARTUP_PROBE_MS: u64 = 1000;
 
+/// Upper bound for `server.tuner_startup_probe_ms` (SPEC §3.1, §6.4).
+///
+/// The probe is waited once per route, and the request-wide wait deadline is
+/// [`crate::session::READINESS_TIMEOUT`] plus a margin (15 s). A probe above
+/// this bound could outlast the deadline the rest of the request honours, so
+/// it is rejected at startup instead of silently behaving differently. 10 s
+/// equals the legacy readiness gate.
+pub const MAX_TUNER_STARTUP_PROBE_MS: u64 = 10_000;
+
 /// `server.yml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -214,7 +223,9 @@ pub struct ChannelConfig {
     /// Extra arguments substituted for `{extra_args}` in the tuner command
     /// (SPEC §3.3). Empty by default; a route may override it for itself.
     ///
-    /// Both the `extra-args` spelling (canonical) and `extra_args` are accepted.
+    /// A standalone argv fragment: quotes, backslashes and newlines are refused
+    /// by validation, so it must never be placed inside a shell string. Both the
+    /// `extra-args` spelling (canonical) and `extra_args` are accepted.
     #[serde(default, rename = "extra-args", alias = "extra_args")]
     pub extra_args: String,
     #[serde(default)]
@@ -237,8 +248,9 @@ pub struct ChannelRouteConfig {
     #[serde(default)]
     pub channel: Option<String>,
     /// Extra arguments used for this route only, overriding the channel's
-    /// `extra-args`. Both the `extra-args` spelling and `extra_args` are
-    /// accepted.
+    /// `extra-args`. A standalone argv fragment (quotes, backslashes and
+    /// newlines are refused); never place it inside a shell string. Both the
+    /// `extra-args` spelling and `extra_args` are accepted.
     #[serde(default, rename = "extra-args", alias = "extra_args")]
     pub extra_args: Option<String>,
 }
@@ -426,6 +438,12 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             "server.yml",
             "tuner_startup_probe_ms",
             "must be greater than 0",
+        ));
+    } else if server.tuner_startup_probe_ms > MAX_TUNER_STARTUP_PROBE_MS {
+        issues.push(Issue::new(
+            "server.yml",
+            "tuner_startup_probe_ms",
+            format!("must be at most {MAX_TUNER_STARTUP_PROBE_MS} ms"),
         ));
     }
 }
@@ -642,6 +660,13 @@ fn validate_channels(channels: &[ChannelConfig], tuners: &[TunerConfig], issues:
                 message,
             ));
         }
+        if let Err(message) = validate_extra_args(&channel.extra_args) {
+            issues.push(Issue::new(
+                "channels.yml",
+                format!("{label}.extra-args"),
+                message,
+            ));
+        }
         if !seen.insert((channel.channel_type.as_str(), channel.channel.as_str())) {
             issues.push(Issue::new(
                 "channels.yml",
@@ -666,6 +691,10 @@ fn validate_channel_routes(
     issues: &mut Vec<Issue>,
 ) {
     let mut seen_tuners = HashSet::new();
+    // Effective channel -> (route index, effective extra-args). Two routes that
+    // resolve to the same effective channel share one session (SPEC §6.4), so a
+    // different `extra-args` could never take effect and is a config mistake.
+    let mut effective: HashMap<&str, (usize, &str)> = HashMap::new();
     for (route_index, route) in channel.routes.iter().enumerate() {
         let route_label = format!("{label}.routes[{route_index}]");
         if route.tuner.trim().is_empty() {
@@ -696,6 +725,35 @@ fn validate_channel_routes(
                     "channels.yml",
                     format!("{route_label}.channel"),
                     message,
+                ));
+            }
+        }
+        if let Some(extra_args) = &route.extra_args {
+            if let Err(message) = validate_extra_args(extra_args) {
+                issues.push(Issue::new(
+                    "channels.yml",
+                    format!("{route_label}.extra-args"),
+                    message,
+                ));
+            }
+        }
+        let effective_channel = route.channel.as_deref().unwrap_or(channel.channel.as_str());
+        let effective_extra = route
+            .extra_args
+            .as_deref()
+            .unwrap_or(channel.extra_args.as_str());
+        if let Some((first_index, first_extra)) =
+            effective.insert(effective_channel, (route_index, effective_extra))
+        {
+            if first_extra != effective_extra {
+                issues.push(Issue::new(
+                    "channels.yml",
+                    format!("{route_label}.extra-args"),
+                    format!(
+                        "route resolves to the same effective channel {effective_channel:?} as \
+                         routes[{first_index}] but declares different extra-args; effective-channel \
+                         reuse ignores route order, so these extra-args would be silently ignored"
+                    ),
                 ));
             }
         }
@@ -779,6 +837,29 @@ pub fn validate_type_name(name: &str) -> Result<(), String> {
 fn type_name_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").expect("valid regex"))
+}
+
+/// Validates an `extra-args` value (SPEC §3.3).
+///
+/// `extra-args` is substituted into the tuner command as a standalone argv
+/// fragment. unituner never passes it through a shell, but an operator could
+/// still write `{extra_args}` inside `sh -c "…"` in `tuners.yml`; a value
+/// containing a quote, a backslash or a newline could then break out of that
+/// string. Those four characters are refused, so the "one argv fragment, never
+/// shell text" invariant is explicit. Everything else (notably spaces between
+/// arguments) is allowed.
+pub fn validate_extra_args(value: &str) -> Result<(), String> {
+    match value
+        .chars()
+        .find(|c| matches!(c, '\'' | '"' | '\\' | '\n' | '\r'))
+    {
+        None => Ok(()),
+        Some(c) => Err(format!(
+            "invalid extra-args {value:?}: character {c:?} is not allowed \
+             (extra-args is a standalone argv fragment and must never be placed \
+             inside a shell string)"
+        )),
+    }
 }
 
 /// Validates a `{channel}` value, as found in `channels.yml` or in the URL path
@@ -1649,5 +1730,106 @@ types:
             config.server.tuner_startup_probe_ms,
             DEFAULT_TUNER_STARTUP_PROBE_MS
         );
+    }
+
+    #[test]
+    fn a_probe_window_above_the_upper_bound_is_rejected() {
+        let server = format!(
+            "{SERVER}\ntuner_startup_probe_ms: {}\n",
+            MAX_TUNER_STARTUP_PROBE_MS + 1
+        );
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "tuner_startup_probe_ms");
+        assert_issue_contains(&issues, "must be at most");
+
+        // The bound itself is accepted.
+        let server = format!("{SERVER}\ntuner_startup_probe_ms: {MAX_TUNER_STARTUP_PROBE_MS}\n");
+        Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("the upper bound is accepted");
+    }
+
+    #[test]
+    fn extra_args_may_not_contain_shell_breaking_characters() {
+        // Each raw value contains one refused character; it is YAML-escaped so
+        // it reaches the parser as that character (not as YAML syntax).
+        for raw in ["x'y", "x\"y", "x\\y", "x\ny"] {
+            let yaml_value = raw
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            // Channel-level.
+            let channels = format!(
+                "- name: AT-X\n  type: CS\n  channel: AT-X\n  extra-args: \"{yaml_value}\"\n"
+            );
+            let issues = routes_fixture(&channels).issues();
+            assert_issue_contains(&issues, ".extra-args");
+            assert_issue_contains(&issues, "invalid extra-args");
+
+            // Route-level.
+            let channels = format!(
+                "- name: AT-X\n  type: CS\n  channel: AT-X\n  routes:\n    - tuner: pt3-gr0\n      extra-args: \"{yaml_value}\"\n"
+            );
+            let issues = routes_fixture(&channels).issues();
+            assert_issue_contains(&issues, ".routes[0].extra-args");
+            assert_issue_contains(&issues, "invalid extra-args");
+        }
+
+        // Spaces between arguments are fine: it stays one argv fragment.
+        let channels = "- name: AT-X\n  type: CS\n  channel: AT-X\n  extra-args: \"--lnb 15 -x\"\n";
+        Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+            .load()
+            .expect("spaces are allowed in extra-args");
+    }
+
+    #[test]
+    fn two_routes_with_the_same_effective_channel_must_agree_on_extra_args() {
+        // Both routes resolve to effective channel 13 (route 1 inherits the
+        // channel's own): the second declares a different extra-args, which
+        // could never take effect.
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  routes:
+    - tuner: pt3-gr0
+      extra-args: "--lnb 15"
+    - tuner: pt3-bs0
+      extra-args: "--lnb 20"
+"#;
+        let issues = routes_fixture(channels).issues();
+        assert_issue_contains(&issues, "same effective channel");
+        assert_issue_contains(&issues, "silently ignored");
+
+        // The same extra-args (or an inherited one) is not a mistake.
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  extra-args: "--lnb 15"
+  routes:
+    - tuner: pt3-gr0
+    - tuner: pt3-bs0
+      extra-args: "--lnb 15"
+"#;
+        Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+            .load()
+            .expect("matching extra-args on a shared effective channel is accepted");
+
+        // Different effective channels may have different extra-args.
+        let channels = r#"
+- name: AT-X
+  type: CS
+  channel: AT-X
+  extra-args: "--lnb 15"
+  routes:
+    - tuner: pt3-gr0
+    - tuner: pt3-bs0
+      channel: "99"
+      extra-args: "--lnb 20"
+"#;
+        Fixture::new(SERVER, TUNERS, channels, PIPELINES)
+            .load()
+            .expect("distinct effective channels are independent");
     }
 }
