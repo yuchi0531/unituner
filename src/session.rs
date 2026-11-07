@@ -180,7 +180,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
-use crate::config::{Config, TunerConfig};
+use crate::config::{ChannelConfig, Config, TunerConfig};
 use crate::pipeline::{
     spawn_pipeline, spawn_tuner_command, CommandVars, PipelineCtx, PipelineHandle, PipelineSpec,
     TunerProcess,
@@ -516,6 +516,19 @@ struct SessionKey {
     channel: String,
 }
 
+/// One resolved route of a routed channel (SPEC §6.4).
+///
+/// `channel` and `extra_args` are the **effective** values for this route: a
+/// route override when present, otherwise the channel's own. `channel` is what
+/// the tuner command receives and what the session is keyed by; `extra_args`
+/// substitutes `{extra_args}`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteTarget {
+    tuner: String,
+    channel: String,
+    extra_args: String,
+}
+
 /// How a session produces its broadcast (SPEC §4, §4.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PipelineMode {
@@ -584,6 +597,10 @@ struct Replay {
 struct Session {
     id: u64,
     key: SessionKey,
+    /// Effective `{extra_args}` for this session's tuner command (SPEC §3.3).
+    /// Not part of the identity: it is fixed together with the key when the
+    /// session is reserved, from the channel or the route that produced it.
+    extra_args: String,
     /// The mode the session was started with (SPEC §4, §4.1). A request that
     /// asks for the other mode is refused; see [`AcquireError::DecodeModeConflict`].
     pipeline_mode: PipelineMode,
@@ -631,6 +648,7 @@ impl Session {
         Self {
             id,
             key,
+            extra_args: String::new(),
             pipeline_mode,
             started_at: SystemTime::now(),
             phase: AtomicU8::new(PHASE_STARTING),
@@ -917,6 +935,50 @@ impl Inner {
         !tuner.disabled && tuner.types.iter().any(|name| name == type_name)
     }
 
+    /// The configured channel entry for `(type_name, channel)`, if any.
+    fn channel(&self, type_name: &str, channel: &str) -> Option<&ChannelConfig> {
+        self.config
+            .channels
+            .iter()
+            .find(|entry| entry.channel_type == type_name && entry.channel == channel)
+    }
+
+    /// The effective `{extra_args}` for a channel without routes (SPEC §3.3).
+    fn channel_extra_args(&self, type_name: &str, channel: &str) -> String {
+        self.channel(type_name, channel)
+            .map(|entry| entry.extra_args.clone())
+            .unwrap_or_default()
+    }
+
+    /// The resolved routes of `(type_name, channel)`, or `None` when the
+    /// channel has none and the legacy selection applies (SPEC §6.4).
+    ///
+    /// A route's effective channel and extra args fall back to the channel's
+    /// own when the route does not override them.
+    fn route_targets(&self, type_name: &str, channel: &str) -> Option<Vec<RouteTarget>> {
+        let entry = self.channel(type_name, channel)?;
+        if entry.routes.is_empty() {
+            return None;
+        }
+        Some(
+            entry
+                .routes
+                .iter()
+                .map(|route| RouteTarget {
+                    tuner: route.tuner.clone(),
+                    channel: route
+                        .channel
+                        .clone()
+                        .unwrap_or_else(|| entry.channel.clone()),
+                    extra_args: route
+                        .extra_args
+                        .clone()
+                        .unwrap_or_else(|| entry.extra_args.clone()),
+                })
+                .collect(),
+        )
+    }
+
     /// Bytes a subscriber reserves for its bounded queue: the packet-aligned
     /// chunk size times `subscriber_buffer_chunks`.
     fn subscriber_buffer_bytes(&self) -> usize {
@@ -1157,14 +1219,36 @@ impl SessionManager {
             self.validate_pin(name, type_name)?;
         }
 
+        // A pinned request ignores the channel's routes entirely (SPEC §6.4):
+        // it names exactly one tuner and never falls back. Otherwise, a channel
+        // with routes is handled by the route walker, which only ever considers
+        // the listed tuners.
+        if pin.is_none() {
+            if let Some(routes) = inner.route_targets(type_name, channel) {
+                return self
+                    .acquire_routed(
+                        type_name,
+                        routes,
+                        user,
+                        tap,
+                        bypass_pipeline,
+                        scan,
+                        wait_deadline(),
+                    )
+                    .await;
+            }
+        }
+
+        // The effective `{extra_args}` of a channel without routes (SPEC §3.3).
+        let extra_args = inner.channel_extra_args(type_name, channel);
+
         // Tuners whose spawn failed during this request. Kept per request so a
         // broken tuner cannot loop the pool (SPEC §6.2 fall-through is ON), but
         // a later request may try it again.
         let mut failed: HashSet<String> = HashSet::new();
         // Waiting is only for concurrent spawns; bound the whole wait so a
         // wedged spawn cannot hold a request open indefinitely.
-        let wait_deadline =
-            tokio::time::Instant::now() + READINESS_TIMEOUT + Duration::from_secs(5);
+        let wait_deadline = wait_deadline();
 
         loop {
             if inner.shutting_down.load(Ordering::SeqCst) {
@@ -1180,6 +1264,8 @@ impl SessionManager {
                     channel,
                     &user,
                     pin.as_deref(),
+                    None,
+                    &extra_args,
                     &failed,
                     bypass_pipeline,
                     scan,
@@ -1221,7 +1307,7 @@ impl SessionManager {
                     // reservation behind: the task either cleans up after
                     // itself or releases the freshly promoted session. See
                     // [`spawn_detached`].
-                    let notify = spawn_detached(&inner, session, victim, user.clone(), tap);
+                    let notify = spawn_detached(&inner, session, victim, user.clone(), tap, false);
                     match notify.await {
                         Ok(Ok(subscription)) => return Ok(subscription),
                         Ok(Err(SpawnFailure::ShuttingDown)) => {
@@ -1255,6 +1341,147 @@ impl SessionManager {
         }
     }
 
+    /// Acquires a session for a routed channel (SPEC §6.4).
+    ///
+    /// Routes are tried strictly in order, and only the named tuner of a route
+    /// is considered. For each route the steps match mirakc-BS4K: reuse/join the
+    /// existing session for the route's effective channel, use the tuner when it
+    /// is free, or grab it from lower-priority users. The next route is tried
+    /// when the tuner cannot be used at all, or when its command fails to start
+    /// — a spawn error or a process that exits before its first data within the
+    /// startup probe window. A probe timeout with the process still alive is
+    /// **not** a failure (SPEC §6.4): the tuner is treated as started, so no
+    /// fallback happens. Pinning never reaches this function.
+    #[allow(clippy::too_many_arguments)]
+    async fn acquire_routed(
+        &self,
+        type_name: &str,
+        routes: Vec<RouteTarget>,
+        user: TunerUser,
+        tap: SessionTap,
+        bypass_pipeline: bool,
+        scan: bool,
+        wait_deadline: tokio::time::Instant,
+    ) -> Result<Subscription, AcquireError> {
+        let inner = Arc::clone(&self.inner);
+        let mut failed: HashSet<String> = HashSet::new();
+        let mut start_failure = false;
+
+        'routes: for route in &routes {
+            // A disabled tuner, or one that does not support the channel type,
+            // is skipped like mirakc-BS4K does. Startup validation only
+            // guarantees that the route names an existing tuner.
+            match inner.tuner(&route.tuner) {
+                Some(tuner) if inner.supports(tuner, type_name) => {}
+                _ => {
+                    tracing::warn!(
+                        tuner = %route.tuner,
+                        type_name,
+                        channel = %route.channel,
+                        "route tuner is disabled or does not support the channel type; skipping"
+                    );
+                    continue 'routes;
+                }
+            }
+
+            loop {
+                if inner.shutting_down.load(Ordering::SeqCst) {
+                    return Err(AcquireError::ShuttingDown);
+                }
+                let selection = {
+                    let mut state = lock(&inner.state);
+                    select(
+                        &inner,
+                        &mut state,
+                        type_name,
+                        &route.channel,
+                        &user,
+                        None,
+                        Some(&route.tuner),
+                        &route.extra_args,
+                        &failed,
+                        bypass_pipeline,
+                        scan,
+                    )
+                };
+                match selection {
+                    Selection::Join(session) => {
+                        match join(&inner, &session, &user, tap) {
+                            Ok(subscription) => return Ok(subscription),
+                            Err(AttachError::Rejected(error)) => return Err(error),
+                            Err(AttachError::Gone) => {}
+                        }
+                        if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
+                            .await
+                        {
+                            return Err(AcquireError::Unavailable);
+                        }
+                    }
+                    Selection::Wait(session) => {
+                        if !wait_before_retry(&session, wait_deadline, type_name, &route.channel)
+                            .await
+                        {
+                            return Err(AcquireError::Unavailable);
+                        }
+                        // The effective channel's stream died before data: this
+                        // route cannot start, so move on to the next one.
+                        if session.phase() == SessionPhase::Failed
+                            && !session.clean_eof.load(Ordering::SeqCst)
+                        {
+                            failed.insert(session.key.tuner.clone());
+                            start_failure = true;
+                            continue 'routes;
+                        }
+                    }
+                    Selection::Spawn { session, victim } => {
+                        // Routed channels use the startup probe (SPEC §6.4): a
+                        // process that exits before its first data within the
+                        // probe window is a start failure and the next route is
+                        // tried; a probe timeout counts as started.
+                        let notify =
+                            spawn_detached(&inner, session, victim, user.clone(), tap, true);
+                        match notify.await {
+                            Ok(Ok(subscription)) => return Ok(subscription),
+                            Ok(Err(SpawnFailure::ShuttingDown)) => {
+                                return Err(AcquireError::ShuttingDown)
+                            }
+                            Ok(Err(SpawnFailure::Aborted(_))) => {
+                                // The takeover was abandoned, but the next route
+                                // may still satisfy the request.
+                                continue 'routes;
+                            }
+                            Ok(Err(SpawnFailure::Failed { tuner })) => {
+                                tracing::warn!(
+                                    tuner = %tuner,
+                                    channel = %route.channel,
+                                    "route tuner failed to start; trying the next route"
+                                );
+                                failed.insert(tuner);
+                                start_failure = true;
+                                continue 'routes;
+                            }
+                            Err(_) => return Err(AcquireError::Unavailable),
+                        }
+                    }
+                    // Busy or otherwise unusable: the next route may work
+                    // (mirakc-BS4K treats this the same as a failed start).
+                    Selection::Fail(_) => continue 'routes,
+                }
+            }
+        }
+
+        tracing::warn!(
+            type_name,
+            routes = routes.len(),
+            start_failure,
+            "no route could satisfy the request"
+        );
+        // Every route was exhausted: the same 503 as mirakc-BS4K's
+        // `TunerUnavailable`, whether the route tuners were busy or failed to
+        // start.
+        Err(AcquireError::Unavailable)
+    }
+
     /// Validates a pinned tuner name (SPEC §6.3).
     ///
     /// A `disabled: true` tuner is reported as unknown: it cannot be selected,
@@ -1272,7 +1499,6 @@ impl SessionManager {
         }
         Ok(())
     }
-
     /// Live session and subscriber counts (SPEC §7).
     ///
     /// `subscribers` counts attached subscribers across every **registered**
@@ -1561,6 +1787,12 @@ fn can_grab(requester: i32, victim_max: i32) -> bool {
 }
 
 /// Picks a tuner and atomically reserves it, or explains why it cannot.
+///
+/// `pin` restricts a pinned request to exactly one tuner (SPEC §6.3); `restrict`
+/// does the same for a routed request, which may only consider the route's
+/// tuner (SPEC §6.4). They are mutually exclusive in practice: a pinned request
+/// ignores routes, so `pin` is `Some` only on the legacy path and `restrict` is
+/// `Some` only on the routed one.
 #[allow(clippy::too_many_arguments)]
 fn select(
     inner: &Arc<Inner>,
@@ -1569,12 +1801,21 @@ fn select(
     channel: &str,
     user: &TunerUser,
     pin: Option<&str>,
+    restrict: Option<&str>,
+    extra_args: &str,
     failed: &HashSet<String>,
     bypass_pipeline: bool,
     scan: bool,
 ) -> Selection {
-    // A pinned tuner must exist and support the type (SPEC §6.3).
-    if let Some(name) = pin {
+    // A pinned tuner must exist and support the type (SPEC §6.3); a route's
+    // tuner must too (SPEC §6.4), though the routed caller already skips
+    // unsupported routes, so the branch below is a safety net.
+    if let Some(name) = restrict {
+        match inner.tuner(name) {
+            Some(tuner) if inner.supports(tuner, type_name) => {}
+            _ => return Selection::Fail(AcquireError::NoTuner),
+        }
+    } else if let Some(name) = pin {
         match inner.tuner(name) {
             None => return Selection::Fail(AcquireError::UnknownTuner(name.to_string())),
             Some(tuner) if !inner.supports(tuner, type_name) => {
@@ -1598,9 +1839,14 @@ fn select(
         // silently ignore the pin, and starting a second session for the same
         // (type, channel) is forbidden by SPEC §6.2, so the request fails
         // instead of falling back. Checked before the phase so a pinned request
-        // does not wait for a spawn it can never join.
-        if pin.is_some_and(|name| name != existing.key.tuner) {
-            return Selection::Fail(AcquireError::Busy);
+        // does not wait for a spawn it can never join. A routed request joins
+        // the session for its effective channel whatever tuner it runs on: the
+        // session identity is the effective (type, channel), so there is never
+        // more than one (SPEC §6.4).
+        if let Some(name) = pin {
+            if name != existing.key.tuner {
+                return Selection::Fail(AcquireError::Busy);
+            }
         }
         // The decode mode is a session property. Joining would deliver the
         // wrong bytes and taking over would make alternating clients fight
@@ -1631,9 +1877,14 @@ fn select(
     }
 
     let supports_type = |tuner: &TunerConfig| inner.supports(tuner, type_name);
-    let matches_pin = |tuner: &TunerConfig| match pin {
-        Some(name) => tuner.name == name,
-        None => true,
+    let allowed = |tuner: &TunerConfig| {
+        if let Some(name) = restrict {
+            return tuner.name == name;
+        }
+        match pin {
+            Some(name) => tuner.name == name,
+            None => true,
+        }
     };
 
     // 2. A completely free, type-compatible tuner.
@@ -1641,7 +1892,7 @@ fn select(
         .config
         .tuners
         .iter()
-        .filter(|tuner| supports_type(tuner) && matches_pin(tuner))
+        .filter(|tuner| supports_type(tuner) && allowed(tuner))
         .filter(|tuner| !failed.contains(&tuner.name))
         .find(|tuner| !inner.tuner_occupied(state, &tuner.name));
     if let Some(tuner) = free {
@@ -1651,6 +1902,7 @@ fn select(
             &tuner.name,
             type_name,
             channel,
+            extra_args,
             user,
             None,
             bypass_pipeline,
@@ -1667,10 +1919,7 @@ fn select(
         // decode-mode conflict. Never a victim (one process tree per channel).
         .filter(|session| !(session.key.type_name == type_name && session.key.channel == channel))
         .filter(|session| !failed.contains(&session.key.tuner))
-        .filter(|session| match pin {
-            Some(name) => session.key.tuner == name,
-            None => true,
-        })
+        .filter(|session| inner.tuner(&session.key.tuner).is_some_and(&allowed))
         .filter(|session| {
             inner
                 .tuner(&session.key.tuner)
@@ -1699,6 +1948,7 @@ fn select(
             &tuner,
             type_name,
             channel,
+            extra_args,
             user,
             Some(victim),
             bypass_pipeline,
@@ -1713,10 +1963,7 @@ fn select(
         .sessions
         .values()
         .filter(|session| session.phase() == SessionPhase::Stopping)
-        .filter(|session| match pin {
-            Some(name) => session.key.tuner == name,
-            None => true,
-        })
+        .filter(|session| inner.tuner(&session.key.tuner).is_some_and(&allowed))
         .filter(|session| {
             inner
                 .tuner(&session.key.tuner)
@@ -1744,6 +1991,7 @@ fn reserve(
     tuner: &str,
     type_name: &str,
     channel: &str,
+    extra_args: &str,
     user: &TunerUser,
     victim: Option<Arc<Session>>,
     bypass_pipeline: bool,
@@ -1769,7 +2017,7 @@ fn reserve(
         return Selection::Fail(error);
     }
 
-    let session = Arc::new(Session::new(
+    let mut session = Session::new(
         inner.session_id(),
         SessionKey {
             tuner: tuner.to_string(),
@@ -1777,7 +2025,9 @@ fn reserve(
             channel: channel.to_string(),
         },
         PipelineMode::of(bypass_pipeline),
-    ));
+    );
+    session.extra_args = extra_args.to_string();
+    let session = Arc::new(session);
     session
         .replay_byte_cap
         .store(inner.replay_byte_cap(), Ordering::Relaxed);
@@ -2004,6 +2254,7 @@ async fn spawn_and_promote(
     victim: Option<Arc<Session>>,
     user: TunerUser,
     tap: SessionTap,
+    probe: bool,
     mut notify: oneshot::Sender<Result<Subscription, SpawnFailure>>,
 ) {
     let inner = &inner;
@@ -2135,7 +2386,7 @@ async fn spawn_and_promote(
         }
     };
 
-    let ready = match await_readiness(inner, readiness, &mut notify).await {
+    let ready = match await_readiness(inner, readiness, &mut notify, probe).await {
         Readiness::Ready => true,
         Readiness::Ended(reason) => {
             tracing::warn!(session_id = session.id, %label, %reason, "no output before EOF");
@@ -2299,6 +2550,7 @@ fn spawn_detached(
     victim: Option<Arc<Session>>,
     user: TunerUser,
     tap: SessionTap,
+    probe: bool,
 ) -> oneshot::Receiver<Result<Subscription, SpawnFailure>> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(spawn_and_promote(
@@ -2307,6 +2559,7 @@ fn spawn_detached(
         victim,
         user,
         tap,
+        probe,
         tx,
     ));
     rx
@@ -2326,13 +2579,25 @@ enum Readiness {
 /// Waits for the first chunk, aborting promptly when shutdown starts or the
 /// requester disappears, so a slow tuner cannot delay `SessionManager::shutdown`
 /// and a cancelled request releases its reservation at once.
+///
+/// `probe` selects the routed-channel semantics (SPEC §6.4): a timeout with the
+/// process still alive means "started" ([`Readiness::Ready`]) rather than
+/// [`Readiness::TimedOut`], so a tuner with no data yet is not a fallback
+/// trigger. Without it, the legacy readiness gate applies and a timeout is a
+/// start failure.
 async fn await_readiness(
     inner: &Arc<Inner>,
     readiness: oneshot::Receiver<Option<String>>,
     notify: &mut oneshot::Sender<Result<Subscription, SpawnFailure>>,
+    probe: bool,
 ) -> Readiness {
     let mut readiness = readiness;
-    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+    let timeout = if probe {
+        Duration::from_millis(inner.config.server.tuner_startup_probe_ms)
+    } else {
+        READINESS_TIMEOUT
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         tokio::select! {
             result = &mut readiness => match result {
@@ -2346,7 +2611,11 @@ async fn await_readiness(
                     return Readiness::ShuttingDown;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Readiness::TimedOut;
+                    // A routed tuner that is still alive but has not produced
+                    // data within the probe window counts as started (SPEC
+                    // §6.4); the pump keeps running and a late first packet is
+                    // delivered normally.
+                    return if probe { Readiness::Ready } else { Readiness::TimedOut };
                 }
             }
         }
@@ -2390,6 +2659,14 @@ fn release_reservation(inner: &Arc<Inner>, session: &Arc<Session>, victim: Optio
             spawn_idle_timer(Arc::clone(inner), Arc::clone(victim), epoch);
         }
     }
+}
+
+/// The request-wide deadline for waiting on a concurrent spawn.
+///
+/// Bounded so a wedged spawn cannot hold a request open indefinitely; the
+/// timeout is the readiness window plus a margin for the takeover teardown.
+fn wait_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + READINESS_TIMEOUT + Duration::from_secs(5)
 }
 
 /// Waits for a concurrent spawn/takeover to change `session`'s phase.
@@ -2477,7 +2754,8 @@ async fn start_process_tree(
         .tuner(&session.key.tuner)
         .ok_or_else(|| format!("tuner {:?} disappeared from the config", session.key.tuner))?
         .clone();
-    let vars = CommandVars::new(&session.key.channel, &session.key.type_name);
+    let vars = CommandVars::new(&session.key.channel, &session.key.type_name)
+        .with_extra_args(session.extra_args.clone());
     // SPEC §4.1: `decode=0` bypasses every pipeline stage, so only the tuner
     // command runs and its (normalized) output is broadcast directly.
     let bypass_pipeline = session.pipeline_mode == PipelineMode::Raw;
@@ -4996,6 +5274,7 @@ mod tests {
                 "t0",
                 "GR",
                 "28",
+                "",
                 &user("b", 0),
                 Some(Arc::clone(&victim)),
                 false,
@@ -5011,6 +5290,7 @@ mod tests {
             Some(Arc::clone(&selected_victim)),
             user("b", 0),
             SessionTap::Raw,
+            false,
             notify,
         ));
         match result.await {
@@ -5380,6 +5660,286 @@ mod tests {
         assert_eq!(manager.counts().sessions, 1);
 
         drop(first);
+        manager.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // routes (SPEC §6.4)
+    // -----------------------------------------------------------------------
+
+    /// A manager whose `server.yml` sets a short startup probe window, so the
+    /// routed tests do not each pay the default 1 s.
+    fn routed_manager(
+        dir: &TempDir,
+        tuners: &str,
+        channels: &str,
+        probe_ms: u64,
+    ) -> SessionManager {
+        let server = format!(
+            "addr: \":40772\"\nidle_timeout_secs: 5\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 8\ntuner_startup_probe_ms: {probe_ms}\n"
+        );
+        manager_with_server(dir, &server, tuners, channels, &pipelines_passthrough())
+    }
+
+    fn routed_channel(route_lines: &str) -> String {
+        format!("- name: AT-X\n  type: GR\n  channel: \"AT-X\"\n  routes:\n{route_lines}")
+    }
+
+    #[tokio::test]
+    async fn a_route_that_fails_to_spawn_falls_back_to_the_next_route() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "- name: broken\n  types: [GR]\n  command: '/nonexistent/unituner-tuner {{channel}}'\n{}",
+            tuner_yaml("good", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: broken\n    - tuner: good\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        let mut subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("route 2 must satisfy the request");
+        assert_eq!(subscription.tuner, "good");
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_route_that_exits_within_the_probe_falls_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "- name: early\n  types: [GR]\n  command: 'sh -c \"exit 3\"'\n{}",
+            tuner_yaml("good", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: early\n    - tuner: good\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 500);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("an early exit must fall back to route 2");
+        assert_eq!(subscription.tuner, "good");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_route_that_stays_alive_without_output_does_not_fall_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        // `sleep 30` starts, produces nothing, and stays alive: the probe
+        // timeout must count as started, so route 2 is never tried.
+        let tuners = format!(
+            "- name: silent\n  types: [GR]\n  command: 'sh -c \"sleep 30\"'\n{}",
+            tuner_yaml("good", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: silent\n    - tuner: good\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 200);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("a probe timeout counts as started");
+        assert_eq!(subscription.tuner, "silent", "route 2 must not be started");
+        let sessions = manager.sessions_snapshot();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].tuner, "silent");
+
+        drop(subscription);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_routed_channel_never_uses_a_tuner_outside_its_routes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("free-outside", &["GR"], &streaming_command(&path)),
+            tuner_yaml("chosen", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: chosen\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("the route tuner is used");
+        assert_eq!(subscription.tuner, "chosen");
+
+        let snapshot = manager.tuners_snapshot();
+        let outside = snapshot
+            .iter()
+            .find(|tuner| tuner.name == "free-outside")
+            .expect("free-outside");
+        assert!(
+            outside.is_free,
+            "a free tuner outside the routes is ignored"
+        );
+        let chosen = snapshot
+            .iter()
+            .find(|tuner| tuner.name == "chosen")
+            .expect("chosen");
+        assert!(chosen.is_using);
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_per_route_channel_override_reaches_the_tuner_command() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let observed = dir.path().join("observed-channel");
+        let command = format!(
+            "sh -c \"echo {{channel}} >> {}; cat {}; sleep 30\"",
+            observed.display(),
+            path.display()
+        );
+        let tuners = tuner_yaml("t0", &["GR"], &command);
+        let channels = routed_channel("    - tuner: t0\n      channel: \"13\"\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 1000);
+
+        let mut subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        assert_eq!(
+            subscription.channel, "13",
+            "the route override is the identity"
+        );
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        let seen = std::fs::read_to_string(&observed).expect("observed channel");
+        assert_eq!(seen.trim(), "13", "the route channel reached the command");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pinning_ignores_the_channel_routes() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("route-tuner", &["GR"], &streaming_command(&path)),
+            tuner_yaml("pinned", &["GR"], &streaming_command(&path))
+        );
+        // The channel only lists `route-tuner`; the pin must win regardless.
+        let channels = routed_channel("    - tuner: route-tuner\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), Some("pinned".to_string()), true)
+            .await
+            .expect("the pin selects the tuner directly");
+        assert_eq!(subscription.tuner, "pinned");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn route_order_is_honored() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let tuners = format!(
+            "{}{}",
+            tuner_yaml("first", &["GR"], &streaming_command(&path)),
+            tuner_yaml("second", &["GR"], &streaming_command(&path))
+        );
+        let channels = routed_channel("    - tuner: first\n    - tuner: second\n");
+        let manager = routed_manager(&dir, &tuners, &channels, 300);
+
+        let subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        assert_eq!(subscription.tuner, "first", "the first route wins");
+        let snapshot = manager.tuners_snapshot();
+        let second = snapshot
+            .iter()
+            .find(|tuner| tuner.name == "second")
+            .expect("second");
+        assert!(
+            second.is_free,
+            "a later route is not started when the first works"
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn all_routes_failing_is_unavailable() {
+        let dir = TempDir::new().expect("tempdir");
+        let tuners = "- name: broken1\n  types: [GR]\n  command: '/nonexistent/one {channel}'\n- name: broken2\n  types: [GR]\n  command: '/nonexistent/two {channel}'\n";
+        let channels = routed_channel("    - tuner: broken1\n    - tuner: broken2\n");
+        let manager = routed_manager(&dir, tuners, &channels, 300);
+
+        let error = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect_err("every route fails");
+        assert_eq!(error, AcquireError::Unavailable);
+        assert!(manager.sessions_snapshot().is_empty());
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_channels_extra_args_reaches_the_tuner_command() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let observed = dir.path().join("observed-extra");
+        let command = format!(
+            "sh -c \"echo {{extra_args}} >> {}; cat {}; sleep 30\"",
+            observed.display(),
+            path.display()
+        );
+        let tuners = tuner_yaml("t0", &["GR"], &command);
+        let channels = "- name: NHK\n  type: GR\n  channel: \"27\"\n  extra-args: \"--lnb 15\"\n";
+        let manager = routed_manager(&dir, &tuners, channels, 1000);
+
+        let mut subscription = manager
+            .acquire("GR", "27", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        let seen = std::fs::read_to_string(&observed).expect("observed extra args");
+        assert_eq!(seen.trim(), "--lnb 15");
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_route_extra_args_overrides_the_channels_own() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = fixture(&dir, "stream.bin", &[packet(0x11), packet(0x22)]);
+        let observed = dir.path().join("observed-route-extra");
+        let command = format!(
+            "sh -c \"echo {{extra_args}} >> {}; cat {}; sleep 30\"",
+            observed.display(),
+            path.display()
+        );
+        let tuners = tuner_yaml("t0", &["GR"], &command);
+        let channels = "- name: AT-X\n  type: GR\n  channel: \"AT-X\"\n  extra-args: \"--channel-default\"\n  routes:\n    - tuner: t0\n      extra-args: \"--route-override\"\n";
+        let manager = routed_manager(&dir, &tuners, channels, 1000);
+
+        let mut subscription = manager
+            .acquire("GR", "AT-X", user("a", 0), None, true)
+            .await
+            .expect("acquire");
+        let bytes = read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
+        assert_eq!(bytes.len(), 2 * PACKET);
+
+        let seen = std::fs::read_to_string(&observed).expect("observed extra args");
+        assert_eq!(seen.trim(), "--route-override");
+
         manager.shutdown().await;
     }
 }

@@ -693,6 +693,112 @@ async fn head_of_an_unknown_service_is_404() {
 const CHANNELS_WITH_DISABLED: &str = "- name: NHK\n  type: GR\n  channel: \"27\"\n\
      - name: Off\n  type: GR\n  channel: \"99\"\n  disabled: true\n";
 
+// ---------------------------------------------------------------------------
+// routes (SPEC §6.4)
+// ---------------------------------------------------------------------------
+
+/// A `channels.yml` with one routed channel `GR/AT-X` and the given route list.
+fn routed_channels(route_lines: &str) -> String {
+    format!("- name: AT-X\n  type: GR\n  channel: \"AT-X\"\n  routes:\n{route_lines}")
+}
+
+#[tokio::test]
+async fn a_routed_channel_streams_end_to_end_after_falling_back() {
+    // Route 1 cannot spawn, so the request must fall back to route 2 and stream.
+    let ts = [packet_bytes(0x11), packet_bytes(0x22)].concat();
+    let fixture = Fixture::new(
+        &tuners("true"),
+        &routed_channels("    - tuner: broken\n    - tuner: good\n"),
+        PIPELINE_CAT,
+    );
+    let path = fixture.write_ts("stream.ts", &ts);
+    let tuners_yml = format!(
+        "- name: broken\n  types: [GR]\n  command: '/nonexistent/unituner-tuner'\n- name: good\n  types: [GR]\n  command: '{command}'\n",
+        command = streaming_command(&path)
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners_yml).expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let response = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_server_identity(response.headers());
+    assert_eq!(header_str(response.headers(), "content-type"), "video/MP2T");
+    let first = read_first_chunk(response.into_body()).await;
+    assert_eq!(first, ts);
+
+    // The request runs on route 2 only.
+    let tuners_body = send_body(&state, PEER, request(Method::GET, "/api/tuners"))
+        .await
+        .2;
+    let tuners_json = json(&tuners_body);
+    assert_eq!(tuners_json[0]["name"], "broken");
+    assert_eq!(tuners_json[0]["isUsing"], false);
+    assert_eq!(tuners_json[1]["name"], "good");
+    assert_eq!(tuners_json[1]["isUsing"], true);
+}
+
+#[tokio::test]
+async fn a_routed_channel_whose_routes_all_fail_is_503() {
+    let fixture = Fixture::new(
+        "- name: broken1\n  types: [GR]\n  command: '/nonexistent/one'\n\
+         - name: broken2\n  types: [GR]\n  command: '/nonexistent/two'\n",
+        &routed_channels("    - tuner: broken1\n    - tuner: broken2\n"),
+        PIPELINE_CAT,
+    );
+    let state = fixture.state();
+
+    let response = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_server_identity(response.headers());
+    let body = read_all(response.into_body()).await;
+    assert_eq!(json(&body)["code"], 503);
+}
+
+#[tokio::test]
+async fn a_routed_channel_head_is_validation_only() {
+    // Routes that would all fail still answer 200 on HEAD: it never acquires a
+    // session, so nothing is tuned (SPEC §9 HEAD parity).
+    let fixture = Fixture::new(
+        "- name: broken1\n  types: [GR]\n  command: '/nonexistent/one'\n\
+         - name: broken2\n  types: [GR]\n  command: '/nonexistent/two'\n",
+        &routed_channels("    - tuner: broken1\n    - tuner: broken2\n"),
+        PIPELINE_CAT,
+    );
+    let state = fixture.state();
+
+    let response = send(
+        &state,
+        PEER,
+        request(Method::HEAD, "/api/channels/GR/AT-X/stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_server_identity(response.headers());
+    assert_eq!(header_str(response.headers(), "content-type"), "video/MP2T");
+    assert_eq!(
+        header_str(response.headers(), TUNER_USER_ID),
+        PEER.to_string()
+    );
+    assert!(read_all(response.into_body()).await.is_empty());
+
+    let tuners_body = send_body(&state, PEER, request(Method::GET, "/api/tuners"))
+        .await
+        .2;
+    for tuner in json(&tuners_body).as_array().expect("tuners array") {
+        assert_eq!(tuner["isUsing"], false, "HEAD must not tune a device");
+    }
+}
+
 #[tokio::test]
 async fn an_unconfigured_channel_stream_is_404_on_get_and_head() {
     let (fixture, marker) = marker_fixture();
