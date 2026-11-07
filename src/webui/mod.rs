@@ -461,8 +461,39 @@ struct ChannelDoc {
     #[serde(rename = "type", alias = "channel_type")]
     channel_type: String,
     channel: String,
+    /// Extra arguments substituted for `{extra_args}` (SPEC §3.3). The
+    /// canonical `extra-args` spelling and the `extra_args` alias are both
+    /// accepted; an empty value is omitted from the YAML like the scan does.
+    #[serde(
+        default,
+        rename = "extra-args",
+        alias = "extra_args",
+        skip_serializing_if = "String::is_empty"
+    )]
+    extra_args: String,
     #[serde(default)]
     disabled: bool,
+    /// Optional tuner routes (SPEC §3.3, §6.4). Empty is omitted so the UI does
+    /// not add a `routes: []` to a channel that has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    routes: Vec<ChannelRouteDoc>,
+}
+
+/// One entry of a channel's `routes` (SPEC §3.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelRouteDoc {
+    tuner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    /// Route-local `extra-args`; `extra_args` is accepted as an alias.
+    #[serde(
+        default,
+        rename = "extra-args",
+        alias = "extra_args",
+        skip_serializing_if = "Option::is_none"
+    )]
+    extra_args: Option<String>,
 }
 
 /// `pipelines.yml` (SPEC §3.4).

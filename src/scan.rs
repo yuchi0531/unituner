@@ -485,15 +485,51 @@ impl Drop for ScanLease {
 }
 
 /// One generated `channels.yml` entry.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+///
+/// Carries the optional `extra-args` / `routes` fields of SPEC §3.3 so a scan
+/// can read and write a routed configuration without dropping them. `Default`
+/// exists so the scan-internal entry builders can name only the fields they
+/// set.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub channel_type: String,
     pub channel: String,
+    /// `extra-args` (canonical) / `extra_args` (alias). Empty is omitted from
+    /// the written YAML so an appended entry stays clean.
+    #[serde(
+        default,
+        rename = "extra-args",
+        alias = "extra_args",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub extra_args: String,
     #[serde(default)]
     pub disabled: bool,
+    /// Tuner routes (SPEC §3.3, §6.4). Empty is omitted from the written YAML.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<ChannelRouteEntry>,
+}
+
+/// One entry of a channel's `routes` (SPEC §3.3).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelRouteEntry {
+    /// `name` of a tuner in `tuners.yml`.
+    pub tuner: String,
+    /// Channel override for this route only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// Route-local `extra-args`; `extra_args` is accepted as an alias.
+    #[serde(
+        default,
+        rename = "extra-args",
+        alias = "extra_args",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub extra_args: Option<String>,
 }
 
 /// A service found on one scanned channel.
@@ -1318,6 +1354,7 @@ fn entries_for(
             channel_type: query.type_name.clone(),
             channel: channel.to_string(),
             disabled: disabled_of(channel),
+            ..Default::default()
         }],
         ScanMode::Service => services
             .iter()
@@ -1360,6 +1397,7 @@ fn entries_for(
                     channel_type: query.type_name.clone(),
                     disabled: disabled_of(&channel),
                     channel,
+                    ..Default::default()
                 }
             })
             .collect(),
@@ -1403,6 +1441,17 @@ fn merge(
         });
         if occupied {
             continue;
+        }
+        // The scan discovers services, not routes. When a refresh replaces an
+        // entry, keep the hand-written `routes` / `extra-args` of the channel it
+        // replaces instead of inventing (empty) ones.
+        if entry.extra_args.is_empty() && entry.routes.is_empty() {
+            if let Some(previous) = existing.iter().find(|previous| {
+                previous.channel_type == entry.channel_type && previous.channel == entry.channel
+            }) {
+                entry.extra_args = previous.extra_args.clone();
+                entry.routes = previous.routes.clone();
+            }
         }
         if entry.name.is_empty() {
             entry.name = entry.channel.clone();
@@ -1802,9 +1851,17 @@ fn write_channels(
             name: entry.name.clone(),
             channel_type: entry.channel_type.clone(),
             channel: entry.channel.clone(),
-            extra_args: String::new(),
+            extra_args: entry.extra_args.clone(),
             disabled: entry.disabled,
-            routes: Vec::new(),
+            routes: entry
+                .routes
+                .iter()
+                .map(|route| crate::config::ChannelRouteConfig {
+                    tuner: route.tuner.clone(),
+                    channel: route.channel.clone(),
+                    extra_args: route.extra_args.clone(),
+                })
+                .collect(),
         })
         .collect();
     candidate.validate().map_err(|error| match error {
@@ -2116,24 +2173,28 @@ mod tests {
                 channel_type: "BS".to_string(),
                 channel: "BS01_0".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "Old Two".to_string(),
                 channel_type: "BS".to_string(),
                 channel: "BS01_1".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "Gone".to_string(),
                 channel_type: "BS".to_string(),
                 channel: "BS01_2".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "Other".to_string(),
                 channel_type: "BS".to_string(),
                 channel: "BS02_0".to_string(),
                 disabled: false,
+                ..Default::default()
             },
         ];
         let query =
@@ -2145,12 +2206,14 @@ mod tests {
                 channel_type: "BS".to_string(),
                 channel: "BS01_0".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "New Two".to_string(),
                 channel_type: "BS".to_string(),
                 channel: "BS01_1".to_string(),
                 disabled: false,
+                ..Default::default()
             },
         ];
         let rescanned: HashSet<String> = ["BS01_0".to_string(), "BS01_1".to_string()]
@@ -2172,12 +2235,14 @@ mod tests {
                 channel_type: "GR".to_string(),
                 channel: "27".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "BS1".to_string(),
                 channel_type: "BS".to_string(),
                 channel: "BS01_0".to_string(),
                 disabled: true,
+                ..Default::default()
             },
         ];
         let query = ScanQuery::from_params(&params(&[("type", "GR")])).expect("query");
@@ -2187,6 +2252,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "28".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let merged = merge(&existing, &query, &rescanned, &HashSet::new(), found);
         assert_eq!(merged.len(), 3);
@@ -2204,12 +2270,14 @@ mod tests {
                 channel_type: "GR".to_string(),
                 channel: "27".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "Keep".to_string(),
                 channel_type: "GR".to_string(),
                 channel: "99".to_string(),
                 disabled: false,
+                ..Default::default()
             },
         ];
         let query =
@@ -2220,6 +2288,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "27".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let merged = merge(&existing, &query, &rescanned, &HashSet::new(), found);
         assert_eq!(merged.len(), 2);
@@ -2235,6 +2304,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "27".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let query =
             ScanQuery::from_params(&params(&[("type", "GR"), ("refresh", "true")])).expect("query");
@@ -2256,6 +2326,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "27".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let query = ScanQuery::from_params(&params(&[("type", "GR")])).expect("query");
         let found = vec![
@@ -2264,12 +2335,14 @@ mod tests {
                 channel_type: "GR".to_string(),
                 channel: "28".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "Same".to_string(),
                 channel_type: "GR".to_string(),
                 channel: "29".to_string(),
                 disabled: false,
+                ..Default::default()
             },
             // An empty SDT name is the only case that falls back to the channel.
             ChannelEntry {
@@ -2277,6 +2350,7 @@ mod tests {
                 channel_type: "GR".to_string(),
                 channel: "30".to_string(),
                 disabled: false,
+                ..Default::default()
             },
         ];
         let merged = merge(&existing, &query, &HashSet::new(), &HashSet::new(), found);
@@ -2346,6 +2420,7 @@ mod tests {
             channel_type: "BS".to_string(),
             channel: channel.to_string(),
             disabled: false,
+            ..Default::default()
         };
         let service = |sid: u16| FoundService {
             service_id: sid,
@@ -2446,6 +2521,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "28".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let (written, did_write) = write_channels(
             &config,
@@ -2500,6 +2576,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "24".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let (entries, written) = write_channels(
             &config,
@@ -2560,6 +2637,7 @@ mod tests {
             channel_type: "GR".to_string(),
             channel: "25".to_string(),
             disabled: false,
+            ..Default::default()
         }];
         let (entries, written) = write_channels(
             &config,
