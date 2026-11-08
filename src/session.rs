@@ -208,8 +208,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
 use crate::config::{ChannelConfig, Config, TunerConfig};
 use crate::pipeline::{
-    spawn_pipeline, spawn_tuner_command, CommandVars, PipelineCtx, PipelineHandle, PipelineSpec,
-    TunerProcess,
+    spawn_pipeline, spawn_tuner_command, ChildEnv, CommandVars, PipelineCtx, PipelineHandle,
+    PipelineSpec, TunerProcess,
 };
 use crate::services::ServiceTable;
 use crate::tsframe::{TsNormalizer, TS_PACKET_SIZE};
@@ -3110,7 +3110,8 @@ async fn start_process_tree(
         .ok_or_else(|| format!("tuner {:?} disappeared from the config", session.key.tuner))?
         .clone();
     let vars = CommandVars::new(&session.key.channel, &session.key.type_name)
-        .with_extra_args(session.extra_args.clone());
+        .with_extra_args(session.extra_args.clone())
+        .with_child_env(ChildEnv::from_server(&inner.config.server));
     // SPEC §4.1: `decode=0` bypasses every pipeline stage, so only the tuner
     // command runs and its (normalized) output is broadcast directly.
     let bypass_pipeline = session.pipeline_mode == PipelineMode::Raw;

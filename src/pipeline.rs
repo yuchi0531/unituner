@@ -43,7 +43,9 @@
 //! escapes the next character. There is no variable expansion, command
 //! substitution, globbing or redirection.
 
+use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -51,7 +53,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use crate::config::{validate_channel_value, validate_type_name, Config};
+use crate::config::{
+    validate_channel_value, validate_type_name, Config, ServerConfig, DEFAULT_CHILD_CWD,
+    DEFAULT_CHILD_HOME, DEFAULT_CHILD_PATH, DEFAULT_CHILD_TMPDIR,
+};
 
 /// Grace between `SIGTERM` and `SIGKILL` (SPEC §6.2).
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
@@ -132,6 +137,80 @@ impl PipelineSpec {
     }
 }
 
+/// The explicit environment and working directory of every child process
+/// (SPEC §3.5).
+///
+/// Children never inherit the server's environment: [`apply`](Self::apply)
+/// clears it first, then sets `PATH`, `HOME` and `TMPDIR`, merges
+/// [`extra`](Self::extra) (which therefore wins over the three base variables),
+/// and applies [`cwd`](Self::cwd) when it exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildEnv {
+    /// `PATH` handed to the child.
+    pub path: String,
+    /// `HOME` handed to the child.
+    pub home: String,
+    /// `TMPDIR` handed to the child.
+    pub tmpdir: String,
+    /// Working directory; `None` inherits the server's working directory.
+    pub cwd: Option<String>,
+    /// Extra variables, merged after the three base ones.
+    pub extra: HashMap<String, String>,
+}
+
+impl Default for ChildEnv {
+    fn default() -> Self {
+        Self {
+            path: DEFAULT_CHILD_PATH.to_string(),
+            home: DEFAULT_CHILD_HOME.to_string(),
+            tmpdir: DEFAULT_CHILD_TMPDIR.to_string(),
+            cwd: (!DEFAULT_CHILD_CWD.is_empty()).then(|| DEFAULT_CHILD_CWD.to_string()),
+            extra: HashMap::new(),
+        }
+    }
+}
+
+impl ChildEnv {
+    /// Builds the child environment from `server.yml` (SPEC §3.1, §3.5).
+    pub fn from_server(server: &ServerConfig) -> Self {
+        Self {
+            path: server.child_path.clone(),
+            home: server.child_home.clone(),
+            tmpdir: server.child_tmpdir.clone(),
+            cwd: (!server.child_cwd.is_empty()).then(|| server.child_cwd.clone()),
+            extra: server.child_env.clone(),
+        }
+    }
+
+    /// Applies the explicit environment and `current_dir` to `command`.
+    ///
+    /// A configured working directory that does not exist is omitted with a
+    /// warning per spawned process (the startup pass already warned once), so
+    /// the child still starts instead of failing with `ENOENT`.
+    fn apply(&self, command: &mut Command, label: &str, stage: usize) {
+        command.env_clear();
+        command.env("PATH", &self.path);
+        command.env("HOME", &self.home);
+        command.env("TMPDIR", &self.tmpdir);
+        // Applied last, so a user entry overrides one of the base three.
+        for (key, value) in &self.extra {
+            command.env(key, value);
+        }
+        if let Some(cwd) = &self.cwd {
+            if Path::new(cwd).is_dir() {
+                command.current_dir(cwd);
+            } else {
+                tracing::warn!(
+                    session = label,
+                    stage,
+                    child_cwd = %cwd,
+                    "child_cwd does not exist; spawning without current_dir"
+                );
+            }
+        }
+    }
+}
+
 /// The `{channel}`, `{type}` and `{extra_args}` values used for placeholder
 /// substitution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,21 +224,31 @@ pub struct CommandVars {
     /// the channel or a route defines `extra-args`; an empty value substitutes
     /// to nothing (see the module documentation).
     pub extra_args: String,
+    /// Explicit environment/working directory for every spawned child.
+    pub child_env: ChildEnv,
 }
 
 impl CommandVars {
-    /// Builds the substitution variables for one session, with no extra args.
+    /// Builds the substitution variables for one session, with no extra args
+    /// and the default child environment.
     pub fn new(channel: impl Into<String>, type_name: impl Into<String>) -> Self {
         Self {
             channel: channel.into(),
             type_name: type_name.into(),
             extra_args: String::new(),
+            child_env: ChildEnv::default(),
         }
     }
 
     /// Sets the `{extra_args}` value.
     pub fn with_extra_args(mut self, extra_args: impl Into<String>) -> Self {
         self.extra_args = extra_args.into();
+        self
+    }
+
+    /// Sets the explicit child environment.
+    pub fn with_child_env(mut self, child_env: ChildEnv) -> Self {
+        self.child_env = child_env;
         self
     }
 }
@@ -595,7 +684,7 @@ pub async fn spawn_tuner_command(
         argv,
         stdin_piped: false,
     }];
-    let mut inner = spawn_chain(&plan, "tuner").await?;
+    let mut inner = spawn_chain(&plan, "tuner", &vars.child_env).await?;
     // A tuner never receives input.
     inner.stdin = None;
     Ok(TunerProcess { inner })
@@ -645,7 +734,7 @@ pub async fn spawn_pipeline(
         });
     }
 
-    spawn_chain(&plan, &ctx.label).await
+    spawn_chain(&plan, &ctx.label, &ctx.vars.child_env).await
 }
 
 /// Whether `command` is the `passthrough` pseudo-command.
@@ -706,7 +795,11 @@ fn argv_summary(argv: &[String]) -> String {
     truncated
 }
 
-async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, PipelineError> {
+async fn spawn_chain(
+    plan: &[SpawnPlan],
+    label: &str,
+    child_env: &ChildEnv,
+) -> Result<PipelineHandle, PipelineError> {
     let mut children: Vec<Child> = Vec::with_capacity(plan.len());
     let mut pids = Vec::with_capacity(plan.len());
     let mut previous_stdout: Option<ChildStdout> = None;
@@ -719,6 +812,7 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command.kill_on_drop(false);
+        child_env.apply(&mut command, label, stage);
 
         if stage == 0 {
             command.stdin(if stage_plan.stdin_piped {
@@ -762,6 +856,7 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
             Ok(mut child) => {
                 if let Some(pid) = child.id() {
                     pids.push(pid);
+                    log_spawned_stage(stage, pid, label);
                 }
                 let stderr = child.stderr.take();
                 let stdout = child.stdout.take();
@@ -810,6 +905,24 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
         stdin: first_stdin,
         stdout: last_stdout,
     })
+}
+
+/// Logs a spawned stage and, at debug level only, what its fd 0/1 point at.
+///
+/// `/proc/<pid>/fd/{0,1}` is read as a symlink directly (no shell): the target
+/// is a `pipe:[inode]` for a pipe and a path for an inherited file, so this
+/// makes a broken chain visible without spawning anything extra.
+fn log_spawned_stage(stage: usize, pid: u32, label: &str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let fd0 = std::fs::read_link(format!("/proc/{pid}/fd/0"))
+        .map(|target| target.display().to_string())
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    let fd1 = std::fs::read_link(format!("/proc/{pid}/fd/1"))
+        .map(|target| target.display().to_string())
+        .unwrap_or_else(|error| format!("<unavailable: {error}>"));
+    tracing::debug!(session = label, stage, pid, %fd0, %fd1, "spawned stage");
 }
 
 /// Reads a stage's stderr line by line.
@@ -1227,6 +1340,120 @@ mod tests {
 
         pipeline.stop().await;
         assert!(!pipeline.is_alive());
+    }
+
+    #[tokio::test]
+    async fn children_get_the_configured_environment_and_cwd() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir(&cwd).expect("create cwd");
+        let dump = dir.path().join("env.txt");
+        let command = format!(
+            "sh -c 'printf \"PATH=%s\\nHOME=%s\\nTMPDIR=%s\\nPWD=%s\\n\" \
+             \"$PATH\" \"$HOME\" \"$TMPDIR\" \"$PWD\" > {}; cat'",
+            dump.display()
+        );
+
+        // `child_env` is applied after PATH/HOME/TMPDIR, so its HOME wins.
+        let mut vars = CommandVars::new("27", "GR");
+        vars.child_env = ChildEnv {
+            path: "/configured/bin:/usr/bin:/bin".to_string(),
+            home: "/configured/home".to_string(),
+            tmpdir: "/configured/tmp".to_string(),
+            cwd: Some(cwd.display().to_string()),
+            extra: HashMap::from([("HOME".to_string(), "/overridden/home".to_string())]),
+        };
+        let mut pipeline = spawn_pipeline(&[command], &PipelineCtx::new(vars, "env-test"))
+            .await
+            .expect("spawn env probe");
+        let mut stdin = pipeline.take_stdin().expect("stdin");
+        let mut stdout = pipeline.take_stdout().expect("stdout");
+        stdin.write_all(&packet(0x33)).await.expect("write");
+        stdin.shutdown().await.expect("close stdin");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 188];
+            stdout.read_exact(&mut buf).await.expect("read");
+        })
+        .await
+        .expect("stage output");
+
+        let reported = std::fs::read_to_string(&dump).expect("read env dump");
+        // The parent's environment is cleared, so only the configured values
+        // can appear here (the test process may or may not have HOME set).
+        assert!(
+            reported.contains("PATH=/configured/bin:/usr/bin:/bin\n"),
+            "{reported}"
+        );
+        assert!(reported.contains("HOME=/overridden/home\n"), "{reported}");
+        assert!(reported.contains("TMPDIR=/configured/tmp\n"), "{reported}");
+        assert!(
+            reported.contains(&format!("PWD={}\n", cwd.display())),
+            "{reported}"
+        );
+        pipeline.stop().await;
+    }
+
+    #[tokio::test]
+    async fn every_stage_gets_pipes_on_stdin_and_stdout() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Capture the link targets into shell variables *before* redirecting:
+        // `readlink ... > file` would otherwise show the redirection's own file
+        // as fd 1 when the shell execs the last command.
+        let stage = |index: usize| {
+            format!(
+                "sh -c 'fd0=$(readlink /proc/$$/fd/0); fd1=$(readlink /proc/$$/fd/1); \
+                 printf \"%s\" \"$fd0\" > {}/fd0_{index}; \
+                 printf \"%s\" \"$fd1\" > {}/fd1_{index}; cat'",
+                dir.path().display(),
+                dir.path().display()
+            )
+        };
+        let commands = [stage(0), stage(1), stage(2)];
+        let mut pipeline = spawn_pipeline(&commands, &ctx()).await.expect("spawn");
+        let mut stdin = pipeline.take_stdin().expect("stdin");
+        let mut stdout = pipeline.take_stdout().expect("stdout");
+        stdin.write_all(&packet(0x44)).await.expect("write");
+        stdin.shutdown().await.expect("close stdin");
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 188];
+        while received.len() < 188 {
+            let read = tokio::time::timeout(Duration::from_secs(5), stdout.read(&mut buf))
+                .await
+                .expect("read timeout")
+                .expect("read");
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..read]);
+        }
+        assert_eq!(received, packet(0x44));
+
+        let fd = |stage: usize, which: u8| {
+            let path = dir.path().join(format!("fd{which}_{stage}"));
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+                .trim()
+                .to_string()
+        };
+        for stage in 0..3 {
+            assert!(
+                fd(stage, 0).starts_with("pipe:["),
+                "stage {stage} stdin is not a pipe: {}",
+                fd(stage, 0)
+            );
+            assert!(
+                fd(stage, 1).starts_with("pipe:["),
+                "stage {stage} stdout is not a pipe: {}",
+                fd(stage, 1)
+            );
+        }
+        // The chain really hands one pipe from a stage's stdout to the next
+        // stage's stdin.
+        assert_eq!(fd(0, 1), fd(1, 0), "stage 0 stdout -> stage 1 stdin");
+        assert_eq!(fd(1, 1), fd(2, 0), "stage 1 stdout -> stage 2 stdin");
+
+        pipeline.stop().await;
     }
 
     #[tokio::test]
