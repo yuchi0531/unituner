@@ -50,6 +50,8 @@ fn main() -> ExitCode {
         }
     };
 
+    config.warn_if_child_cwd_missing();
+
     tracing::info!(
         tuners = config.tuners.len(),
         channels = config.channels.len(),

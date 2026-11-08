@@ -70,12 +70,38 @@ pub const DEFAULT_TUNER_STARTUP_PROBE_MS: u64 = 1000;
 
 /// Upper bound for `server.tuner_startup_probe_ms` (SPEC §3.1, §6.4).
 ///
-/// The probe is waited once per route, and the request-wide wait deadline is
-/// [`crate::session::READINESS_TIMEOUT`] plus a margin (15 s). A probe above
-/// this bound could outlast the deadline the rest of the request honours, so
-/// it is rejected at startup instead of silently behaving differently. 10 s
-/// equals the legacy readiness gate.
+/// The probe is waited once per route; it is the **route fallback window**, not
+/// the readiness gate. 10 s is a fixed sanity bound so a typo such as
+/// `tuner_startup_probe_ms: 100000` cannot hold a single route for minutes.
 pub const MAX_TUNER_STARTUP_PROBE_MS: u64 = 10_000;
+
+/// Default time [`SessionManager::acquire`] waits for the first pipeline output
+/// before treating a spawn as failed (SPEC §6.2, §8).
+pub const DEFAULT_TUNER_READINESS_TIMEOUT_SECS: u64 = 30;
+
+/// Default per-channel scan budget covering acquire and SI reading (SPEC §8).
+pub const DEFAULT_SCAN_CHANNEL_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound for the two timeout fields above.
+pub const MAX_SCAN_TIMEOUT_SECS: u64 = 600;
+
+/// Default `PATH` handed to every tuner/pipeline child (SPEC §3.1, §3.5).
+///
+/// The child environment is explicit: it never inherits `PATH` from the server
+/// process, where a service-manager environment may list directories the
+/// service user cannot stat (e.g. `/root/.cargo/bin`).
+pub const DEFAULT_CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Default `HOME` handed to every child (SPEC §3.1, §3.5).
+pub const DEFAULT_CHILD_HOME: &str = "/var/lib/unituner";
+
+/// Default `TMPDIR` handed to every child (SPEC §3.1, §3.5).
+pub const DEFAULT_CHILD_TMPDIR: &str = "/tmp";
+
+/// Default working directory for every child (SPEC §3.1, §3.5).
+///
+/// `""` means "inherit the server's working directory".
+pub const DEFAULT_CHILD_CWD: &str = "/var/lib/unituner";
 
 /// `server.yml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +164,43 @@ pub struct ServerConfig {
     /// `routes` keep the existing readiness gate and are unaffected.
     #[serde(default = "default_tuner_startup_probe_ms")]
     pub tuner_startup_probe_ms: u64,
+    /// Time given to a tuner/pipeline to produce its first byte before the
+    /// legacy readiness gate treats the spawn as failed (SPEC §3.1, §8).
+    ///
+    /// This is **not** the routed startup probe (`tuner_startup_probe_ms`):
+    /// that window only decides whether a route falls back, while this gate
+    /// decides whether the request as a whole fails. 30 s tolerates a tuner
+    /// that needs several seconds to lock before its first packet.
+    #[serde(default = "default_tuner_readiness_timeout_secs")]
+    pub tuner_readiness_timeout_secs: u64,
+    /// Per-channel budget for every scan (startup, manual re-scan and the
+    /// discovery API), covering acquire *and* SI reading (SPEC §8).
+    ///
+    /// Must be strictly greater than `tuner_readiness_timeout_secs`; the scan
+    /// also caps its acquire at `readiness + 5 s` so SI still gets the rest of
+    /// the budget.
+    #[serde(default = "default_scan_channel_timeout_secs")]
+    pub scan_channel_timeout_secs: u64,
+    /// `PATH` for every tuner/pipeline child (SPEC §3.5). Never empty.
+    #[serde(default = "default_child_path")]
+    pub child_path: String,
+    /// `HOME` for every tuner/pipeline child (SPEC §3.5). Never empty.
+    #[serde(default = "default_child_home")]
+    pub child_home: String,
+    /// `TMPDIR` for every tuner/pipeline child (SPEC §3.5). Never empty.
+    #[serde(default = "default_child_tmpdir")]
+    pub child_tmpdir: String,
+    /// Working directory for every tuner/pipeline child (SPEC §3.5).
+    ///
+    /// Empty means "inherit the server's working directory". If a non-empty
+    /// value does not exist, startup only warns; each spawn then omits
+    /// `current_dir` so the server still works with a stale default.
+    #[serde(default = "default_child_cwd")]
+    pub child_cwd: String,
+    /// Extra environment variables for every child (SPEC §3.5). Merged after
+    /// `PATH` / `HOME` / `TMPDIR`, so an entry here overrides them.
+    #[serde(default)]
+    pub child_env: HashMap<String, String>,
 }
 
 impl Default for ServerConfig {
@@ -154,7 +217,26 @@ impl Default for ServerConfig {
             max_sessions: default_max_sessions(),
             max_subscriber_buffer_bytes: default_max_subscriber_buffer_bytes(),
             tuner_startup_probe_ms: default_tuner_startup_probe_ms(),
+            tuner_readiness_timeout_secs: default_tuner_readiness_timeout_secs(),
+            scan_channel_timeout_secs: default_scan_channel_timeout_secs(),
+            child_path: default_child_path(),
+            child_home: default_child_home(),
+            child_tmpdir: default_child_tmpdir(),
+            child_cwd: default_child_cwd(),
+            child_env: HashMap::new(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// The configured readiness gate (SPEC §6.2, §8).
+    pub fn tuner_readiness_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.tuner_readiness_timeout_secs)
+    }
+
+    /// The configured per-channel scan budget (SPEC §8).
+    pub fn scan_channel_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.scan_channel_timeout_secs)
     }
 }
 
@@ -199,6 +281,30 @@ fn default_max_subscriber_buffer_bytes() -> usize {
 
 fn default_tuner_startup_probe_ms() -> u64 {
     DEFAULT_TUNER_STARTUP_PROBE_MS
+}
+
+fn default_tuner_readiness_timeout_secs() -> u64 {
+    DEFAULT_TUNER_READINESS_TIMEOUT_SECS
+}
+
+fn default_scan_channel_timeout_secs() -> u64 {
+    DEFAULT_SCAN_CHANNEL_TIMEOUT_SECS
+}
+
+fn default_child_path() -> String {
+    DEFAULT_CHILD_PATH.to_string()
+}
+
+fn default_child_home() -> String {
+    DEFAULT_CHILD_HOME.to_string()
+}
+
+fn default_child_tmpdir() -> String {
+    DEFAULT_CHILD_TMPDIR.to_string()
+}
+
+fn default_child_cwd() -> String {
+    DEFAULT_CHILD_CWD.to_string()
 }
 
 /// One entry of `tuners.yml`.
@@ -369,6 +475,23 @@ impl Config {
             Err(ConfigError::Invalid(issues))
         }
     }
+
+    /// Warns once at startup when `server.child_cwd` is non-empty but does not
+    /// exist.
+    ///
+    /// A missing working directory is **not** a startup error: the default
+    /// `/var/lib/unituner` may legitimately not exist yet, and each spawn then
+    /// omits `current_dir` so existing deployments keep working. The spawn-time
+    /// warning explains the per-process omission.
+    pub fn warn_if_child_cwd_missing(&self) {
+        let cwd = self.server.child_cwd.as_str();
+        if !cwd.is_empty() && !Path::new(cwd).is_dir() {
+            tracing::warn!(
+                child_cwd = %cwd,
+                "server.child_cwd does not exist; child processes will inherit the server's working directory"
+            );
+        }
+    }
 }
 
 /// Collects every validation issue in `config`.
@@ -446,6 +569,84 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             format!("must be at most {MAX_TUNER_STARTUP_PROBE_MS} ms"),
         ));
     }
+    for (field, value) in [
+        (
+            "tuner_readiness_timeout_secs",
+            server.tuner_readiness_timeout_secs,
+        ),
+        (
+            "scan_channel_timeout_secs",
+            server.scan_channel_timeout_secs,
+        ),
+    ] {
+        if value == 0 {
+            issues.push(Issue::new("server.yml", field, "must be greater than 0"));
+        } else if value > MAX_SCAN_TIMEOUT_SECS {
+            issues.push(Issue::new(
+                "server.yml",
+                field,
+                format!("must be at most {MAX_SCAN_TIMEOUT_SECS}"),
+            ));
+        }
+    }
+    if server.scan_channel_timeout_secs > 0
+        && server.scan_channel_timeout_secs <= server.tuner_readiness_timeout_secs
+    {
+        issues.push(Issue::new(
+            "server.yml",
+            "scan_channel_timeout_secs",
+            format!(
+                "must be strictly greater than tuner_readiness_timeout_secs ({} <= {})",
+                server.scan_channel_timeout_secs, server.tuner_readiness_timeout_secs
+            ),
+        ));
+    }
+    // `child_cwd` alone may be empty (inherit the server's working directory).
+    for (field, value, allow_empty) in [
+        ("child_path", server.child_path.as_str(), false),
+        ("child_home", server.child_home.as_str(), false),
+        ("child_tmpdir", server.child_tmpdir.as_str(), false),
+        ("child_cwd", server.child_cwd.as_str(), true),
+    ] {
+        if let Err(message) = validate_child_value(value, allow_empty) {
+            issues.push(Issue::new("server.yml", field, message));
+        }
+    }
+    for (name, value) in &server.child_env {
+        if name.is_empty() || name.contains('\0') || name.contains('\n') || name.contains('\r') {
+            issues.push(Issue::new(
+                "server.yml",
+                format!("child_env[{name:?}]"),
+                "environment variable name must be non-empty and contain no NUL or newline",
+            ));
+        }
+        if value.contains('\0') {
+            issues.push(Issue::new(
+                "server.yml",
+                format!("child_env[{name:?}]"),
+                "environment variable value must not contain NUL",
+            ));
+        }
+    }
+}
+
+/// Validates a child-process path-like setting.
+///
+/// `None` for `value` means "this field may be empty"; `Some` requires a
+/// non-empty value. NUL and newlines are never accepted in an environment value
+/// or a path.
+fn validate_child_value(value: &str, allow_empty: bool) -> Result<(), String> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err("must not be empty".to_string())
+        };
+    }
+    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+        return Err("must not contain NUL or newlines".to_string());
+    }
+    Ok(())
 }
 
 /// A `server.yml` `allowed_hosts` entry must be a bare host name or IP literal:
@@ -899,6 +1100,7 @@ pub fn validate_channel_value(value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     const SERVER: &str = r#"
@@ -1750,6 +1952,106 @@ types:
             config.server.tuner_startup_probe_ms,
             DEFAULT_TUNER_STARTUP_PROBE_MS
         );
+    }
+
+    #[test]
+    fn server_defaults_cover_child_env_and_timeouts() {
+        let config = Fixture::new("{}", TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("valid config");
+        assert_eq!(config.server.child_path, DEFAULT_CHILD_PATH);
+        assert_eq!(config.server.child_home, DEFAULT_CHILD_HOME);
+        assert_eq!(config.server.child_tmpdir, DEFAULT_CHILD_TMPDIR);
+        assert_eq!(config.server.child_cwd, DEFAULT_CHILD_CWD);
+        assert!(config.server.child_env.is_empty());
+        assert_eq!(
+            config.server.tuner_readiness_timeout(),
+            Duration::from_secs(DEFAULT_TUNER_READINESS_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            config.server.scan_channel_timeout(),
+            Duration::from_secs(DEFAULT_SCAN_CHANNEL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn child_env_is_parsed_and_an_empty_cwd_is_allowed() {
+        let server =
+            format!("{SERVER}\nchild_cwd: \"\"\nchild_env:\n  PATH: /custom/bin\n  FOO: bar\n");
+        let config = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("valid config");
+        assert!(config.server.child_cwd.is_empty());
+        assert_eq!(config.server.child_env["PATH"], "/custom/bin");
+        assert_eq!(config.server.child_env["FOO"], "bar");
+    }
+
+    #[test]
+    fn an_empty_child_path_home_or_tmpdir_is_rejected() {
+        for field in ["child_path", "child_home", "child_tmpdir"] {
+            let server = format!("{SERVER}\n{field}: \"\"\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, field);
+            assert_issue_contains(&issues, "must not be empty");
+        }
+        // `child_cwd` is the one field allowed to be empty.
+        Fixture::new(
+            &format!("{SERVER}\nchild_cwd: \"\"\n"),
+            TUNERS,
+            CHANNELS,
+            PIPELINES,
+        )
+        .load()
+        .expect("an empty child_cwd inherits the server's working directory");
+    }
+
+    #[test]
+    fn child_paths_with_nul_or_newlines_are_rejected() {
+        for field in ["child_path", "child_home", "child_tmpdir", "child_cwd"] {
+            for raw in ["x\0y", "x\ny", "x\ry"] {
+                let escaped = raw
+                    .replace('\0', "\\0")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                let server = format!("{SERVER}\n{field}: \"{escaped}\"\n");
+                let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+                assert_issue_contains(&issues, field);
+                assert_issue_contains(&issues, "NUL or newlines");
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_defaults_are_30_and_60_and_bounded() {
+        assert_eq!(DEFAULT_TUNER_READINESS_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_SCAN_CHANNEL_TIMEOUT_SECS, 60);
+        for field in ["tuner_readiness_timeout_secs", "scan_channel_timeout_secs"] {
+            let server = format!("{SERVER}\n{field}: 0\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, field);
+            assert_issue_contains(&issues, "must be greater than 0");
+
+            let server = format!("{SERVER}\n{field}: {}\n", MAX_SCAN_TIMEOUT_SECS + 1);
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, field);
+            assert_issue_contains(&issues, "must be at most");
+        }
+    }
+
+    #[test]
+    fn the_scan_budget_must_exceed_the_readiness_gate() {
+        let server =
+            format!("{SERVER}\ntuner_readiness_timeout_secs: 30\nscan_channel_timeout_secs: 30\n");
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "scan_channel_timeout_secs");
+        assert_issue_contains(&issues, "strictly greater");
+        assert_issue_contains(&issues, "30 <= 30");
+
+        let server =
+            format!("{SERVER}\ntuner_readiness_timeout_secs: 30\nscan_channel_timeout_secs: 31\n");
+        Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("one second above the readiness gate is valid");
     }
 
     #[test]
