@@ -17,6 +17,7 @@
 //! | `GET/PUT /webui/api/pipelines` | `pipelines.yml` (SPEC §3.4) |
 //! | `GET /webui/api/server-config` | `server.yml`, read-only (SPEC §3.1) |
 //! | `POST /webui/api/restart` | re-validate, stop sessions, self-reexec |
+//! | `POST /webui/api/services/scan` | manual service re-scan (`text/plain`, SPEC §8.2) |
 //!
 //! The JSON CRUD API stays under `/webui/api/*`; only the HTML entry point is at
 //! `/`. `/api/*` is untouched: [`app`] merges the existing API router with this
@@ -96,11 +97,12 @@ pub(crate) mod store;
 pub use store::lock_async as store_lock_async;
 
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -108,6 +110,9 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 use crate::api::{with_common_layers, AppState};
 use crate::config::{host_is_allowed, ChannelConfig, Config, ConfigError, ServerConfig};
@@ -194,6 +199,7 @@ pub fn router_with(state: AppState, webui: Webui) -> Router {
             get(get_pipelines).put(put_pipelines),
         )
         .route("/webui/api/server-config", get(server_config))
+        .route("/webui/api/services/scan", post(rescan_services))
         .route("/webui/api/restart", post(restart))
         // Mutating requests are guarded against cross-site use (the UI has no
         // authentication; `allowed_cidrs` and the Host allowlist are the only
@@ -878,6 +884,55 @@ fn channels_on_disk(dir: &Path) -> Option<usize> {
         *guard = Some((path, stamp.0, stamp.1, count));
     }
     Some(count)
+}
+
+// ---------------------------------------------------------------------------
+// Service re-scan (SPEC §8.2)
+// ---------------------------------------------------------------------------
+
+/// `POST /webui/api/services/scan`: one manual service re-scan.
+///
+/// Distinct from `PUT /api/config/channels/scan`, which discovers and rewrites
+/// `channels.yml`. This endpoint never writes the configuration; it re-reads
+/// every enabled channel once, drops records of channels that are no longer
+/// enabled, and rewrites `services.json`. Progress is the same `text/plain`
+/// stream the discovery scan uses, and the shared [`crate::scan::ScanLock`]
+/// makes a concurrent request a 409 `Already Scanning`.
+async fn rescan_services(State(state): State<AppState>) -> Response {
+    let scan_lease = match state.scan_lock.acquire() {
+        Some(lease) => lease,
+        None => return error_response(StatusCode::CONFLICT, "Already Scanning", Vec::new()),
+    };
+
+    let (tx, rx) = mpsc::channel::<String>(64);
+    let manager = state.manager.clone();
+    let config = Arc::clone(&state.config);
+    let config_dir = state.config_dir.clone();
+    let shutdown = state.shutdown_watch();
+    tokio::spawn(async move {
+        tracing::info!("service re-scan started");
+        let result = crate::scan::rescan_services(
+            &manager,
+            &config,
+            &config_dir,
+            tx.clone(),
+            Some(shutdown),
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%error, "service re-scan failed");
+            let _ = tx.send(format!("error: {error}\n")).await;
+        }
+        // Releasing the lease is what makes the next scan possible.
+        drop(scan_lease);
+    });
+
+    let stream = ReceiverStream::new(rx).map(|line| Ok::<Bytes, Infallible>(Bytes::from(line)));
+    let mut response = Response::new(Body::from_stream(stream));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    response
 }
 
 // ---------------------------------------------------------------------------
