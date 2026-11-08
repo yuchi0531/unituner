@@ -139,6 +139,13 @@ function channelLabel(channel) {
   return channel ? `${channel.type}/${channel.channel}` : '—';
 }
 
+/** The physical channel number on its own, as shown in the services table. */
+function physicalChannel(service) {
+  return service.channel && service.channel.channel
+    ? String(service.channel.channel)
+    : '—';
+}
+
 // ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
@@ -275,8 +282,8 @@ async function loadServices() {
       el('td', { text: String(service.serviceId) }),
       el('td', { text: String(service.networkId) }),
       el('td', { text: service.name }),
-      el('td', { text: String(service.type) }),
-      el('td', { text: channelLabel(service.channel) }),
+      el('td', { text: service.channel && service.channel.type ? service.channel.type : '—' }),
+      el('td', { text: physicalChannel(service) }),
     ]),
   );
   $('#services-table tbody').replaceChildren(...rows);

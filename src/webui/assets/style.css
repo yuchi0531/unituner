@@ -799,8 +799,12 @@ footer {
   /* The route editor stacks its three fields instead of crushing them. */
   .route { grid-template-columns: 1fr; }
   .route-actions { justify-content: flex-end; }
-  #services-table th:nth-child(n + 5),
-  #services-table td:nth-child(n + 5) { display: none; }
+  /* Keep ID, Name, Type and the physical channel visible; SID and NID are
+     the least important columns on a phone. */
+  #services-table th:nth-child(2),
+  #services-table th:nth-child(3),
+  #services-table td:nth-child(2),
+  #services-table td:nth-child(3) { display: none; }
   .message { bottom: 16px; }
 }
 

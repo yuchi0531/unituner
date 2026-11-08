@@ -624,6 +624,58 @@ async fn the_index_has_a_rescan_action_and_the_script_streams_it() {
 }
 
 #[tokio::test]
+async fn the_services_table_shows_the_physical_channel() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let (status, _, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Scope the header assertions to the services table: the channels editor
+    // keeps its own <th>Channel</th>.
+    let html = text(&body);
+    let table = html
+        .find("id=\"services-table\"")
+        .map(|start| &html[start..])
+        .expect("services table present");
+    let table = &table[..table.find("</table>").expect("table closes")];
+    assert!(table.contains("<th>Type</th>"), "{table}");
+    assert!(table.contains("<th>Phys CH</th>"), "{table}");
+    assert!(!table.contains("<th>Channel</th>"), "{table}");
+
+    let (status, _, body) = get(&state, "/assets/app.js").await;
+    assert_eq!(status, StatusCode::OK);
+    let script = text(&body);
+    assert!(
+        script.contains("physicalChannel"),
+        "the services table renders a dedicated physical channel"
+    );
+    assert!(
+        script.contains("service.channel.channel"),
+        "the cell reads the channel number, not the combined label"
+    );
+    assert!(
+        script.contains("service.channel.type"),
+        "the Type column shows the channel type"
+    );
+
+    let (status, _, body) = get(&state, "/assets/style.css").await;
+    assert_eq!(status, StatusCode::OK);
+    let css = text(&body);
+    assert!(
+        !css.contains("#services-table th:nth-child(n + 5)"),
+        "the services table no longer hides columns 5+"
+    );
+    assert!(
+        css.contains("#services-table th:nth-child(2)"),
+        "SID is hidden on phones"
+    );
+    assert!(
+        css.contains("#services-table th:nth-child(3)"),
+        "NID is hidden on phones"
+    );
+}
+
+#[tokio::test]
 async fn the_merged_app_keeps_the_mirakurun_api_working() {
     let fixture = Fixture::new();
     let state = fixture.state();
