@@ -118,8 +118,7 @@ impl PipelineSpec {
     ///
     /// A type without a binding (or one whose binding names a missing pipeline,
     /// which startup validation rejects) yields an empty spec, so the tuner
-    /// stream is delivered as-is (SPEC §3.4). The input framing is separate:
-    /// see [`PipelinesConfig::input_for_type`](crate::config::PipelinesConfig::input_for_type).
+    /// stream is delivered as-is (SPEC §3.4).
     pub fn for_type(config: &Config, type_name: &str) -> Self {
         let Some(binding) = config.pipelines.types.get(type_name) else {
             return Self::default();
@@ -1136,14 +1135,12 @@ mod tests {
                         "GR".to_string(),
                         PipelineBinding {
                             pipeline: "soft".to_string(),
-                            input: crate::config::PipelineInput::Ts,
                         },
                     ),
                     (
                         "BS".to_string(),
                         PipelineBinding {
                             pipeline: "missing".to_string(),
-                            input: crate::config::PipelineInput::Ts,
                         },
                     ),
                 ]),

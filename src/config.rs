@@ -15,9 +15,7 @@ use std::sync::OnceLock;
 
 use ipnet::IpNet;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-
-use crate::pipeline::is_passthrough;
+use serde::Deserialize;
 
 /// Default listen address. `:40772` binds every interface, matching the
 /// mirakurun default port (SPEC §3.1 leaves the choice to the implementation).
@@ -377,50 +375,16 @@ pub struct PipelinesConfig {
     pub types: HashMap<String, PipelineBinding>,
 }
 
-/// The kind of bytes a tuner hands to its pipeline (SPEC §3.4, §4).
-///
-/// A TS tuner emits MPEG-TS, which unituner normalizes (204 → 188) before
-/// stage 0. A BS4K tuner emits TLV/MMT instead: byte-for-byte passthrough to
-/// the converter pipeline is required, because the TS normalizer would look for
-/// `0x47` sync bytes inside TLV and destroy the stream.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PipelineInput {
-    /// MPEG-TS output; normalized before the pipeline (the default).
-    #[default]
-    Ts,
-    /// TLV/MMT output; passed raw to the pipeline, which converts it to TS.
-    Tlv,
-}
-
-impl fmt::Display for PipelineInput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ts => f.write_str("ts"),
-            Self::Tlv => f.write_str("tlv"),
-        }
-    }
-}
-
 /// A `pipelines.types` value.
+///
+/// The bound pipeline receives the tuner's bytes as-is and must emit MPEG-TS;
+/// unituner normalizes the pipeline output (204 → 188) before broadcasting
+/// (SPEC §3.4, §4).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineBinding {
     /// The pipeline this type feeds.
     pub pipeline: String,
-    /// What the tuner emits. Defaults to `ts`, the pre-TLV behavior.
-    #[serde(default)]
-    pub input: PipelineInput,
-}
-
-impl PipelinesConfig {
-    /// The input mode bound to `type_name`. Types without a binding are TS
-    /// (SPEC §3.4), so existing deployments keep their behavior.
-    pub fn input_for_type(&self, type_name: &str) -> PipelineInput {
-        self.types
-            .get(type_name)
-            .map_or(PipelineInput::Ts, |binding| binding.input)
-    }
 }
 
 /// The whole configuration.
@@ -1035,38 +999,11 @@ fn validate_pipelines(pipelines: &PipelinesConfig, issues: &mut Vec<Issue>) {
                 message,
             ));
         }
-        let Some(commands) = pipelines.pipelines.get(&binding.pipeline) else {
-            let message = if binding.input == PipelineInput::Tlv {
-                format!(
-                    "input: tlv requires an existing pipeline; {:?} is not defined",
-                    binding.pipeline
-                )
-            } else {
-                format!("references unknown pipeline {:?}", binding.pipeline)
-            };
+        if !pipelines.pipelines.contains_key(&binding.pipeline) {
             issues.push(Issue::new(
                 "pipelines.yml",
                 format!("types.{type_name}.pipeline"),
-                message,
-            ));
-            continue;
-        };
-        // A TLV tuner must be converted to TS by the pipeline. A pipeline with
-        // no real stage (`[]` or only `passthrough`) would hand TLV straight to
-        // the built-in TS path, so reject it at startup instead of failing on
-        // every scan (SPEC §3.4, §4).
-        if binding.input == PipelineInput::Tlv
-            && !commands.iter().any(|command| !is_passthrough(command))
-        {
-            tracing::warn!(
-                type_name,
-                pipeline = %binding.pipeline,
-                "input: tlv type needs a pipeline stage that converts TLV to TS"
-            );
-            issues.push(Issue::new(
-                "pipelines.yml",
-                format!("types.{type_name}.input"),
-                "input: tlv requires a pipeline with at least one non-passthrough command",
+                format!("references unknown pipeline {:?}", binding.pipeline),
             ));
         }
     }
@@ -1482,54 +1419,34 @@ types:
     }
 
     #[test]
-    fn pipeline_input_defaults_to_ts() {
-        let pipelines = r#"
-pipelines:
-  soft:
-    - "softcas-dec"
-types:
-  GR: { pipeline: soft }
-"#;
-        let config = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines)
-            .load()
-            .expect("ts is the default input");
-        assert_eq!(config.pipelines.types["GR"].input, PipelineInput::Ts);
-        assert_eq!(config.pipelines.input_for_type("GR"), PipelineInput::Ts);
-        // A type without a binding is TS too (SPEC §3.4).
-        assert_eq!(config.pipelines.input_for_type("BS4K"), PipelineInput::Ts);
-    }
-
-    #[test]
-    fn pipeline_input_tlv_is_accepted() {
+    fn pipeline_binding_has_only_the_pipeline_field() {
         let pipelines = r#"
 pipelines:
   mmt:
     - "dantto4k"
 types:
-  BS4K: { pipeline: mmt, input: tlv }
+  BS4K: { pipeline: mmt }
 "#;
         let config = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines)
             .load()
-            .expect("tlv binding is valid");
-        assert_eq!(config.pipelines.types["BS4K"].input, PipelineInput::Tlv);
-        assert_eq!(config.pipelines.input_for_type("BS4K"), PipelineInput::Tlv);
+            .expect("a binding needs only the pipeline name");
+        assert_eq!(config.pipelines.types["BS4K"].pipeline, "mmt");
     }
 
     #[test]
-    fn an_unknown_pipeline_input_value_is_rejected() {
-        for value in ["tsv", "TLV", "mpegts", "tlv ", ""] {
+    fn an_input_field_is_rejected_as_unknown() {
+        // The input mode was removed: the pipeline always receives the tuner
+        // bytes raw and unituner only normalizes its TS output (SPEC §3.4).
+        for value in ["ts", "tlv", "mpegts", ""] {
             let pipelines = format!(
                 "pipelines:\n  mmt:\n    - \"dantto4k\"\ntypes:\n  BS4K: {{ pipeline: mmt, input: \"{value}\" }}\n"
             );
             match Fixture::new(SERVER, TUNERS, CHANNELS, &pipelines).load() {
                 Err(ConfigError::Parse { path, source }) => {
                     assert!(path.ends_with("pipelines.yml"));
-                    let message = source.to_string();
                     assert!(
-                        message.contains("unknown variant")
-                            || message.contains("invalid type")
-                            || message.contains("unknown input"),
-                        "unexpected parse error for {value:?}: {message}"
+                        source.to_string().contains("unknown field"),
+                        "unexpected parse error for {value:?}: {source}"
                     );
                 }
                 other => panic!("input {value:?} must be rejected, got {other:?}"),
@@ -1538,8 +1455,8 @@ types:
     }
 
     #[test]
-    fn a_misspelled_pipeline_input_field_is_rejected() {
-        // `deny_unknown_fields` catches the typo instead of silently using ts.
+    fn a_misspelled_pipeline_binding_field_is_rejected() {
+        // `deny_unknown_fields` catches the typo instead of silently ignoring it.
         let pipelines = r#"
 pipelines:
   mmt:
@@ -1557,15 +1474,13 @@ types:
     }
 
     #[test]
-    fn a_tlv_binding_without_a_pipeline_is_rejected() {
-        // `pipeline` is required, so omitting it fails at parse time with a
-        // clear \"missing field\" message.
+    fn a_binding_without_a_pipeline_is_rejected() {
         let pipelines = r#"
 pipelines:
   mmt:
     - "dantto4k"
 types:
-  BS4K: { input: tlv }
+  BS4K: { }
 "#;
         match Fixture::new(SERVER, TUNERS, CHANNELS, pipelines).load() {
             Err(ConfigError::Parse { path, source }) => {
@@ -1576,36 +1491,6 @@ types:
                 );
             }
             other => panic!("expected a parse error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_tlv_binding_to_a_missing_pipeline_is_rejected() {
-        let pipelines = r#"
-pipelines:
-  soft:
-    - "softcas-dec"
-types:
-  BS4K: { pipeline: does-not-exist, input: tlv }
-"#;
-        let issues = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines).issues();
-        assert_issue_contains(&issues, "input: tlv requires an existing pipeline");
-    }
-
-    #[test]
-    fn a_tlv_binding_to_an_empty_pipeline_is_rejected() {
-        // `[]` and an all-passthrough pipeline have no stage that could turn
-        // TLV into TS, so the scan would never see a usable stream.
-        for pipelines in [
-            "pipelines:\n  mmt: []\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n",
-            "pipelines:\n  mmt:\n    - \"passthrough\"\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n",
-        ] {
-            let issues = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines).issues();
-            assert_issue_contains(&issues, "at least one");
-            assert!(
-                issues.iter().any(|issue| issue.contains("input: tlv")),
-                "the TLV-specific reason must be reported: {issues:#?}"
-            );
         }
     }
 
