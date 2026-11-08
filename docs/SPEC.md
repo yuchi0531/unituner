@@ -316,7 +316,7 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 - スキャンは全 channel に対して通常セッションとして扱わず、scan 用セッションで取得する。相手が busy なら skip + 次回 retry。
 - テーブルが ready に至るまでは `/api/services/{id}/stream` が 404 を返してよい（README に記載）。
 - ARIB サービス名/SDT デコード：`siketyan/arib-rs`（MIT、STD-B24 text / STD-B10 TS SI tables）を第一候補とし、実 TS で早期検証する。動かなければ手書き SI パーサにフォールバックする。
-- スキャンのスケジュール（定期 re-scan の要否・間隔）は要定義。
+- スキャンのスケジュール（定期 re-scan）は行わない。結果は `services.json` に永続化し、起動時はキャッシュが有効ならチューナーに触れない。再スキャンは webui の **Re-scan** ボタン（`POST /webui/api/services/scan`）で手動実行する（§8.2）。
 - ARIB テキストのデコードは「0x21..0x7E だけなら ASCII」というショートカットをしない。初期の GL は 2 バイト漢字であり、`25 46 25 6C 45 6C` は `%F%lEl` ではなく「テレ東」になる。現在の designation を知っているのはデコーダだけなので、常に arib デコーダを通す。
 - `SiParser` は PID ごとに最後にパースしたセクションをキャッシュし、同一バイト列の再送では CRC・パース・ARIB デコードを省略する。キャッシュヒットでも PAT の network id スタンプと NIT の副作用（network id / TSID 集合の更新）は再適用する。
 
@@ -371,6 +371,31 @@ Found 1 channels for 13
 **RESTART REQUIRED** to apply changes.
 ```
 
+### 8.2 サービスキャッシュ（`services.json`）
+
+- スキャン結果は `config_dir/services.json` に永続化する。起動時はこのキャッシュを読み、`/api/services` とサービスストリームが直ちに使える状態にする。
+- スキーマ:
+  ```json
+  {"version":1,"fingerprint":"<hex>","generated_at":"2026-11-09T12:34:56.789Z","services":[ ... ]}
+  ```
+  - `version`: 現在 `1`。未知のバージョンは無視してスキャンし、成功後に上書きする。
+  - `fingerprint`: 後述の設定フィンガープリント（FNV-1a 64 の 16 桁 hex）。
+  - `generated_at`: RFC3339 UTC（ミリ秒精度）。
+  - `services`: `ServiceRecord` の配列（`network_id` / `tsid` / `service_id` / `service_type` / `name` / `remote_control_key_id` / `channel` / `pmt_pid` / `has_logo_data`）。順序は `ServiceTable::snapshot()`（network → tsid → service id → channel）で安定。
+- **無期限**: キャッシュは時間で失効しない。フィンガープリントが変わったとき、または手動 Re-scan が成功したときだけ置き換わる。放送再編でサービス名/SID だけが変わった場合は、設定が同じならキャッシュはそのまま使われ、Re-scan が必須。
+- **フィンガープリント**: 有効（`disabled` でない）`channels.yml` エントリだけを対象に、`(type, channel)` でソートした各エントリの `type` / `channel` / `extra-args` / `routes`（route ごとの `tuner`・`channel` 上書き・`extra-args` 上書きを含む）を、長さプレフィックス付きで連結した文字列を FNV-1a 64 でハッシュする。スキーマ定数 `"unituner-services-v1"` も入力に含む。`DefaultHasher` / `RandomState` は Rust バージョン間で安定でないため使わない。`disabled` エントリと `tuners.yml` は含めない（Tuner 定義ではなく放送の性質で決まるため）。チャンネルの追加・削除・disable・`routes` / `extra-args` 変更で自動的に再スキャンされる。
+- **起動時**: `services.json` が読め、`version == 1` かつフィンガープリントが一致すれば、チューナーを一切起動せずにキャッシュを復元して終了する（`startup scan skipped: service cache is valid`）。`services: []` も「その設定にはスキャン対象が無い」という有効な結果として受理する。ファイル欠落・破損・バージョン不一致・フィンガープリント不一致は warn して通常のスキャンにフォールバックし、完了後に上書きする。
+- **書き込み**: `services.json.tmp` → `fsync` → `rename`。Unix では `0600` で作成し、既存ファイルのモードは保持する。部分的 JSON は残らない。書き込み失敗は警告のみで、メモリ上のサービス表は有効なまま。
+- **起動時スキャンの永続化**: 最初のパスで 1 件以上見つかった、または再試行対象が残らない（全チャンネルが成功または無信号）場合にキャッシュを書く。以後の再試行パスは、表が実際に変わったときだけ書き換える。全チャンネルが busy の初回パスでは、空のキャッシュを「有効」として残さないよう書き込まない。キャッシュが書かれた後の再起動では busy チャンネルの再試行は行われない（無期限キャッシュの仕様）。
+- **手動 Re-scan** (`POST /webui/api/services/scan`):
+  - 他の webui mutation と同じ CSRF / Host / JSON Content-Type ガードを通る。
+  - 共有 `scan_lock`（`PUT /api/config/channels/scan` と同一）を取得する。実行中なら **409** `{"code":409,"reason":"Already Scanning"}`。
+  - 有効な `channels.yml` の全エントリを **ちょうど 1 パス** スキャンし、進捗を `text/plain` でストリーミングする（無限 backoff はしない）。
+  - パス完了後に、**有効な**チャンネルに属するレコードだけを残す（削除・disable されたチャンネルのレコードを落とす）。busy / 無信号のチャンネルは有効なままなので、以前のレコードを保持する。スキャンに成功したチャンネルでは、そのチャンネルから消えたサービスも（通常の探索と同じ `retain_channel` で）落とす。
+  - その後 `services.json` を書き、`**RE-SCAN COMPLETE**` と件数を出力する。
+  - `channels.yml` は一切書かない（チャンネル探索 API とは別物）。
+  - クライアントが途中で切断した場合、キャッシュは書かず、チャンネル単位の retain も適用しない（メモリ上の表には途中までの upsert が残りうる）。終了時の retain と保存は行わない。
+
 ## 9. HTTP API（mirakurun 互換サブセット）
 
 | エンドポイント | 仕様 |
@@ -408,11 +433,13 @@ Found 1 channels for 13
   - `GET/PUT /webui/api/{tuners,channels,pipelines}`
   - `GET /webui/api/server-config`（閲覧）
   - `POST /webui/api/restart`
+  - `POST /webui/api/services/scan`（有効チャンネルを 1 パス再スキャンし `services.json` を更新。§8.2）
 - 保存フロー：入力バリデーション（3.6）→ `.bak` 世代管理付きコピー → tmp 書き込み → fsync → 原子的 rename。失敗時は書き戻さない。
   - 同時編集を防ぐ楽観排他（ETag / version）を持つ。1 世代のみの `.bak` は上書きで失われるため、時刻付き世代管理とするか否かは要定義。
 - 反映：「再起動」ボタン → サーバ側で新 config を再検証 → **自己再exec**（`std::env::current_exe()`、systemd 非依存）。再検証失敗なら再起動せずエラー返却（壊れた設定で自己再exec してループしない）。
 - CSRF ガード（変更系 API）は `Origin` と `Host` を比較する。`Host` が無い HTTP/2 では URI の authority を使い、ホスト名の比較は ASCII の大文字小文字を無視する。
 - 再起動はチャンネルスキャン実行中なら **409 `Already Scanning`** を返す（スキャンが `channels.yml` を read-merge-write している最中の `exec` を避ける）。
+- app bar の **Re-scan** ボタンは `POST /webui/api/services/scan` を呼び、進捗ログをモーダルにストリーミング表示する。完了後に Services タブと Status の件数を更新する。実行中の再クリックや他のスキャンは 409 になる。`channels.yml` は変更しない。
 - ステータス表示用の `channels.yml` エントリ数は `(path, mtime, size)` をキーにキャッシュし、ファイルが変わったときだけ再パース・再検証する。
 - `/api/config/{tuners,channels}`（Mirakurun 互換の mutation path）は実装しない。非対応は README 制限欄に明記する。
 
@@ -426,7 +453,7 @@ unituner/
   src/tsframe.rs        # 188/204 packetizer (204→188 正規化は pipeline 入力側)
   src/si.rs             # PAT/PMT/SDT 解析 (arib クレート呼出 or 手書き)
   src/tsfilter.rs       # 内蔵 TSFilter (PAT 書き換え + PID 通過制御)
-  src/services.rs       # in-memory ServiceTable + スキャン更新
+  src/services.rs       # in-memory ServiceTable + services.json 永続化 + fingerprint
   src/session.rs        # Session 管理: 予約/奪取/fanout/アイドル解放/バックプレッシャ
   src/pipeline.rs       # pipeline spawn (stdin→stdout 連結, setsid, SIGTERM→猶予→SIGKILL)
   src/api.rs            # axum routes (mirakurun 互換サブセット)
@@ -464,7 +491,6 @@ unituner/
   - 確定（Phase 1）: `":40772"` = 全インタフェース。`server.yml` の `idle_timeout_secs` / `subscriber_buffer_chunks` / `chunk_size_bytes` の既定はそれぞれ 5 / 1024 / 65536。
 - `X-Mirakurun-Priority` 負値の扱い
 - 奪取リトライキュー（mirakurun の 50 回 × 250ms 相当の bounded wait を入れるか。推奨：入れる）
-- スキャンの定期 re-scan の要否・間隔
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` 同時指定時の優先規則
 - per-IP/per-session cap の既定値
   - 確定: `max_subscribers_per_session: 32` / `max_subscribers_per_ip: 16` / `max_sessions: 16` / `max_subscriber_buffer_bytes: 2147483648`（2 GiB）。超過は 429。2 GiB は 32 購読者分（64 MiB × 32）にあたるため、通常は per-session 上限の方が先に効く。詳細は §7。
@@ -478,10 +504,11 @@ unituner/
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
 - webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
-- スキャン完了までは `/api/services/{id}/stream` が 404 しうる
+- 初回起動など `services.json` が無い/無効なとき、スキャン完了までは `/api/services/{id}/stream` が 404 しうる（有効なキャッシュがあれば起動直後から配信できる）
+- `services.json` は無期限キャッシュである。放送再編（サービス名/SID の変更）は設定フィンガープリントを変えないため、自動検出されず webui の **Re-scan**（`POST /webui/api/services/scan`）が必要
 - `routes` を持つチャンネルは**列挙したチューナーだけ**を使う（type 非依存）。フォールバックは起動失敗のときだけで、起動 probe（既定 1000 ms）のタイムアウトは「起動成功」として扱う（no signal はフォールバックしない）。pinning（`X-Mirakc-Tuner` / `X-Mirakurun-Tuner`）は routes を無視する
 - webui の Channels は `routes` / `extra-args` も編集できる（route の追加・削除・並べ替えを含む）。
-- `PUT /api/config/channels/scan` は curl 等で直接叩く（webui には出さない）。`async` / `GET` ポーリングは非対応。channels.yml 書き換え後は **RESTART REQUIRED**（自動再起動しない）
+- `PUT /api/config/channels/scan` は curl 等で直接叩く（チャンネル探索は webui には出さない。webui の Re-scan はサービス表専用で `channels.yml` を書かない）。`async` / `GET` ポーリングは非対応。channels.yml 書き換え後は **RESTART REQUIRED**（自動再起動しない）
 - 探索 API は既存エントリを維持し、**追加のみ**行う（type 単位の完全置換はしない。`refresh=true` のときのみ既存を置換）
 - スキャンの SDT 完了後の猶予（1.5 秒）は時間の上限であり保証ではない。SDT 完了から 1.5 秒以内に NIT-actual が送出されない多重では、そのチャンネルの network id は SDT の `original_network_id` 由来になる
 - DRCS グリフからデコードしたサービス名は U+FFFD になる（DRCS は Unicode に対応付けがない）

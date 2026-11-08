@@ -30,7 +30,7 @@ sudo ./target/release/unituner --config-dir /etc/unituner
 
 ## 設定
 
-`--config-dir` 直下の 4 ファイルを読む。すべて必須。未知のフィールドは拒否する（`cmd:` のような typo は起動エラー）。検証は起動時 fail-fast で、問題はファイル名と該当項目付きで報告される。
+`--config-dir` 直下の 4 ファイルを読む。すべて必須。未知のフィールドは拒否する（`cmd:` のような typo は起動エラー）。検証は起動時 fail-fast で、問題はファイル名と該当項目付きで報告される。同じディレクトリにスキャン結果の `services.json` が自動生成される（手編集しない。後述の「サービスキャッシュ」を参照）。
 
 ### `server.yml`
 
@@ -154,6 +154,22 @@ types:
 - `{channel}` の値は英数字と `. _ + - : @ ,` のみ、`{type}` は上記正規表現。URL パス由来の値にも同じ検証を適用する。`{extra_args}` は `--lnb 15` のように複数トークンへ展開する前提のため charset ホワイトリスト検証は行わないが、定義値に引用符・バックスラッシュ・改行は含められない。
 - コマンドは argv 分割して**直接 spawn** する。`/bin/sh -c` は使わない。引用符・バックスラッシュは解釈するが、変数展開・glob・リダイレクトは行わない。
 
+### サービスキャッシュ（`services.json`）
+
+スキャン結果は `--config-dir` 直下の `services.json` に保存される。起動時はこれを読み、`/api/services` とサービスストリームをチューナー起動なしで提供する。
+
+```json
+{"version":1,"fingerprint":"0123456789abcdef","generated_at":"2026-11-09T12:34:56.789Z","services":[...]}
+```
+
+- `version` は現在 `1`。未知のバージョン・破損 JSON・欠落は警告して通常スキャンにフォールバックし、成功後に上書きする。起動は失敗しない。
+- `fingerprint` は**有効な** `channels.yml` エントリ（`type` / `channel` / `extra-args` / `routes` と route ごとの上書き）を `(type, channel)` 順に正規化して FNV-1a 64 でハッシュしたもの。`disabled` エントリと `tuners.yml` は含まない。
+- チャンネルの追加・削除・disable、`routes` / `extra-args` の変更はフィンガープリントを変え、次回起動時に自動再スキャンする。放送再編でサービス名/SID だけが変わった場合は自動検出されない。
+- **無期限キャッシュ**。時間では失効しない。フィンガープリント変更か、web UI の **Re-scan** ボタン（`POST /webui/api/services/scan`）でだけ置き換わる。有効なキャッシュがある再起動では、前回 busy だったチャンネルの再試行は行わない。
+- 書き込みは `services.json.tmp` → `fsync` → `rename` で原子的。Unix では `0600` で作成し、既存のモードを保持する。書き込み失敗は警告のみで、メモリ上のサービス表は有効なまま。
+- `services: []` も「スキャン対象が無かった」という有効な結果として扱う。
+- 手動 Re-scan は有効チャンネルを 1 パスだけスキャンし、削除/disable されたチャンネルのレコードを落とす。busy・無信号のチャンネルは以前のレコードを保持する。`channels.yml` は変更しない。
+
 ## パイプライン
 
 `pipelines.<name>` は stdin→stdout で直列につながる外部コマンドの配列。1 段目の stdin にチューナー出力（188/204 を 188 に正規化したもの）が入り、最終段の stdout が broadcast される。パイプライン通過後の TS だけが service 検出・フィルタ・配信に使われる。
@@ -260,7 +276,7 @@ decode モードはセッションの属性であり、同一チャンネルに 
 | タブ | 内容 |
 |---|---|
 | Status | チューナー / セッション / 件数（`/webui/api/status`） |
-| Services | 探索で見つかったサービス一覧（表示のみ） |
+| Services | 探索で見つかったサービス一覧（表示のみ）。app bar の **Re-scan** で再スキャン |
 | Channels | `channels.yml` の追加・編集・削除・保存 |
 | Tuners | `tuners.yml` の追加・編集・削除・保存 |
 | Pipelines | `pipelines.yml` と type バインドの編集・保存 |
@@ -275,6 +291,9 @@ decode モードはセッションの属性であり、同一チャンネルに 
 | GET / PUT | `/webui/api/pipelines` |
 | GET | `/webui/api/server-config`（`Allow: GET, HEAD`） |
 | POST | `/webui/api/restart` |
+| POST | `/webui/api/services/scan`（`text/plain` 進捗ストリーム、409 で `Already Scanning`） |
+
+**Re-scan** ボタンは app bar にあり、`POST /webui/api/services/scan` を `Content-Type: application/json`（body `{}`）で呼ぶ。進捗はモーダルに逐次表示され、完了時に Services タブと Status の件数を更新する。`channels.yml` は書かない。実行中の 2 本目は 409、途中で閉じると `services.json` は更新されない。
 
 保存の挙動:
 
@@ -352,13 +371,14 @@ Found 1 channels for 24
 
 ### 起動時スキャン
 
-リスン開始後、バックグラウンドで有効な `channels.yml` の全エントリを 1 回ずつチューニングし、見つかったサービスをメモリ上のサービス表へ upsert する。
+リスン開始後、有効な `channels.yml` の全エントリを 1 回ずつチューニングし、見つかったサービスをメモリ上のサービス表へ upsert する。ただし `services.json` のスキーマバージョンとフィンガープリントが現在の設定に一致する場合は、**チューナーを起動せず**キャッシュを復元して即座に終了する。
 
 - 優先度 `-1000` で動くため、利用者のセッションを奪取しない。busy なチューナーはスキップする。
 - 有効なチューナーが複数ある type では、その台数を上限に並列でスキャンする（1 台なら従来どおり直列）。busy / 奪取されたチャンネルはそのパスを塞がず、再試行キューに回る。
 - PAT・PMT・SDT-actual・NIT-actual が揃ったチャンネルは、25 秒の予算を待たずに終了する（SPEC §8.1）。
 - busy / チューナー不在だったチャンネルだけを 30 秒 → 60 秒 → 120 秒 → 240 秒 → 300 秒（上限）の backoff で再試行する。無信号は再試行しない。
-- サービス表は削除しないため、失敗したチャンネルは前回の内容を保持する。
+- 最初のパスで 1 件以上見つかった、または再試行対象が残らない場合に `services.json` を書く。以後の再試行パスは表が変わったときだけ更新する。全チャンネル busy の初回パスでは空キャッシュを書かない。
+- サービス表は削除しないため、失敗したチャンネルは前回の内容を保持する（ただし起動時の完了パス後、設定から消えたチャンネルのレコードは落とす）。
 - サーバのシャットダウン時に停止する。
 
 ## 実機での確認
@@ -424,7 +444,8 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 - 複数の `X-Mirakurun-Priority` は集約しない（最後の非空値を使う）。
 - `decode=0` は pipeline **全段**バイパス。mirakurun の「B-25 デコーダのみスキップ」とは異なる。
 - web UI に認証はない。`allowed_cidrs` と `allowed_hosts` のみで、設定編集と再起動ができるため実質的に遠隔操作面になる。信頼できる LAN に置くこと。
-- スキャンが完了するまで `/api/services/{id}/stream` は 404 になりうる（サービス表は起動時スキャンで埋まる）。
+- `services.json` が無い初回起動やキャッシュ無効時、スキャンが完了するまで `/api/services/{id}/stream` は 404 になりうる（有効なキャッシュがあれば起動直後から配信できる）。
+- `services.json` は無期限キャッシュ。放送再編（サービス名/SID の変更）はフィンガープリントを変えないため自動検出されず、web UI の **Re-scan** が必要。busy だったチャンネルは、キャッシュが書かれた後の再起動では再試行されない。
 - スキャンは専用の大型購読バッファを持たず、通常購読者と同じ `subscriber_buffer_chunks` を使う（SPEC §8 の専用バッファ要件は未実装）。
 - スキャンの SDT 完了後の猶予（1.5 秒）は時間の上限であり保証ではない。SDT 完了から 1.5 秒以内に NIT-actual が送出されない多重では、そのチャンネルの network id は SDT の `original_network_id` 由来になる。
 - DRCS グリフからデコードしたサービス名は U+FFFD になる（DRCS は Unicode に対応付けがない）。
