@@ -92,7 +92,9 @@ use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::{validate_channel_value, validate_type_name, ChannelConfig, Config};
+use crate::config::{
+    normalize_host, validate_channel_value, validate_type_name, ChannelConfig, Config,
+};
 use crate::scan::{self, ScanLock, ScanQuery};
 use crate::services::{ServiceRecord, ServiceTable};
 use crate::session::{
@@ -547,7 +549,11 @@ async fn program_not_found() -> Response {
 async fn iptv_playlist(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let api_root = format!("http://{}/api", playlist_authority(&state, &headers));
     let records = state.manager.services().list();
-    playlist_response(Body::from(iptv_playlist_body(&api_root, &records)))
+    playlist_response(Body::from(iptv_playlist_body(
+        &api_root,
+        &records,
+        &state.config,
+    )))
 }
 
 /// `HEAD /api/iptv/playlist`: the GET response headers, without a body.
@@ -567,14 +573,43 @@ fn playlist_response(body: Body) -> Response {
 
 /// The request's authority, or the configured listen address when the client
 /// omitted `Host` (native clients do that; SPEC §3.1).
+///
+/// The raw `Host` is never trusted verbatim: it is normalized with the same
+/// [`normalize_host`] the webui host guard uses, and an invalid value falls
+/// back to the configured listen address.
 fn playlist_authority(state: &AppState, headers: &HeaderMap) -> String {
     headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .map(str::to_owned)
+        .and_then(normalize_authority)
         .unwrap_or_else(|| fallback_authority(&state.config.server.addr))
+}
+
+/// A `Host` header as a URL authority, or `None` when it is not a valid host.
+///
+/// Validates with [`normalize_host`] (same normalization as the webui host
+/// guard), then re-attaches the port and IPv6 brackets `normalize_host`
+/// strips, so `EXAMPLE.LAN:40772` -> `example.lan:40772` and
+/// `[::1]:40772` -> `[::1]:40772`.
+fn normalize_authority(value: &str) -> Option<String> {
+    let host = normalize_host(value)?;
+    let trimmed = value.trim();
+    let port = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.split_once(']')?.1.strip_prefix(':')
+    } else if trimmed.matches(':').count() == 1 {
+        trimmed.split_once(':').map(|(_, port)| port)
+    } else {
+        None
+    };
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(match port {
+        Some(port) => format!("{authority}:{port}"),
+        None => authority,
+    })
 }
 
 /// `server.addr` as `<host>:<port>`, with a wildcard bind pointing at loopback.
@@ -589,21 +624,43 @@ fn fallback_authority(addr: &str) -> String {
     }
 }
 
-fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord]) -> String {
-    let mut services: Vec<&ServiceRecord> = records
+fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord], config: &Config) -> String {
+    // Only tuneable services are listed: service types `0x01`/`0xAD`, bound to
+    // a channel, and that channel is configured and enabled — the same check
+    // `validate_service_stream`/`require_channel` apply to stream URLs, so the
+    // playlist never emits a dead link.
+    let eligible: Vec<&ServiceRecord> = records
         .iter()
-        .filter(|record| matches!(record.service_type, 1 | 173))
+        .filter(|record| {
+            matches!(record.service_type, 1 | 173)
+                && record
+                    .channel
+                    .as_ref()
+                    .is_some_and(|(channel_type, channel)| {
+                        find_channel(config, channel_type, channel)
+                            .is_some_and(|entry| !entry.disabled)
+                    })
+        })
         .collect();
+
+    // Dedup by item id with the same winner as `ServiceTable::get`: the first
+    // record in `order_key` order (network, tsid, service id, then channel
+    // lexical, so BS beats GR). `list()` is already in that order, but pick
+    // the minimum explicitly so the result does not depend on input order.
+    let mut winners: HashMap<crate::services::ServiceItemId, &ServiceRecord> = HashMap::new();
+    for record in eligible {
+        let entry = winners.entry(record.item_id()).or_insert(record);
+        if service_order_key(record) < service_order_key(entry) {
+            *entry = record;
+        }
+    }
+
+    // Only the winners are sorted for display, by the channel-oriented order.
+    let mut services: Vec<&ServiceRecord> = winners.into_values().collect();
     services.sort_by(|left, right| playlist_order(left, right));
 
     let mut body = String::from("#EXTM3U\n");
-    // The same item id can appear on two channels; mirakurun lists one service
-    // entry per id, and so does `/api/services`.
-    let mut seen = HashSet::new();
     for record in services {
-        if !seen.insert(record.item_id()) {
-            continue;
-        }
         let item_id = record.item_id();
         let channel_type = record
             .channel
@@ -618,6 +675,20 @@ fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord]) -> String {
         body.push_str(&format!("{api_root}/services/{item_id}/stream\n"));
     }
     body
+}
+
+/// The dedup key mirrored from `ServiceRecord::order_key` (services.rs):
+/// network, transport stream, service id, then channel (`None` first).
+fn service_order_key(record: &ServiceRecord) -> (u16, u16, u16, Option<(&str, &str)>) {
+    (
+        record.network_id,
+        record.tsid,
+        record.service_id,
+        record
+            .channel
+            .as_ref()
+            .map(|(channel_type, channel)| (channel_type.as_str(), channel.as_str())),
+    )
 }
 
 /// Channel-oriented order: GR, BS, CS, SKY, then any other type alphabetically;
@@ -1271,4 +1342,120 @@ pub fn bind_address(addr: &str) -> Result<SocketAddr, String> {
     candidate
         .parse::<SocketAddr>()
         .map_err(|_| format!("{addr:?} is not a valid socket address"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PipelinesConfig, ServerConfig};
+
+    fn channel(channel_type: &str, channel: &str, disabled: bool) -> ChannelConfig {
+        ChannelConfig {
+            name: format!("{channel_type} {channel}"),
+            channel_type: channel_type.to_string(),
+            channel: channel.to_string(),
+            extra_args: String::new(),
+            disabled,
+            routes: Vec::new(),
+        }
+    }
+
+    fn config(channels: Vec<ChannelConfig>) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            tuners: Vec::new(),
+            channels,
+            pipelines: PipelinesConfig {
+                pipelines: HashMap::new(),
+                types: HashMap::new(),
+            },
+        }
+    }
+
+    fn record(
+        sid: u16,
+        service_type: u8,
+        name: &str,
+        channel: Option<(&str, &str)>,
+    ) -> ServiceRecord {
+        let mut record = ServiceRecord::new(0x1111, 0x2222, sid, service_type, name);
+        record.channel = channel.map(|(t, c)| (t.to_string(), c.to_string()));
+        record
+    }
+
+    #[test]
+    fn playlist_filters_unbound_unconfigured_and_disabled_channels() {
+        let cfg = config(vec![
+            channel("GR", "27", false),
+            channel("BS", "BS01", true),
+        ]);
+        let records = vec![
+            record(1, 1, "Enabled", Some(("GR", "27"))),
+            record(2, 1, "Disabled", Some(("BS", "BS01"))),
+            record(3, 1, "Unconfigured", Some(("GR", "99"))),
+            record(4, 1, "Unbound", None),
+            record(5, 2, "Radio", Some(("GR", "27"))),
+        ];
+        let body = iptv_playlist_body("http://h/api", &records, &cfg);
+        assert!(body.contains("Enabled"), "{body}");
+        for absent in ["Disabled", "Unconfigured", "Unbound", "Radio"] {
+            assert!(!body.contains(absent), "{body}");
+        }
+    }
+
+    #[test]
+    fn playlist_dedup_winner_matches_service_table_get_order() {
+        // Same item id on GR and BS, same nid/tsid/sid: order_key's channel
+        // lexical order puts BS before GR, so BS must win even though
+        // playlist_order would rank GR first.
+        let cfg = config(vec![
+            channel("GR", "27", false),
+            channel("BS", "BS01", false),
+        ]);
+        let records = vec![
+            record(1, 1, "GR copy", Some(("GR", "27"))),
+            record(1, 1, "BS copy", Some(("BS", "BS01"))),
+        ];
+        let body = iptv_playlist_body("http://h/api", &records, &cfg);
+        assert!(body.contains("BS copy"), "{body}");
+        assert!(body.contains("group-title=\"BS\""), "{body}");
+        assert!(!body.contains("GR copy"), "{body}");
+        assert_eq!(body.matches("#EXTINF").count(), 1, "{body}");
+    }
+
+    #[test]
+    fn playlist_winners_are_sorted_by_playlist_order_after_dedup() {
+        let cfg = config(vec![
+            channel("GR", "27", false),
+            channel("BS", "BS01", false),
+        ]);
+        let records = vec![
+            record(2, 1, "BS svc", Some(("BS", "BS01"))),
+            record(1, 1, "GR svc", Some(("GR", "27"))),
+        ];
+        let body = iptv_playlist_body("http://h/api", &records, &cfg);
+        let gr = body.find("GR svc").expect("GR entry");
+        let bs = body.find("BS svc").expect("BS entry");
+        assert!(gr < bs, "{body}");
+    }
+
+    #[test]
+    fn normalize_authority_lowercases_and_keeps_port_and_brackets() {
+        assert_eq!(
+            normalize_authority("EXAMPLE.LAN:40772").as_deref(),
+            Some("example.lan:40772")
+        );
+        assert_eq!(
+            normalize_authority("[::1]:40772").as_deref(),
+            Some("[::1]:40772")
+        );
+        assert_eq!(normalize_authority("::1").as_deref(), Some("[::1]"));
+        assert_eq!(
+            normalize_authority("localhost.").as_deref(),
+            Some("localhost")
+        );
+        for invalid in ["a b", "host/path", "host:bad", "", "http://x"] {
+            assert_eq!(normalize_authority(invalid), None, "{invalid:?}");
+        }
+    }
 }

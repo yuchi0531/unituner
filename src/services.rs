@@ -130,6 +130,16 @@ pub enum SidLookupError {
     /// No service in the table has this service id.
     #[error("service id {0} not found")]
     NotFound(u16),
+    /// No service in the table has this item id.
+    ///
+    /// Used by [`ServiceTable::resolve`] /
+    /// [`ServiceTable::resolve_raw_on_channel`] when the id text is a
+    /// well-formed `u64` item id that matches nothing and is too large to
+    /// be a bare `u16` service id. It is a not-found, not
+    /// [`Malformed`](Self::Malformed): the text parsed fine, the service
+    /// simply is not in the table.
+    #[error("service item id {0} not found")]
+    NotFoundItem(u64),
     /// More than one service carries this service id: another network or
     /// another channel (SPEC §5).
     #[error("service id {0} is ambiguous")]
@@ -304,6 +314,10 @@ impl ServiceTable {
     /// When the incoming record is bound to a channel and only an *unbound*
     /// record for the same item id exists, that record is merged and moved onto
     /// the channel rather than left behind as a second, channel-less copy.
+    /// Symmetrically, when the incoming record is *unbound* and a bound
+    /// record for the same item id already exists, it is merged into the
+    /// first such record (in list order) instead of creating a second,
+    /// channel-less copy that would make bare-sid lookups ambiguous.
     pub fn upsert(&self, record: ServiceRecord) {
         let key = ServiceKey::of(&record);
         let mut records = self.write();
@@ -325,6 +339,24 @@ impl ServiceTable {
                 records.insert(key, stored);
                 return;
             }
+        } else {
+            // Mirror case: the incoming record is unbound but a bound copy
+            // already exists. Merge into the first bound copy in list order
+            // so bound-then-unbound cannot split one service into two
+            // records and make `get_by_sid` report `Ambiguous`.
+            let bound_key = records
+                .iter()
+                .filter(|(bound_key, _)| {
+                    bound_key.item_id == record.item_id() && bound_key.channel_type.is_some()
+                })
+                .min_by(|(_, l), (_, r)| l.order_key().cmp(&r.order_key()))
+                .map(|(bound_key, _)| bound_key.clone());
+            if let Some(bound_key) = bound_key {
+                if let Some(stored) = records.get_mut(&bound_key) {
+                    stored.merge(&record);
+                    return;
+                }
+            }
         }
         records.insert(key, record);
     }
@@ -336,11 +368,28 @@ impl ServiceTable {
         self.write().insert(key, record);
     }
 
+    /// Inserts `record` under its current key, merging into an existing
+    /// record on collision (the same semantics as the colliding branch of
+    /// [`set_channel`](Self::set_channel)).
+    fn insert_merging(records: &mut HashMap<ServiceKey, ServiceRecord>, record: ServiceRecord) {
+        let key = ServiceKey::of(&record);
+        match records.get_mut(&key) {
+            Some(existing) => existing.merge(&record),
+            None => {
+                records.insert(key, record);
+            }
+        }
+    }
+
     /// Applies `f` to the record with `item_id`, under one write lock.
     ///
     /// With several channels carrying the same item id the first record in
     /// stable list order is used; [`modify_all`](Self::modify_all) visits every
     /// one of them. Returns whether a record was found.
+    ///
+    /// If `f` changes a key field (`network_id`, `service_id` or `channel`),
+    /// the record is rekeyed under `ServiceKey::of` of the mutated record
+    /// (merging on collision), so the map key never goes stale.
     pub fn modify<F: FnOnce(&mut ServiceRecord)>(&self, item_id: ServiceItemId, f: F) -> bool {
         let mut records = self.write();
         // First record in list order (order_key, same as get()/list()),
@@ -353,37 +402,48 @@ impl ServiceTable {
         let Some(key) = best_key else {
             return false;
         };
-        match records.get_mut(&key) {
-            Some(record) => {
-                f(record);
-                true
-            }
-            None => false,
-        }
+        let Some(mut record) = records.remove(&key) else {
+            return false;
+        };
+        f(&mut record);
+        Self::insert_merging(&mut records, record);
+        true
     }
 
     /// Applies `f` to every record with `item_id`, under one write lock.
     ///
-    /// Returns whether at least one record was found.
+    /// Returns whether at least one record was found. Like
+    /// [`modify`](Self::modify), records are rekeyed after `f` runs (merging
+    /// on collision) if `f` changed a key field.
     pub fn modify_all<F: FnMut(&mut ServiceRecord)>(
         &self,
         item_id: ServiceItemId,
         mut f: F,
     ) -> bool {
         let mut records = self.write();
-        let mut found = false;
-        for record in records.values_mut() {
-            if record.item_id() == item_id {
-                f(record);
-                found = true;
-            }
+        let mut keys: Vec<ServiceKey> = records
+            .iter()
+            .filter(|(_, record)| record.item_id() == item_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if keys.is_empty() {
+            return false;
         }
-        found
+        keys.sort();
+        for key in keys {
+            let Some(mut record) = records.remove(&key) else {
+                continue;
+            };
+            f(&mut record);
+            Self::insert_merging(&mut records, record);
+        }
+        true
     }
 
     /// Applies `f` to the record with `item_id` on `(channel_type, channel)`.
     ///
-    /// Returns whether the record exists.
+    /// Returns whether the record exists. Like [`modify`](Self::modify), the
+    /// record is rekeyed after `f` runs if `f` changed a key field.
     pub fn modify_on_channel<F: FnOnce(&mut ServiceRecord)>(
         &self,
         item_id: ServiceItemId,
@@ -393,13 +453,12 @@ impl ServiceTable {
     ) -> bool {
         let key = ServiceKey::for_channel(item_id, channel_type, channel);
         let mut records = self.write();
-        match records.get_mut(&key) {
-            Some(record) => {
-                f(record);
-                true
-            }
-            None => false,
-        }
+        let Some(mut record) = records.remove(&key) else {
+            return false;
+        };
+        f(&mut record);
+        Self::insert_merging(&mut records, record);
+        true
     }
 
     /// Sets the remote-control key id of every record with `item_id`.
@@ -427,35 +486,90 @@ impl ServiceTable {
 
     /// Sets the `(type, channel)` binding of a known service.
     ///
-    /// Binding an unbound record moves its storage key; if a record already
-    /// exists for the target channel, the two are merged. Does nothing when the
-    /// item id is unknown; returns whether it was set.
+    /// Only the *unbound* record (if any) is moved onto the target channel:
+    /// binding an unbound record moves its storage key, and if a record
+    /// already exists for the target channel the two are merged. Records
+    /// already bound to *other* channels are left untouched, so calling this
+    /// on a service that is already received on another channel no longer
+    /// destroys that other channel's binding. Use
+    /// [`add_channel_binding`](Self::add_channel_binding) to add a further
+    /// channel binding as a copy.
+    ///
+    /// Does nothing (returns `false`) when the item id is unknown, or when
+    /// there is neither an unbound record nor a record on the target channel
+    /// (i.e. the service is only bound to other channels).
     pub fn set_channel(&self, item_id: ServiceItemId, channel_type: &str, channel: &str) -> bool {
         let mut records = self.write();
         let target = ServiceKey::for_channel(item_id, channel_type, channel);
-        let mut sources: Vec<ServiceKey> = records
-            .keys()
-            .filter(|key| key.item_id == item_id && **key != target)
-            .cloned()
-            .collect();
-        if sources.is_empty() {
-            let Some(record) = records.get_mut(&target) else {
-                return false;
-            };
-            record.channel = Some((channel_type.to_owned(), channel.to_owned()));
-            return true;
-        }
-        sources.sort();
-        for source in sources {
-            let Some(mut record) = records.remove(&source) else {
-                continue;
-            };
+        let unbound = ServiceKey {
+            item_id,
+            channel_type: None,
+            channel: None,
+        };
+        if let Some(mut record) = records.remove(&unbound) {
             record.channel = Some((channel_type.to_owned(), channel.to_owned()));
             match records.get_mut(&target) {
                 Some(existing) => existing.merge(&record),
                 None => {
-                    records.insert(target.clone(), record);
+                    records.insert(target, record);
                 }
+            }
+            return true;
+        }
+        if let Some(record) = records.get_mut(&target) {
+            record.channel = Some((channel_type.to_owned(), channel.to_owned()));
+            return true;
+        }
+        false
+    }
+
+    /// Adds a `(type, channel)` binding *in addition to* any existing ones.
+    ///
+    /// Unlike [`set_channel`](Self::set_channel), which only moves the
+    /// unbound record, this inserts a copy of a known service under the
+    /// target channel and leaves every existing record (unbound or bound to
+    /// other channels) in place. The copy is taken from the unbound record
+    /// when one exists, otherwise from the first record in list order. If a
+    /// record already exists on the target channel, the copy is merged into
+    /// it instead of duplicating it.
+    ///
+    /// Returns whether the item id is known. This is the correct call when a
+    /// service is newly found on a further physical channel; `set_channel`
+    /// is for giving an unbound record its (first) binding.
+    pub fn add_channel_binding(
+        &self,
+        item_id: ServiceItemId,
+        channel_type: &str,
+        channel: &str,
+    ) -> bool {
+        let mut records = self.write();
+        let target = ServiceKey::for_channel(item_id, channel_type, channel);
+        let unbound = ServiceKey {
+            item_id,
+            channel_type: None,
+            channel: None,
+        };
+        let source_key = if records.contains_key(&unbound) {
+            unbound
+        } else {
+            let Some(key) = records
+                .iter()
+                .filter(|(key, _)| key.item_id == item_id)
+                .min_by(|(_, l), (_, r)| l.order_key().cmp(&r.order_key()))
+                .map(|(key, _)| key.clone())
+            else {
+                return false;
+            };
+            key
+        };
+        let Some(mut copy) = records.get(&source_key).cloned() else {
+            return false;
+        };
+        copy.channel = Some((channel_type.to_owned(), channel.to_owned()));
+        match records.get_mut(&target) {
+            Some(existing) => existing.merge(&copy),
+            None => {
+                records.insert(target, copy);
             }
         }
         true
@@ -573,18 +687,38 @@ impl ServiceTable {
     ///
     /// `raw` is the decimal text from the URL. It is first read as a
     /// [`ServiceItemId`]; if no such service exists it is read as a bare
-    /// service id. Text that is not a decimal number, is negative, or exceeds
-    /// both a `u64` and a `u16` yields [`SidLookupError::Malformed`].
+    /// service id. Both lookups happen under a single read guard, so the
+    /// table cannot change between the item-id and bare-sid checks.
+    ///
+    /// Text that is not a decimal number, or is negative, or exceeds `u64`
+    /// yields [`SidLookupError::Malformed`]. Text that parses as a `u64` but
+    /// matches no item id and is too large to be a bare `u16` service id
+    /// yields [`SidLookupError::NotFoundItem`] (a well-formed id that simply
+    /// is not in the table), not `Malformed`.
     pub fn resolve(&self, raw: &str) -> Result<ServiceRecord, SidLookupError> {
         let trimmed = raw.trim();
-        if let Ok(value) = trimmed.parse::<u64>() {
-            if let Some(record) = self.get(ServiceItemId(value)) {
-                return Ok(record);
-            }
+        let Ok(value) = trimmed.parse::<u64>() else {
+            return Err(SidLookupError::Malformed(raw.to_owned()));
+        };
+        let records = self.read();
+        // Exact item-id match, first in list order (same winner as `get`).
+        if let Some(record) = records
+            .values()
+            .filter(|record| record.item_id() == ServiceItemId(value))
+            .min_by(|l, r| l.order_key().cmp(&r.order_key()))
+        {
+            return Ok(record.clone());
         }
-        match trimmed.parse::<u16>() {
-            Ok(sid) => self.get_by_sid(sid),
-            Err(_) => Err(SidLookupError::Malformed(raw.to_owned())),
+        // Bare sid, under the same guard (`get_by_sid` semantics inline).
+        if value > u64::from(u16::MAX) {
+            return Err(SidLookupError::NotFoundItem(value));
+        }
+        let sid = value as u16;
+        let mut matches = records.values().filter(|record| record.service_id == sid);
+        match (matches.next(), matches.next()) {
+            (None, _) => Err(SidLookupError::NotFound(sid)),
+            (Some(record), None) => Ok(record.clone()),
+            (Some(_), Some(_)) => Err(SidLookupError::Ambiguous(sid)),
         }
     }
 
@@ -621,14 +755,32 @@ impl ServiceTable {
         raw: &str,
     ) -> Result<ServiceRecord, SidLookupError> {
         let trimmed = raw.trim();
-        if let Ok(value) = trimmed.parse::<u64>() {
-            if let Some(record) = self.get_on_channel(channel_type, channel, ServiceItemId(value)) {
-                return Ok(record);
-            }
+        let Ok(value) = trimmed.parse::<u64>() else {
+            return Err(SidLookupError::Malformed(raw.to_owned()));
+        };
+        // Item-id and bare-sid lookups under a single read guard (see
+        // `resolve`); a `u64` that matches no item id on this channel and
+        // exceeds `u16::MAX` is `NotFoundItem`, not `Malformed`.
+        let records = self.read();
+        if let Some(record) = records.get(&ServiceKey::for_channel(
+            ServiceItemId(value),
+            channel_type,
+            channel,
+        )) {
+            return Ok(record.clone());
         }
-        match trimmed.parse::<u16>() {
-            Ok(sid) => self.resolve_on_channel(channel_type, channel, sid),
-            Err(_) => Err(SidLookupError::Malformed(raw.to_owned())),
+        if value > u64::from(u16::MAX) {
+            return Err(SidLookupError::NotFoundItem(value));
+        }
+        let sid = value as u16;
+        let mut matches = records
+            .iter()
+            .filter(|(key, record)| key.is_on(channel_type, channel) && record.service_id == sid)
+            .map(|(_, record)| record);
+        match (matches.next(), matches.next()) {
+            (None, _) => Err(SidLookupError::NotFound(sid)),
+            (Some(record), None) => Ok(record.clone()),
+            (Some(_), Some(_)) => Err(SidLookupError::Ambiguous(sid)),
         }
     }
 
@@ -1350,13 +1502,14 @@ mod tests {
         bound.remote_control_key_id = Some(3);
         table.insert(bound);
 
-        // An unbound record for the same service, carrying the PMT PID, is
-        // bound to the channel that already has a record.
+        // An unbound record for the same service, carrying the PMT PID:
+        // `upsert` now merges it into the bound record directly (m10), so
+        // there is no second record left for `set_channel` to move.
         let mut unbound = record(1, 10, 10, "");
         unbound.service_type = 0;
         unbound.pmt_pid = Some(0x1F0);
         table.upsert(unbound);
-        assert_eq!(table.len(), 2);
+        assert_eq!(table.len(), 1);
 
         assert!(table.set_channel(id, "GR", "27"));
         assert_eq!(table.len(), 1);
@@ -1514,18 +1667,72 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reports_an_out_of_range_id_as_malformed() {
+    fn resolve_reports_an_out_of_range_id_as_not_found() {
         // 70_000 parses as a u64 (so it is not a bare u16 sid) but no item id
-        // in the table matches it, and it cannot be a service id.
+        // in the table matches it, and it cannot be a service id. It is a
+        // well-formed id that is simply absent: `NotFoundItem`, not
+        // `Malformed`.
         let table = ServiceTable::new();
         assert_eq!(
             table.resolve("70000"),
-            Err(SidLookupError::Malformed("70000".to_owned()))
+            Err(SidLookupError::NotFoundItem(70_000))
         );
         assert_eq!(
             table.resolve_raw_on_channel("GR", "27", "70000"),
-            Err(SidLookupError::Malformed("70000".to_owned()))
+            Err(SidLookupError::NotFoundItem(70_000))
         );
+    }
+
+    #[test]
+    fn upserting_unbound_after_bound_merges_instead_of_splitting() {
+        let table = ServiceTable::new();
+        let id = ServiceItemId::new(1, 10);
+        table.upsert(on_channel(1, 10, 10, "bound", "GR", "27"));
+        // An unbound update for the same service must merge into the bound
+        // record, not create a second record that makes the sid ambiguous.
+        let mut unbound = record(1, 10, 10, "");
+        unbound.service_type = 0;
+        unbound.pmt_pid = Some(0x1F0);
+        table.upsert(unbound);
+        assert_eq!(table.len(), 1);
+        let stored = table.get(id).expect("record");
+        assert_eq!(stored.name, "bound");
+        assert_eq!(stored.pmt_pid, Some(0x1F0));
+        assert_eq!(stored.channel, Some(("GR".to_owned(), "27".to_owned())));
+        assert_eq!(table.get_by_sid(10).expect("record").name, "bound");
+    }
+
+    #[test]
+    fn modify_rekeys_when_the_closure_changes_key_fields() {
+        let table = ServiceTable::new();
+        let old_id = ServiceItemId::new(1, 10);
+        table.upsert(record(1, 10, 10, "svc"));
+        assert!(table.modify(old_id, |record| {
+            record.service_id = 20;
+        }));
+        assert!(table.get(old_id).is_none());
+        let new_id = ServiceItemId::new(1, 20);
+        assert_eq!(table.get(new_id).expect("record").name, "svc");
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn set_channel_keeps_other_channel_bindings_and_add_binding_copies() {
+        let table = ServiceTable::new();
+        let id = ServiceItemId::new(1, 10);
+        table.insert(on_channel(1, 10, 10, "GR", "GR", "27"));
+        table.insert(on_channel(1, 10, 10, "CATV", "CABLE_CATV", "C17"));
+        // set_channel with no unbound record must not move either bound copy.
+        assert!(!table.set_channel(id, "BS", "BS01_0"));
+        assert_eq!(table.len(), 2);
+        assert!(table.get_on_channel("GR", "27", id).is_some());
+        assert!(table.get_on_channel("CABLE_CATV", "C17", id).is_some());
+        // add_channel_binding copies instead of moving.
+        assert!(table.add_channel_binding(id, "BS", "BS01_0"));
+        assert_eq!(table.len(), 3);
+        assert!(table.get_on_channel("BS", "BS01_0", id).is_some());
+        assert!(table.get_on_channel("GR", "27", id).is_some());
+        assert!(!table.add_channel_binding(ServiceItemId::new(9, 9), "BS", "BS01_0"));
     }
 
     #[test]

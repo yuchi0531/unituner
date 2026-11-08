@@ -6,6 +6,15 @@
 //! `cmd:` instead of `command:` are rejected instead of silently ignored.
 //! Validation is fail-fast at startup: any issue is reported with the file and
 //! the offending item, and the process exits non-zero.
+//!
+//! NOTE (duplicate map keys): the `pipelines`, `types` and `child_env` maps
+//! are `HashMap`s, so a repeated YAML key would normally collapse silently
+//! (last one wins). `serde_yaml_ng`'s derived `HashMap` deserialization does
+//! collapse them, but its `Value` parser rejects a repeated key with a
+//! `duplicate entry with key "..."` error, so [`parse_file`] pre-checks every
+//! document as a `Value` and turns that error into a load-time parse failure
+//! (see the duplicate-key tests below). If the YAML backend is ever swapped,
+//! re-check that duplicate keys are still rejected rather than collapsed.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -47,6 +56,18 @@ pub const DEFAULT_MAX_SUBSCRIBERS_PER_IP: usize = 16;
 
 /// Default maximum number of concurrent sessions (SPEC §7).
 pub const DEFAULT_MAX_SESSIONS: usize = 16;
+
+/// Minimum `server.chunk_size_bytes`: one TS packet (188 bytes).
+pub const MIN_CHUNK_SIZE_BYTES: usize = 188;
+
+/// Maximum `server.chunk_size_bytes`: 1 MiB.
+pub const MAX_CHUNK_SIZE_BYTES: usize = 1_048_576;
+
+/// Maximum `server.subscriber_buffer_chunks` per subscriber.
+pub const MAX_SUBSCRIBER_BUFFER_CHUNKS: usize = 65_536;
+
+/// Maximum `server.idle_timeout_secs`: 24 hours.
+pub const MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
 /// Default total subscriber buffer budget, in bytes (SPEC §7).
 ///
@@ -452,6 +473,19 @@ fn parse_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, ConfigErro
         path: path.to_path_buf(),
         source,
     })?;
+    // Duplicate map keys (`pipelines`, `types`, `child_env`, …) would collapse
+    // silently (last one wins) in the derived `HashMap` deserialization below.
+    // The `Value` parser rejects them instead, so surface that error as the
+    // parse failure for this file. Any other `Value` error is ignored here:
+    // the typed parse below produces the proper, specific error for it.
+    if let Err(source) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text) {
+        if source.to_string().contains("duplicate entry") {
+            return Err(ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
     serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
         source,
@@ -514,12 +548,26 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
         issues.push(Issue::new("server.yml", "addr", message));
     }
     for (index, cidr) in server.allowed_cidrs.iter().enumerate() {
-        if let Err(error) = cidr.parse::<ipnet::IpNet>() {
-            issues.push(Issue::new(
+        match cidr.parse::<ipnet::IpNet>() {
+            Ok(net) => {
+                if cidr_has_host_bits(&net) {
+                    // Not an error: matching masks the host bits off anyway
+                    // (e.g. 192.168.1.1/24 behaves as 192.168.1.0/24), but the
+                    // operator probably meant the network address, so warn at
+                    // startup. `Issue` has no warning severity, so this is a
+                    // log line, not a validation issue.
+                    tracing::warn!(
+                        cidr = %cidr,
+                        network = %net.network(),
+                        "allowed_cidrs entry has host bits set; it matches its network address"
+                    );
+                }
+            }
+            Err(error) => issues.push(Issue::new(
                 "server.yml",
                 format!("allowed_cidrs[{index}]"),
                 format!("{cidr:?} is not a valid CIDR: {error}"),
-            ));
+            )),
         }
     }
     for (index, host) in server.allowed_hosts.iter().enumerate() {
@@ -531,19 +579,55 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
             ));
         }
     }
-    if server.subscriber_buffer_chunks == 0 {
+    if !(1..=MAX_SUBSCRIBER_BUFFER_CHUNKS).contains(&server.subscriber_buffer_chunks) {
         issues.push(Issue::new(
             "server.yml",
             "subscriber_buffer_chunks",
-            "must be greater than 0",
+            format!("must be between 1 and {MAX_SUBSCRIBER_BUFFER_CHUNKS}"),
         ));
     }
-    if server.chunk_size_bytes == 0 {
+    if !(MIN_CHUNK_SIZE_BYTES..=MAX_CHUNK_SIZE_BYTES).contains(&server.chunk_size_bytes) {
         issues.push(Issue::new(
             "server.yml",
             "chunk_size_bytes",
-            "must be greater than 0",
+            format!("must be between {MIN_CHUNK_SIZE_BYTES} and {MAX_CHUNK_SIZE_BYTES}"),
         ));
+    }
+    if server.idle_timeout_secs > MAX_IDLE_TIMEOUT_SECS {
+        issues.push(Issue::new(
+            "server.yml",
+            "idle_timeout_secs",
+            format!("must be at most {MAX_IDLE_TIMEOUT_SECS}"),
+        ));
+    }
+    // One subscriber's worst-case reservation must fit the total budget.
+    // Only checked when the inputs are themselves in range, so an out-of-range
+    // value does not also produce a misleading cross-field issue. Checked
+    // arithmetic: an overflowing product exceeds any `usize` budget.
+    if (MIN_CHUNK_SIZE_BYTES..=MAX_CHUNK_SIZE_BYTES).contains(&server.chunk_size_bytes)
+        && (1..=MAX_SUBSCRIBER_BUFFER_CHUNKS).contains(&server.subscriber_buffer_chunks)
+        && server.max_subscriber_buffer_bytes > 0
+    {
+        let aligned = (server.chunk_size_bytes / 188 * 188).max(188);
+        match aligned.checked_mul(server.subscriber_buffer_chunks) {
+            Some(cost) if cost <= server.max_subscriber_buffer_bytes => {}
+            Some(cost) => issues.push(Issue::new(
+                "server.yml",
+                "max_subscriber_buffer_bytes",
+                format!(
+                    "must be at least packet_aligned(chunk_size_bytes) * subscriber_buffer_chunks ({aligned} * {} = {cost})",
+                    server.subscriber_buffer_chunks
+                ),
+            )),
+            None => issues.push(Issue::new(
+                "server.yml",
+                "max_subscriber_buffer_bytes",
+                format!(
+                    "must be at least packet_aligned(chunk_size_bytes) * subscriber_buffer_chunks ({aligned} * {} overflows usize)",
+                    server.subscriber_buffer_chunks
+                ),
+            )),
+        }
     }
     for (field, value) in [
         (
@@ -618,11 +702,14 @@ fn validate_server(server: &ServerConfig, issues: &mut Vec<Issue>) {
         }
     }
     for (name, value) in &server.child_env {
-        if name.is_empty() || name.contains('\0') || name.contains('\n') || name.contains('\r') {
+        // `=` would let one entry smuggle in a second `KEY=value` pair when
+        // the environment is flattened, and control characters (NUL, CR, LF,
+        // …) have no place in an environment variable name.
+        if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
             issues.push(Issue::new(
                 "server.yml",
                 format!("child_env[{name:?}]"),
-                "environment variable name must be non-empty and contain no NUL or newline",
+                "environment variable name must be non-empty and contain no '=' or control characters",
             ));
         }
         if value.contains('\0') {
@@ -774,6 +861,12 @@ fn ip_candidates(ip: IpAddr) -> Vec<IpAddr> {
         IpAddr::V4(v4) => candidates.push(IpAddr::V6(v4.to_ipv6_mapped())),
     }
     candidates
+}
+
+/// Whether `net` was written with host bits set (e.g. `192.168.1.1/24`):
+/// the address differs from the network address it actually matches.
+fn cidr_has_host_bits(net: &IpNet) -> bool {
+    net.addr() != net.network()
 }
 
 fn validate_addr(addr: &str) -> Result<(), String> {
@@ -973,6 +1066,13 @@ fn validate_pipelines(pipelines: &PipelinesConfig, issues: &mut Vec<Issue>) {
     // at least one non-empty command, which the loop below checks.
     for (name, commands) in sorted_entries(&pipelines.pipelines) {
         let label = format!("pipelines.{name}");
+        if name.trim().is_empty() {
+            issues.push(Issue::new(
+                "pipelines.yml",
+                label.clone(),
+                "pipeline name must not be empty",
+            ));
+        }
         if commands.is_empty() {
             issues.push(Issue::new(
                 "pipelines.yml",
@@ -1261,6 +1361,62 @@ types:
             assert_issue_contains(&issues, field);
             assert_issue_contains(&issues, "must be greater than 0");
         }
+    }
+
+    #[test]
+    fn chunk_and_buffer_caps_are_bounded() {
+        for (field, value) in [
+            ("chunk_size_bytes", 187),
+            ("chunk_size_bytes", 1_048_577),
+            ("subscriber_buffer_chunks", 65_537),
+        ] {
+            let server = format!("{SERVER}\n{field}: {value}\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, field);
+            assert_issue_contains(&issues, "must be between");
+        }
+        // The bounds themselves are accepted.
+        let server = format!(
+            "{SERVER}\nchunk_size_bytes: 188\nsubscriber_buffer_chunks: 65536\n\
+             max_subscriber_buffer_bytes: {}\n",
+            188usize * 65_536
+        );
+        Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("boundary values are accepted");
+    }
+
+    #[test]
+    fn subscriber_cost_must_fit_the_total_budget() {
+        // Defaults: 65424 * 1024 = 67,010,736 > 1,000,000.
+        let server = format!("{SERVER}\nmax_subscriber_buffer_bytes: 1000000\n");
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "max_subscriber_buffer_bytes");
+        assert_issue_contains(&issues, "packet_aligned(chunk_size_bytes)");
+
+        // Checked arithmetic: the largest in-range inputs overflow usize
+        // multiplication only via the checked path, and must still be rejected
+        // rather than wrapping (on 64-bit this product fits, so use a budget
+        // below it to exercise the same branch deterministically).
+        let server = format!(
+            "{SERVER}\nchunk_size_bytes: 1048576\nsubscriber_buffer_chunks: 65536\n\
+             max_subscriber_buffer_bytes: 1\n"
+        );
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "max_subscriber_buffer_bytes");
+    }
+
+    #[test]
+    fn idle_timeout_is_bounded_at_86400() {
+        let server = format!("{SERVER}\nidle_timeout_secs: 86401\n");
+        let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+        assert_issue_contains(&issues, "idle_timeout_secs");
+        assert_issue_contains(&issues, "must be at most 86400");
+
+        let server = format!("{SERVER}\nidle_timeout_secs: 86400\n");
+        Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("86400 is accepted");
     }
 
     #[test]
@@ -2234,5 +2390,87 @@ types:
         Fixture::new(SERVER, TUNERS, channels, PIPELINES)
             .load()
             .expect("distinct effective channels are independent");
+    }
+
+    // -----------------------------------------------------------------------
+    // duplicate map keys / child_env names / pipeline names / CIDR host bits
+    // -----------------------------------------------------------------------
+
+    fn assert_duplicate_key_rejected(fixture: &Fixture, file: &str) {
+        match fixture.load() {
+            Err(ConfigError::Parse { path, source }) => {
+                assert!(path.ends_with(file), "{path:?}");
+                assert!(
+                    source.to_string().contains("duplicate entry"),
+                    "unexpected parse error: {source}"
+                );
+            }
+            other => panic!("duplicate key must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_pipeline_key_is_rejected() {
+        let pipelines = "pipelines:\n  soft:\n    - \"a\"\n  soft:\n    - \"b\"\ntypes: {}\n";
+        assert_duplicate_key_rejected(
+            &Fixture::new(SERVER, TUNERS, CHANNELS, pipelines),
+            "pipelines.yml",
+        );
+    }
+
+    #[test]
+    fn duplicate_type_key_is_rejected() {
+        let pipelines = "pipelines:\n  soft:\n    - \"a\"\ntypes:\n  GR: { pipeline: soft }\n  GR: { pipeline: soft }\n";
+        assert_duplicate_key_rejected(
+            &Fixture::new(SERVER, TUNERS, CHANNELS, pipelines),
+            "pipelines.yml",
+        );
+    }
+
+    #[test]
+    fn duplicate_child_env_key_is_rejected() {
+        let server = format!("{SERVER}\nchild_env:\n  FOO: a\n  FOO: b\n");
+        assert_duplicate_key_rejected(
+            &Fixture::new(&server, TUNERS, CHANNELS, PIPELINES),
+            "server.yml",
+        );
+    }
+
+    #[test]
+    fn child_env_names_with_equals_or_control_chars_are_rejected() {
+        for bad in ["FOO=BAR", "FOO\\tBAR"] {
+            // "\\t" is a YAML double-quoted escape: the parsed name has a tab.
+            let server = format!("{SERVER}\nchild_env:\n  \"{bad}\": v\n");
+            let issues = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).issues();
+            assert_issue_contains(&issues, "child_env");
+            assert_issue_contains(&issues, "'=' or control");
+        }
+        // A plain name still loads.
+        let server = format!("{SERVER}\nchild_env:\n  FOO_BAR: v\n");
+        Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("a plain child_env name is valid");
+    }
+
+    #[test]
+    fn empty_pipeline_name_is_rejected() {
+        for name in ["", "   "] {
+            let pipelines = format!("pipelines:\n  \"{name}\":\n    - \"a\"\ntypes: {{}}\n");
+            let issues = Fixture::new(SERVER, TUNERS, CHANNELS, &pipelines).issues();
+            assert_issue_contains(&issues, "pipeline name must not be empty");
+        }
+    }
+
+    #[test]
+    fn cidr_with_host_bits_is_accepted() {
+        // Host bits set: accepted (matches the network address), only warned.
+        let server = "addr: \":40772\"\nallowed_cidrs: [\"192.168.1.1/24\"]\n";
+        Fixture::new(server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("host-bit CIDR is a warning, not an error");
+        let net: IpNet = "192.168.1.1/24".parse().expect("cidr");
+        assert!(cidr_has_host_bits(&net));
+        let net: IpNet = "192.168.1.0/24".parse().expect("cidr");
+        assert!(!cidr_has_host_bits(&net));
     }
 }

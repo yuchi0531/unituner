@@ -822,12 +822,18 @@ enum SaveFailure {
 /// the file was read.
 async fn server_config(State(state): State<AppState>) -> Response {
     let dir = state.config_dir.clone();
+    let client_dir = dir.clone();
     let loaded = tokio::task::spawn_blocking(move || load_server_config(&dir)).await;
     let (server, source, error) = match loaded {
         Ok(Ok(server)) => (server, "file", None),
         Ok(Err(error)) => {
+            // The full error (with the absolute path) goes to the server log
+            // only; the client gets the same message with the config
+            // directory stripped, so the response does not leak the host's
+            // filesystem layout.
             tracing::warn!(%error, "server-config fell back to the in-memory value");
-            (state.config.server.clone(), "memory", Some(error))
+            let client_error = strip_config_dir(&error, &client_dir);
+            (state.config.server.clone(), "memory", Some(client_error))
         }
         Err(error) => {
             let error = format!("failed to read server.yml: {error}");
@@ -857,6 +863,14 @@ async fn server_config(State(state): State<AppState>) -> Response {
     response
 }
 
+/// Removes the absolute config-directory path from an error message that is
+/// about to be returned to a client, keeping only the file name
+/// (`/etc/unituner/server.yml` → `server.yml`). The unmodified error is what
+/// the server logs.
+fn strip_config_dir(error: &str, dir: &Path) -> String {
+    error.replace(&dir.display().to_string(), SERVER_FILE)
+}
+
 /// Reads and parses `server.yml` from `dir` (blocking; call from a blocking
 /// task).
 fn load_server_config(dir: &Path) -> Result<ServerConfig, String> {
@@ -873,40 +887,37 @@ fn load_server_config(dir: &Path) -> Result<ServerConfig, String> {
 ///
 /// The Status tab polls this endpoint, and re-parsing (and fully validating)
 /// the whole document on every poll is pure waste when the file has not
-/// changed: the parsed count is cached behind its `(mtime, size)` stamp and
-/// only recomputed after a hand edit or a webui save changes the file.
+/// changed: the parsed count is cached behind a content hash (the same
+/// FNV-1a [`etag`] the save path uses) and only recomputed after a hand edit
+/// or a webui save changes the content. Reading the small file on every poll
+/// is cheap; the YAML parse is the part being skipped.
 ///
-/// The stamp is a heuristic, not a content hash: a same-size rewrite inside
-/// one coarse mtime tick (FAT/exFAT, a stale NFS attribute cache, `cp -p`)
-/// serves the previous count until the next change. That is a display value on
-/// the Status tab only; the file itself is re-read by every code path that
-/// writes or validates configuration.
+/// A content hash replaces the previous `(mtime, size)` stamp, which could
+/// serve a stale count after a same-size rewrite inside one coarse mtime
+/// tick (FAT/exFAT, a stale NFS attribute cache, `cp -p`). The hash is
+/// recomputed from the bytes just read, so a rewrite is always seen. The
+/// count is still a display value on the Status tab only; the file itself is
+/// re-read by every code path that writes or validates configuration.
 fn channels_on_disk(dir: &Path) -> Option<usize> {
     use std::sync::Mutex;
-    use std::time::SystemTime;
 
-    static CACHE: Mutex<Option<(std::path::PathBuf, SystemTime, u64, usize)>> = Mutex::new(None);
+    static CACHE: Mutex<Option<(std::path::PathBuf, String, usize)>> = Mutex::new(None);
 
     let path = dir.join(CHANNELS_FILE);
-    // The stamp is only used to *skip* re-parsing: a filesystem without mtime
-    // (some FUSE/virtual mounts) still parses the file every time instead of
-    // falling back to the startup snapshot.
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let stamp = etag(&text);
 
     let cached = CACHE.lock().ok().and_then(|guard| guard.clone());
-    if let (Some(stamp), Some((cached_path, mtime, len, count))) = (stamp, cached) {
-        if cached_path == path && mtime == stamp.0 && len == stamp.1 {
+    if let Some((cached_path, cached_stamp, count)) = cached {
+        if cached_path == path && cached_stamp == stamp {
             return Some(count);
         }
     }
-    let text = std::fs::read_to_string(&path).ok()?;
     let count = serde_yaml_ng::from_str::<Vec<ChannelConfig>>(&text)
         .ok()
         .map(|channels| channels.len())?;
-    if let (Some(stamp), Ok(mut guard)) = (stamp, CACHE.lock()) {
-        *guard = Some((path, stamp.0, stamp.1, count));
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((path, stamp, count));
     }
     Some(count)
 }

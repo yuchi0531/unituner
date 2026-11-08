@@ -28,17 +28,19 @@
 //! mutexes and proceed in parallel on the blocking pool.
 //!
 //! The scan layer ([`crate::scan`]) still calls the synchronous [`lock`], which
-//! spins on the same mutex with `try_lock`. That keeps scan and webui saves
-//! mutually exclusive, but the scan owner should switch to
-//! `lock_async(..).await` (and run its write inside `spawn_blocking`) so a slow
-//! `fsync` does not park a worker there.
+//! spins on the same mutex with `try_lock`, but only up to
+//! [`SYNC_LOCK_TIMEOUT`] (see [`lock_timeout`]): a webui save holding the lock
+//! through a slow `fsync` can no longer park a runtime worker for ever. That
+//! keeps scan and webui saves mutually exclusive, but the scan owner should
+//! still switch to `lock_async(..).await` (and run its write inside
+//! `spawn_blocking`) so a slow `fsync` does not park a worker there at all.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -109,6 +111,44 @@ pub async fn lock_async(file: &str) -> MutexGuard<'static, ()> {
     file_mutex(file).lock().await
 }
 
+/// How long the synchronous [`lock`] waits for a busy file before giving up.
+///
+/// A webui save holds the lock only for one validate-and-write sequence, so
+/// 30 s is far beyond any legitimate hold; exceeding it means the holder is
+/// wedged, and parking a runtime worker for ever (the previous behaviour)
+/// hides that instead of surfacing it.
+pub const SYNC_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Locks `file` for a synchronous caller, giving up after `timeout`.
+///
+/// This is the panic-free, bounded form of [`lock`]: it returns `None` when
+/// the file stayed busy for the whole `timeout` instead of spinning for ever,
+/// so callers that can handle failure should prefer it and report the timeout
+/// themselves. New synchronous callers should use this (or [`lock_async`])
+/// rather than [`lock`].
+pub fn lock_timeout(file: &str, timeout: Duration) -> Option<MutexGuard<'static, ()>> {
+    let mutex = file_mutex(file);
+    let deadline = Instant::now() + timeout;
+    // Exponential backoff instead of a fixed 1 ms spin: a webui save holding
+    // the lock through a slow `fsync` can keep this waiter queued for a long
+    // time, and a 1 ms wakeup loop burns a core (and contends with the worker
+    // doing the save) for the whole wait. Still a spin — `blocking_lock`
+    // panics inside a runtime — but it parks progressively longer, and never
+    // past `deadline`.
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        if let Ok(guard) = mutex.try_lock() {
+            return Some(guard);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = backoff.saturating_mul(2).min(Duration::from_millis(50));
+    }
+}
+
 /// Locks `file` for a synchronous caller (the channel scan).
 ///
 /// Tokio's `blocking_lock` panics inside a runtime, and the scan calls this from
@@ -117,21 +157,26 @@ pub async fn lock_async(file: &str) -> MutexGuard<'static, ()> {
 /// exclusive. The critical section in the scan is a short read-merge-write; a
 /// webui save holding the lock during a slow `fsync` makes the scan's worker
 /// thread wait, which is why the scan should move to [`lock_async`].
+///
+/// The wait is bounded by [`SYNC_LOCK_TIMEOUT`] (via [`lock_timeout`]): if
+/// the file is still busy after that, the failure is logged and this panics
+/// with a descriptive message instead of parking the runtime worker for ever.
+/// The scan caller (`scan.rs`, which this module must not change) takes the
+/// guard directly and has no error channel for a timeout, so a wedged holder
+/// surfaces as a failed scan task rather than a silently unlocked write; the
+/// file is never written without the lock.
 pub fn lock(file: &str) -> MutexGuard<'static, ()> {
-    let mutex = file_mutex(file);
-    // Exponential backoff instead of a fixed 1 ms spin: a webui save holding
-    // the lock through a slow `fsync` can keep this waiter queued for a long
-    // time, and a 1 ms wakeup loop burns a core (and contends with the worker
-    // doing the save) for the whole wait. Still a spin — `blocking_lock`
-    // panics inside a runtime — but it parks progressively longer.
-    let mut backoff = Duration::from_millis(1);
-    loop {
-        if let Ok(guard) = mutex.try_lock() {
-            return guard;
-        }
-        std::thread::sleep(backoff);
-        backoff = backoff.saturating_mul(2).min(Duration::from_millis(50));
-    }
+    lock_timeout(file, SYNC_LOCK_TIMEOUT).unwrap_or_else(|| {
+        tracing::error!(
+            file,
+            timeout = ?SYNC_LOCK_TIMEOUT,
+            "timed out waiting for the per-file store lock"
+        );
+        panic!(
+            "timed out after {SYNC_LOCK_TIMEOUT:?} waiting for the store lock on {file:?}; \
+             the lock holder appears wedged"
+        )
+    })
 }
 
 /// Validates `yaml` as the new content of `file` and, when the whole
@@ -234,6 +279,12 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     if path.exists() {
         fs::copy(path, &bak)
             .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
+        // Persist the backup itself: without an fsync a crash could leave a
+        // zero-length or partial `.bak` behind while the original is already
+        // replaced, defeating the one-generation rollback.
+        File::open(&bak)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("failed to back up {}: {error}", bak.display()))?;
     }
 
     let written = (|| -> std::io::Result<()> {
@@ -283,21 +334,46 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
 /// `0700`.
 fn scratch_dir() -> Result<PathBuf, SaveError> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "unituner-validate-{}-{}",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+    // The pid can be reused after a crash/exec, and a leftover directory from
+    // a killed process may still exist under the same `<pid>-<seq>` name, so
+    // an `AlreadyExists` is not fatal: retry with the next sequence number
+    // instead of failing the save. Other errors (permissions, a missing
+    // temp dir) are real and reported at once.
+    const MAX_ATTEMPTS: u32 = 16;
+    for attempt in 0..MAX_ATTEMPTS {
+        let path = std::env::temp_dir().join(format!(
+            "unituner-validate-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                tracing::debug!(
+                    attempt,
+                    path = %path.display(),
+                    "scratch directory already exists; retrying with the next sequence"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(SaveError::internal(format!(
+                    "failed to create {}: {error}",
+                    path.display()
+                )));
+            }
+        }
     }
-    builder.create(&path).map_err(|error| {
-        SaveError::internal(format!("failed to create {}: {error}", path.display()))
-    })?;
-    Ok(path)
+    Err(SaveError::internal(format!(
+        "failed to create a scratch directory in {} after {MAX_ATTEMPTS} attempts",
+        std::env::temp_dir().display()
+    )))
 }
 
 #[cfg(test)]
@@ -481,6 +557,27 @@ mod tests {
             fs::read_to_string(&path).expect("read").contains("name: B"),
             "the queued save won the race"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_timeout_is_bounded_and_succeeds_when_free() {
+        // Held by the async lock: the bounded sync wait must give up (None)
+        // instead of spinning for ever.
+        let guard = lock_async(CHANNELS_FILE).await;
+        let started = std::time::Instant::now();
+        assert!(
+            lock_timeout(CHANNELS_FILE, Duration::from_millis(50)).is_none(),
+            "a held file must time out, not park the worker"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the timeout must be honoured promptly"
+        );
+        // Once released, the same bounded wait acquires it.
+        drop(guard);
+        let guard = lock_timeout(CHANNELS_FILE, Duration::from_secs(5))
+            .expect("a free file must be lockable");
+        drop(guard);
     }
 
     #[test]

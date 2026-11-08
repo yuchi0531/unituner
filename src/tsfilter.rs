@@ -177,8 +177,11 @@ fn find_program_pid(section: &[u8], service_id: u16) -> Option<u16> {
 /// `last_section_number = 0`. The trailing CRC32 is recomputed over the new
 /// section.
 ///
-/// Returns `None` when the input is not a complete PAT section or does not
-/// contain `service_id`.
+/// Returns `None` when the input is not a complete PAT section, does not
+/// contain `service_id`, or has `current_next_indicator == 0`: a next-version
+/// PAT must not be applied before it is in force, so it is never rewritten
+/// into an in-force table (callers that count such sections check
+/// `section[5]` before calling).
 ///
 /// ```
 /// use unituner::si::crc32_mpeg2;
@@ -195,11 +198,17 @@ fn find_program_pid(section: &[u8], service_id: u16) -> Option<u16> {
 ///            u32::from_be_bytes(rewritten[rewritten.len() - 4..].try_into().unwrap()));
 /// assert!(rewrite_pat_for_service(&section, 0x0409).is_none());
 /// ```
+#[must_use]
 pub fn rewrite_pat_for_service(section_bytes: &[u8], service_id: u16) -> Option<Vec<u8>> {
     if service_id == 0 {
         return None;
     }
     let body = pat_body(section_bytes)?;
+    // `current_next_indicator` is the low bit of section[5]; a next-version
+    // section (0) must never be rewritten into the in-force stream.
+    if section_bytes[5] & 0x01 == 0 {
+        return None;
+    }
 
     // Two passes over the (small) entry loop, no intermediate Vec: count
     // the entries to keep and check the target exists, then copy directly.
@@ -420,7 +429,9 @@ impl ServiceFilter {
     fn rebuild_allowed(&mut self) {
         self.allowed_bitmap = [0u64; 128];
         let set = |bm: &mut [u64; 128], pid: u16| {
-            debug_assert!(pid <= NULL_PID, "PID out of the 13-bit range");
+            // Release-mode assert: a PID outside the 13-bit range would index
+            // past the bitmap instead of merely tripping a debug check.
+            assert!(pid <= NULL_PID, "PID out of the 13-bit range");
             bm[(pid >> 6) as usize] |= 1u64 << (pid & 63);
         };
         for &pid in &FIXED_PIDS {
@@ -479,7 +490,11 @@ impl ServiceFilter {
     /// Whether `pid` should be forwarded according to the current knowledge.
     #[inline]
     fn is_allowed(&self, pid: u16) -> bool {
-        (self.allowed_bitmap[(pid >> 6) as usize] >> (pid & 63)) & 1 == 1
+        // Checked access: a PID outside the 13-bit range is simply not allowed
+        // instead of indexing past the bitmap.
+        self.allowed_bitmap
+            .get((pid >> 6) as usize)
+            .is_some_and(|word| (word >> (pid & 63)) & 1 == 1)
     }
 
     /// Buffers PAT packets and emits the rewritten PAT once its section is
@@ -614,6 +629,11 @@ impl ServiceFilter {
             }
             let total = 3 + ((usize::from(rest[1] & 0x0F) << 8) | usize::from(rest[2]));
             if !(12..=MAX_SECTION_LEN).contains(&total) {
+                // A corrupt section length: drop it and abandon any section in
+                // progress, exactly like `continue_pat_section` does, so the
+                // dropped section is counted instead of silently vanishing.
+                self.pat.abandon();
+                self.dropped_pat_sections += 1;
                 return;
             }
             if rest.len() >= total {
@@ -664,12 +684,24 @@ impl ServiceFilter {
             self.missing_service_sections += 1;
             return;
         };
+        // The template packet may carry a large adaptation field, which shrinks
+        // the payload capacity even though the rewritten (single-programme)
+        // section is short. Fall back to a minimal 4-byte header (payload
+        // only, no adaptation field) sized for the completed section instead
+        // of dropping a PAT that would have fitted.
+        let mut payload_offset = payload_offset;
+        let mut strip_adaptation = false;
         let capacity = TS_PACKET_SIZE.saturating_sub(payload_offset + 1);
         if rewritten.len() > capacity {
-            // Should be impossible for a single programme; never emit a torn
-            // section.
-            self.dropped_pat_sections += 1;
-            return;
+            let minimal_capacity = TS_PACKET_SIZE - (4 + 1);
+            if rewritten.len() > minimal_capacity {
+                // Should be impossible for a single programme; never emit a
+                // torn section.
+                self.dropped_pat_sections += 1;
+                return;
+            }
+            payload_offset = 4;
+            strip_adaptation = true;
         }
         // Copy the template straight into `out` and patch it in place:
         // one copy instead of template->Vec + Vec->out.
@@ -680,6 +712,12 @@ impl ServiceFilter {
             None => 0,
         };
         self.pat.out_cc = Some(cc);
+        if strip_adaptation {
+            // Switch the adaptation-field control to "payload only" (0x01);
+            // the bytes that held the adaptation field are overwritten by the
+            // pointer field, the section and 0xFF stuffing below.
+            out[base + 3] = (out[base + 3] & 0xCF) | 0x10;
+        }
         out[base + 3] = (out[base + 3] & 0xF0) | cc;
         // Every emitted packet begins a section, even when the template was a
         // continuation packet of the original (PUSI clear).
@@ -823,5 +861,45 @@ mod tests {
         assert!(rewrite_pat_for_service(&section, 0x0409).is_none());
         assert!(rewrite_pat_for_service(&section, 0).is_none());
         assert!(rewrite_pat_for_service(&[], 0x0400).is_none());
+    }
+
+    #[test]
+    fn rewrite_returns_none_for_a_next_version_section() {
+        // current_next_indicator == 0 (0xC0): a next-version PAT must never be
+        // rewritten into the in-force stream.
+        let mut section = pat_section(&[(0x0400, 0x0100)]);
+        section[5] = 0xC0;
+        assert!(rewrite_pat_for_service(&section, 0x0400).is_none());
+        // The in-force spelling (0xC1) still rewrites.
+        section[5] = 0xC1;
+        assert!(rewrite_pat_for_service(&section, 0x0400).is_some());
+    }
+
+    #[test]
+    fn emit_pat_falls_back_to_a_minimal_header_when_adaptation_is_large() {
+        // A template whose payload starts at offset 175 leaves only 12 bytes
+        // of capacity — too small for the 20-byte rewritten section — but the
+        // minimal 4-byte-header form (183 bytes) fits.
+        let section = pat_section(&[(0x0400, 0x0100)]);
+        let mut template = [0xFFu8; TS_PACKET_SIZE];
+        template[0] = SYNC_BYTE;
+        template[1] = 0x40; // PUSI, PID 0x0000
+        template[2] = 0x00;
+        template[3] = 0x30; // adaptation field + payload
+        template[4] = 170; // adaptation field length: payload starts at 175
+        let mut filter = ServiceFilter::new(0x0400);
+        let mut out = Vec::new();
+        filter.emit_pat(&section, &template, 175, &mut out);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        assert_eq!(filter.packets_out, 1);
+        assert_eq!(filter.pat_rewrites, 1);
+        assert_eq!(filter.dropped_pat_sections, 0);
+        // Adaptation control is now payload-only and the section starts at 5.
+        assert_eq!(out[3] >> 4, 0x01);
+        assert_eq!(out[4], 0x00, "pointer field");
+        let rewritten = rewrite_pat_for_service(&section, 0x0400).unwrap();
+        assert_eq!(&out[5..5 + rewritten.len()], &rewritten[..]);
+        assert!(out[5 + rewritten.len()..].iter().all(|&b| b == 0xFF));
+        assert_eq!(filter.pmt_pid, Some(0x0100));
     }
 }

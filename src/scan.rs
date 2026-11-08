@@ -601,6 +601,12 @@ struct ChannelSink {
     seen_pat: bool,
     /// Whether a PMT has been seen.
     seen_pmt: bool,
+    /// `service_id`s for which a PMT has been seen (per-service coverage, so
+    /// one service's PMT does not satisfy another's).
+    pmt_service_ids: HashSet<u16>,
+    /// Whether the network id captured at SDT time came from an authoritative
+    /// source (parser / NIT-actual) rather than the SDT fallback.
+    network_id_from_nit: bool,
     /// Whether a NIT *actual* has been seen (supplies the network id and the
     /// remote-control key id of `found`).
     seen_nit_actual: bool,
@@ -646,6 +652,10 @@ impl SdtAccumulator {
             sdt.transport_stream_id,
             sdt.version_number,
         );
+        if sdt.section_number > sdt.last_section_number {
+            // Malformed section: it can never be part of this table.
+            return None;
+        }
         if self.current != Some(table) {
             // A new table (or table version): sections of the previous one
             // must not contribute to it.
@@ -672,9 +682,11 @@ impl SdtAccumulator {
 
     /// Every collected service, in section order, up to `last_section_number`.
     fn collect(&self, last_section_number: u8) -> Vec<(u16, u8, String)> {
+        let mut seen: HashSet<u16> = HashSet::new();
         (0..=last_section_number)
             .filter_map(|number| self.sections.get(&number))
             .flat_map(|services| services.iter().cloned())
+            .filter(|(service_id, _, _)| seen.insert(*service_id))
             .collect()
     }
 
@@ -728,8 +740,9 @@ impl ChannelSink {
                 }
             }
             SiEvent::Sdt(sdt) => self.push_sdt(sdt),
-            SiEvent::Pmt(_) => {
+            SiEvent::Pmt(pmt) => {
                 self.seen_pmt = true;
+                self.pmt_service_ids.insert(pmt.program_number);
             }
         }
     }
@@ -754,7 +767,9 @@ impl ChannelSink {
         let Some(services) = self.sdt.push(sdt) else {
             return;
         };
-        let network_id = self.network_id().unwrap_or(sdt.original_network_id);
+        let authoritative = self.network_id();
+        self.network_id_from_nit = authoritative.is_some();
+        let network_id = authoritative.unwrap_or(sdt.original_network_id);
         self.found = services
             .into_iter()
             .map(|(service_id, service_type, name)| FoundService {
@@ -773,15 +788,23 @@ impl ChannelSink {
     /// Whether a complete SDT-actual has been stored and no newer table
     /// version is halfway through being received.
     fn is_complete(&self) -> bool {
-        self.complete && !self.found.is_empty() && !self.sdt.pending_new_version()
+        self.complete && !self.sdt.pending_new_version()
     }
 
     /// Whether every core table needed for a finished record has arrived:
-    /// PAT (PMT PIDs), a PMT, the complete SDT-actual (service names) and a
-    /// NIT-actual (network id / remote-control key id). The scan may exit as
-    /// soon as this holds instead of waiting out the channel budget.
+    /// PAT (PMT PIDs), a PMT for *every* found service, the complete
+    /// SDT-actual (service names) and a NIT-actual (network id /
+    /// remote-control key id). The scan may exit as soon as this holds
+    /// instead of waiting out the channel budget.
     fn has_all_core_tables(&self) -> bool {
-        self.is_complete() && self.seen_pat && self.seen_pmt && self.seen_nit_actual
+        self.is_complete()
+            && self.seen_pat
+            && self.seen_nit_actual
+            && !self.found.is_empty()
+            && self
+                .found
+                .iter()
+                .all(|service| self.pmt_service_ids.contains(&service.service_id))
     }
 
     /// Copies the NIT remote-control key id and the PAT PMT PIDs onto every
@@ -810,6 +833,17 @@ impl ChannelSink {
                     .collect();
             }
         }
+        // The network id captured at SDT time may have been the
+        // `original_network_id` fallback; if an authoritative id (parser /
+        // NIT-actual) is known by now, refresh it. Never overwrite an
+        // already authoritative id.
+        if !self.network_id_from_nit {
+            if let Some(network_id) = self.network_id() {
+                for service in &mut self.found {
+                    service.network_id = network_id;
+                }
+            }
+        }
         for service in &mut self.found {
             service.remote_control_key_id = self.remote_control_key_id;
             service.pmt_pid = self.pmt_pids.get(&service.service_id).copied();
@@ -831,7 +865,7 @@ pub async fn run_scan(
     config_dir: &Path,
     query: &ScanQuery,
     tx: mpsc::Sender<String>,
-    shutdown: Option<watch::Receiver<bool>>,
+    mut shutdown: Option<watch::Receiver<bool>>,
 ) -> Result<(), String> {
     let existing = read_channels(config_dir)?;
     let mut lines = Lines::new(tx);
@@ -1016,7 +1050,11 @@ pub async fn run_scan(
         // reporting it busy (a sequential scan would have done exactly that).
         if matches!(outcome, ChannelOutcome::Busy) {
             if let Some(parallel) = parallel.as_mut() {
-                parallel.wait_all().await;
+                if parallel.wait_all(&mut shutdown, &lines).await {
+                    parallel.abort();
+                    tracing::info!("channel scan cancelled");
+                    return Ok(());
+                }
                 if let Some(retry) = scan_channel_cancellable(
                     manager,
                     &query.type_name,
@@ -1292,8 +1330,37 @@ impl ParallelScan {
 
     /// Lets every remaining task finish, keeping their results in the oneshots,
     /// so a channel can be retried without another task holding the tuner.
-    async fn wait_all(&mut self) {
-        while self.tasks.join_next().await.is_some() {}
+    /// Returns `true` when shutdown/disconnect fired first: the tasks are
+    /// aborted and the caller must stop instead of retrying.
+    async fn wait_all(
+        &mut self,
+        shutdown: &mut Option<watch::Receiver<bool>>,
+        lines: &Lines,
+    ) -> bool {
+        loop {
+            if lines.is_closed() || cancelled(shutdown) {
+                self.abort();
+                return true;
+            }
+            match shutdown {
+                Some(rx) => tokio::select! {
+                    joined = self.tasks.join_next() => {
+                        if joined.is_none() {
+                            return false;
+                        }
+                    }
+                    _ = shutdown_fired(rx) => {
+                        self.abort();
+                        return true;
+                    }
+                },
+                None => {
+                    if self.tasks.join_next().await.is_none() {
+                        return false;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1513,6 +1580,10 @@ async fn scan_channel_watched(
     };
     let Some(acquired) = acquired else {
         tracing::debug!(channel, "scan acquire cancelled by shutdown");
+        // Dropping the acquire stops its reservation asynchronously; wait
+        // for the tuner to leave Starting/Stopping so the next channel does
+        // not report Busy because of this one.
+        wait_for_release(manager, type_name, channel).await;
         return (ChannelOutcome::NoSignal, true);
     };
 
@@ -1536,6 +1607,7 @@ async fn scan_channel_watched(
         }
         Ok(Err(failure)) => {
             tracing::debug!(channel, ?failure, "scan could not acquire a tuner");
+            let unavailable = matches!(failure.error, crate::session::AcquireError::Unavailable);
             let outcome = match failure.error {
                 // SPEC §8: "相手がbusyならskip＋次回retry". Only a genuinely busy
                 // tuner is retried.
@@ -1555,6 +1627,11 @@ async fn scan_channel_watched(
                 ),
                 _ => ChannelOutcome::Failed,
             };
+            if unavailable {
+                // The tuner process was started and failed; its teardown is
+                // asynchronous, so wait for the release like the timeout path.
+                wait_for_release(manager, type_name, channel).await;
+            }
             return (outcome, false);
         }
         Ok(Ok(subscription)) => subscription,
@@ -1624,6 +1701,13 @@ async fn scan_channel_watched(
                     if sink.seen_nit_actual && !first_nit {
                         first_nit = true;
                         tracing::debug!(channel, ms = elapsed.as_millis() as u64, "scan: NIT");
+                    }
+                    if sink.sdt.pending_new_version() && sdt_complete {
+                        // A newer SDT version is being assembled: the old
+                        // grace deadline must not cut it short. Restore the
+                        // full budget and re-arm the latch for the new table.
+                        sdt_complete = false;
+                        read_deadline = deadline;
                     }
                     if sink.is_complete() && !sdt_complete {
                         sdt_complete = true;
@@ -2096,9 +2180,12 @@ pub async fn startup_scan(
                 expected = SERVICE_CACHE_VERSION,
                 "startup scan: unsupported services.json version, scanning"
             );
+            // Stale cache contents must not survive into the new scan.
+            table.clear();
         }
         Ok(Some(_)) => {
             tracing::info!("startup scan: services.json fingerprint changed, scanning");
+            table.clear();
         }
         Ok(None) => tracing::info!("startup scan: no service cache, scanning"),
         Err(error) => {
@@ -2125,7 +2212,7 @@ pub async fn startup_scan(
     let mut pass = 0usize;
     let mut cache_written = false;
     loop {
-        if *shutdown.borrow() {
+        if stopped(&shutdown) {
             tracing::info!(pass, "startup scan stopped");
             return;
         }
@@ -2150,7 +2237,7 @@ pub async fn startup_scan(
 
         // A pass interrupted by shutdown must not sleep (nor write the cache):
         // return right away so the task never outlives the server.
-        if *shutdown.borrow() {
+        if stopped(&shutdown) {
             tracing::info!(pass, "startup scan stopped");
             return;
         }
@@ -2163,10 +2250,13 @@ pub async fn startup_scan(
         let should_write = if cache_written {
             summary.found > 0 && before != table.snapshot()
         } else {
+            // The first cache is written only once the pass is final (nothing
+            // left to retry): a partial first pass must not persist a cache a
+            // later boot would accept while busy channels are still pending.
             // "Nothing left to retry" is only a legitimate empty answer when no
             // tuner failed to start: a config whose tuner is missing must be
             // re-probed on the next boot, not remembered as empty forever.
-            summary.found > 0 || (retry.is_empty() && summary.hard_failures == 0)
+            retry.is_empty() && (summary.found > 0 || summary.hard_failures == 0)
         };
         if should_write {
             // Drop records of channels that are no longer enabled. Busy or
@@ -2469,9 +2559,26 @@ async fn scan_pass(
     }
 
     let mut outcomes: Vec<Option<ChannelOutcome>> = (0..pending.len()).map(|_| None).collect();
+    let mut join_errors = 0usize;
     while let Some(joined) = tasks.join_next().await {
-        if let Ok((index, outcome)) = joined {
-            outcomes[index] = outcome;
+        match joined {
+            Ok((index, outcome)) => outcomes[index] = outcome,
+            Err(error) => {
+                // A panicking task loses its index; count it and attribute it
+                // to a still-missing outcome below so it is not silently
+                // dropped from attempted/hard_failures.
+                join_errors += 1;
+                tracing::warn!(?error, "startup scan task panicked");
+            }
+        }
+    }
+    for outcome in outcomes.iter_mut() {
+        if join_errors == 0 {
+            break;
+        }
+        if outcome.is_none() {
+            *outcome = Some(ChannelOutcome::Failed);
+            join_errors -= 1;
         }
     }
 
@@ -2549,7 +2656,13 @@ fn upsert_startup_services(
     channel: &StartupChannel,
     services: &[FoundService],
 ) -> usize {
-    for service in services {
+    // Same filter as the HTTP scan paths: only scannable service types are
+    // stored, so the startup scan cannot persist e.g. data services.
+    let services: Vec<&FoundService> = services
+        .iter()
+        .filter(|service| SCAN_SERVICE_TYPES.contains(&service.service_type))
+        .collect();
+    for service in &services {
         let mut record = ServiceRecord::new(
             service.network_id,
             service.tsid,

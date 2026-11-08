@@ -162,7 +162,10 @@ pub fn decode_arib_text(bytes: &[u8]) -> String {
         decoded
     };
     cleaned
-        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        // Only ASCII whitespace + NUL: `is_whitespace` also matches U+3000
+        // (ideographic/fullwidth space), which would turn an all-fullwidth-
+        // space name into an empty string.
+        .trim_matches(|c: char| c == '\0' || c.is_ascii_whitespace())
         .to_owned()
 }
 
@@ -839,6 +842,11 @@ pub struct SectionAssembler {
     pids: HashMap<u16, PidState>,
     /// PIDs to assemble, or `None` for every PID.
     interest: Option<HashSet<u16>>,
+    /// Interest set as given at construction, restored by
+    /// [`reset`](Self::reset) so PIDs learned later via
+    /// [`add_interest`](Self::add_interest) (PMT/NIT PIDs learned from a
+    /// PAT) do not survive a reset.
+    initial_interest: Option<HashSet<u16>>,
     /// Table ids to assemble, or `None` for every table.
     tables: Option<HashSet<u8>>,
     /// Packets skipped because their PID was not in [`interest`](Self::interest).
@@ -863,8 +871,10 @@ impl SectionAssembler {
     /// [`add_interest`](Self::add_interest) extends the set later (a PAT names
     /// its PMT PIDs only after it has been parsed).
     pub fn with_interest<I: IntoIterator<Item = u16>>(pids: I) -> Self {
+        let interest: HashSet<u16> = pids.into_iter().collect();
         Self {
-            interest: Some(pids.into_iter().collect()),
+            initial_interest: Some(interest.clone()),
+            interest: Some(interest),
             ..Self::default()
         }
     }
@@ -941,8 +951,6 @@ impl SectionAssembler {
 
         let mut sections: Vec<Vec<u8>> = Vec::new();
         if header.payload_unit_start {
-            // A new section starts here, so any pending skip is obsolete.
-            state.skip = 0;
             let pointer = usize::from(payload[0]);
             let start = 1 + pointer;
             if start > payload.len() {
@@ -953,11 +961,25 @@ impl SectionAssembler {
             if !state.buf.is_empty() {
                 // A new section starts here, so whatever was being assembled
                 // is abandoned. Bytes before the pointer belong to it and may
-                // be enough to finish it.
+                // be enough to finish it. A pending `skip` (the tail of an
+                // allowlist-rejected section) must be applied to these bytes
+                // first: `extend_and_collect` consumes `skip` internally, so
+                // zeroing it before this call would re-parse the rejected
+                // tail as a fresh section. The reset therefore happens only
+                // after this call (via `drop_partial` below).
                 if pointer > 0 {
                     state.extend_and_collect(&payload[1..start], tables, &mut sections);
                 }
                 state.drop_partial();
+            } else {
+                // No buffered section: the pointer bytes are the tail of the
+                // previous section (or stuffing). Apply any pending skip to
+                // them without feeding them into assembly, then clear the
+                // skip before the new section at `start` is parsed.
+                if state.skip > 0 && pointer > 0 {
+                    state.skip = state.skip.saturating_sub(pointer);
+                }
+                state.skip = 0;
             }
             if start < payload.len() {
                 state.extend_and_collect(&payload[start..], tables, &mut sections);
@@ -1006,7 +1028,12 @@ impl SectionAssembler {
         self.pids.values().map(|state| state.skipped).sum()
     }
 
-    /// Forgets every partially assembled section and the continuity state.
+    /// Forgets every partially assembled section and the continuity state,
+    /// and restores the interest set to the one given at construction.
+    ///
+    /// PIDs learned later via [`add_interest`](Self::add_interest) (the
+    /// PMT/NIT PIDs a PAT named) are cleared, so a reset parser does not
+    /// keep assembling PIDs of the previous multiplex.
     ///
     /// The counters stay: [`non_si_packets`](Self::non_si_packets) is cumulative
     /// over the assembler's lifetime, while
@@ -1016,6 +1043,7 @@ impl SectionAssembler {
     pub fn reset(&mut self) {
         self.pids.clear();
         self.leftover.clear();
+        self.interest.clone_from(&self.initial_interest);
     }
 }
 
@@ -1209,7 +1237,10 @@ impl SiParser {
     /// `invalid_sections`, parse-level `ignored_sections`) are kept; the
     /// assembler's own counters restart with its state, so
     /// [`SiStats::non_si_packets`] and the assembler share of
-    /// `ignored_sections` go back to zero.
+    /// `ignored_sections` go back to zero. The assembler's interest set is
+    /// restored to its construction value (see
+    /// [`SectionAssembler::reset`]), so PMT/NIT PIDs learned from a PAT of
+    /// the previous multiplex are forgotten too.
     pub fn reset(&mut self) {
         self.assembler.reset();
         self.leftover.clear();
@@ -2430,6 +2461,66 @@ mod tests {
         let events = parser.push_packets(&packets[split..]);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], SiEvent::Pat(_)));
+    }
+
+    #[test]
+    fn reset_forgets_pids_learned_from_a_pat() {
+        let mut parser = SiParser::new();
+        parser.push_packets(&section_packet(PAT_PID, &pat_section()));
+        assert!(parser.assembler.is_interested(0x01F0));
+        parser.reset();
+        assert!(
+            !parser.assembler.is_interested(0x01F0),
+            "PMT PID learned from the PAT must not survive reset"
+        );
+        assert!(parser.assembler.is_interested(PAT_PID));
+        assert!(parser.assembler.is_interested(NIT_PID));
+        assert!(parser.assembler.is_interested(SDT_PID));
+    }
+
+    #[test]
+    fn an_all_fullwidth_space_name_is_not_trimmed_to_empty() {
+        // JIS X 0208 row 1 col 1 is U+3000 (ideographic space): ESC $ B 21 21.
+        let decoded = decode_arib_text(&[0x1B, 0x24, 0x42, 0x21, 0x21]);
+        assert_eq!(decoded, "\u{3000}");
+        // ASCII whitespace/NUL padding around it is still trimmed.
+        let padded = decode_arib_text(&[
+            0x00, 0x1B, 0x28, 0x4A, b' ', 0x1B, 0x24, 0x42, 0x21, 0x21, 0x00,
+        ]);
+        assert_eq!(padded, "\u{3000}");
+    }
+
+    #[test]
+    fn a_rejected_sections_tail_in_a_pointer_field_is_not_reparsed() {
+        // Long EIT (table 0x4E, not in the allowlist) spanning packets, then a
+        // PUSI packet whose pointer field carries the EIT tail followed by a
+        // valid SDT section.
+        let eit = section(0x4E, 0x0408, vec![0x11; 400]);
+        let eit_packets = section_packets(SDT_PID, &eit, 0);
+        let mut assembler = SectionAssembler::with_interest([SDT_PID]).with_tables([0x42]);
+        // First packet: 183 bytes of the EIT; second: next 184 (continuation).
+        assert!(assembler
+            .push_packet(&eit_packets[..TS_PACKET_SIZE])
+            .is_empty());
+        assert!(assembler
+            .push_packet(&eit_packets[TS_PACKET_SIZE..2 * TS_PACKET_SIZE])
+            .is_empty());
+        assert_eq!(assembler.ignored_sections(), 1);
+
+        let sdt = sdt_section();
+        let consumed = 183 + 184;
+        let tail = &eit[consumed..];
+        assert_eq!(tail.len(), 45);
+        let after_pointer = TS_PACKET_SIZE - 4 - 1 - tail.len();
+        let mut payload = vec![tail.len() as u8];
+        payload.extend_from_slice(tail);
+        payload.extend_from_slice(&sdt[..after_pointer]);
+        let mut sections = assembler.push_packet(&packet(SDT_PID, true, 2, &payload));
+        // Continuation carrying the rest of the SDT.
+        sections.extend(assembler.push_packet(&packet(SDT_PID, false, 3, &sdt[after_pointer..])));
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].bytes, sdt);
+        assert_eq!(assembler.ignored_sections(), 1);
     }
 
     #[test]

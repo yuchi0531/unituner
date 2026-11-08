@@ -2814,7 +2814,19 @@ fn loopback_ip(last: u8) -> SocketAddr {
 // ---------------------------------------------------------------------------
 
 fn playlist_fixture(server: &str) -> Fixture {
-    Fixture::new_with_server(server, &tuners("true"), &channels(&[]), PIPELINE_CAT)
+    // The playlist only lists services whose channel is configured and
+    // enabled, so the fixture must configure every channel the playlist
+    // tables below bind to.
+    let playlist_channels = "\
+- name: GR 2\n  type: GR\n  channel: \"2\"\n\
+- name: GR 26\n  type: GR\n  channel: \"26\"\n\
+- name: GR 27\n  type: GR\n  channel: \"27\"\n\
+- name: BS01\n  type: BS\n  channel: \"BS01\"\n\
+- name: CS01\n  type: CS\n  channel: \"CS01\"\n\
+- name: SKY01\n  type: SKY\n  channel: \"SKY01\"\n\
+- name: AA 1\n  type: AA\n  channel: \"1\"\n\
+- name: ZZ 1\n  type: ZZ\n  channel: \"1\"\n";
+    Fixture::new_with_server(server, &tuners("true"), playlist_channels, PIPELINE_CAT)
 }
 
 fn playlist_table(entries: &[(u16, u8, &str, &str, &str)]) -> ServiceTable {
