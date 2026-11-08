@@ -121,6 +121,13 @@ types:                                # チャンネルタイプ → pipeline �
 - CAS（デスクランブル）は特定実装に依存しない。B25 系のスクランブル解除は外部 B25 デコーダ
   （例: `arib-b25-stream-test`。引数なしで stdin の TS を stdout へ流す）を pipeline の
   1 段として置く。段数・順序はユーザー定義で、TS 変換段はその後段に置く。
+- `passthrough` は予約済みの疑似コマンド。前後の空白を除き ASCII 大文字小文字を無視して
+  **完全一致**した段だけを特別扱いし、外部プロセスを spawn しない。
+  - 全段が `passthrough` の pipeline は、型にバインドしない場合と同じく生 TS をそのまま配信する。
+  - 混合チェーンでは該当段だけを落とす（`["passthrough", "cat"]` と `["cat", "passthrough"]` は
+    どちらも `["cat"]` と同じ）。
+  - `passthrough-x`、`/usr/bin/passthrough`、`passthrough command` などは通常のコマンドとして実行する
+    （typo を黙って疑似コマンド扱いしない）。
 
 ### 3.5 プレースホルダとコマンド実行
 
@@ -133,6 +140,8 @@ types:                                # チャンネルタイプ → pipeline �
 - `{extra_args}` はチャンネル/route 定義由来の信頼済み断片であり、`--lnb 15` のように複数 argv トークンへ展開することを意図するため、`{channel}` の charset ホワイトリスト検証は行わない。ただし定義値自体は §3.3 の規則（引用符・バックスラッシュ・改行を含まない）を満たさなければならない。
   - `{extra_args}` が空文字列のときは何も置換しない。argv 分割が周囲の空白を畳むため、引用符なしの `cmd {channel} {extra_args}` は `["cmd", "<channel>"]` となりトークンが消える。引用した `"{extra_args}"` は空トークン 1 個になる（シェルと同じ）。
   - 未知の `{...}`（例: `{chanel}`, `{extra_argz}`）は空白化せず**そのまま残す**。typo がコマンド側で目に見える形で失敗するようにするため。
+  - `passthrough` の判定はプレースホルダ置換より**前**に行う。疑似コマンド自身は `{channel}` / `{type}` / `{extra_args}` の置換対象にならない
+    （`{channel}` が偶然 `passthrough` に展開されても疑似コマンドにはならない）。
 - コマンドは **argv 分割して直接 spawn** する（`/bin/sh -c` は使わない）。`{channel}`/`{type}` の値は生成時に charset 検証 + クォーティングを通す。
   - config 値と URL パス由来の値（`/api/channels/{type}/{channel}/stream`）は同じ検証関数に通す。URL 由来のメタ文字がシェルに流入しないこと（command injection 防止）。
   - 確定（Phase 1）: `{channel}` の許容文字は ASCII 英数字と `. _ + - : @ ,` のみ（空白・引用符・`\`・`/`・シェルメタ文字は拒否）。{type} は §3.3 の正規表現 `^[A-Za-z0-9][A-Za-z0-9_-]*$`。

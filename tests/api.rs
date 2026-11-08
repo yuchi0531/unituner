@@ -619,6 +619,71 @@ async fn the_channel_stream_returns_the_post_pipeline_bytes() {
 }
 
 #[tokio::test]
+async fn a_passthrough_pipeline_streams_the_raw_tuner_output() {
+    let ts = [packet_bytes(0x11), packet_bytes(0x22), packet_bytes(0x33)].concat();
+    let bound_pipelines =
+        "pipelines:\n  none:\n    - \"passthrough\"\ntypes:\n  GR: { pipeline: none }\n";
+
+    let bound = Fixture::new(
+        &tuners("true"),
+        &channels(&[("NHK", "27")]),
+        bound_pipelines,
+    );
+    let bound_path = bound.write_ts("stream.ts", &ts);
+    std::fs::write(
+        bound.path.join("tuners.yml"),
+        tuners(&streaming_command(&bound_path)),
+    )
+    .expect("rewrite tuners.yml");
+    let bound_state = bound.state();
+
+    let raw = Fixture::new(
+        &tuners("true"),
+        &channels(&[("NHK", "27")]),
+        "pipelines: {}\ntypes: {}\n",
+    );
+    let raw_path = raw.write_ts("stream.ts", &ts);
+    std::fs::write(
+        raw.path.join("tuners.yml"),
+        tuners(&streaming_command(&raw_path)),
+    )
+    .expect("rewrite tuners.yml");
+    let raw_state = raw.state();
+
+    let bound_response = send(
+        &bound_state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream"),
+    )
+    .await;
+    assert_eq!(bound_response.status(), StatusCode::OK);
+    let bound_bytes = read_first_chunk(bound_response.into_body()).await;
+
+    let raw_response = send(
+        &raw_state,
+        PEER,
+        request(Method::GET, "/api/channels/GR/27/stream"),
+    )
+    .await;
+    assert_eq!(raw_response.status(), StatusCode::OK);
+    let raw_bytes = read_first_chunk(raw_response.into_body()).await;
+
+    // The pseudo-command adds no stage, so the bytes are byte-identical.
+    assert_eq!(bound_bytes, ts);
+    assert_eq!(bound_bytes, raw_bytes);
+
+    // The session has the tuner process only; no pipeline child was spawned.
+    let sessions = bound_state.manager.sessions_snapshot();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].pids.len(), 1);
+
+    let tuners_body = send_body(&bound_state, PEER, request(Method::GET, "/api/tuners"))
+        .await
+        .2;
+    assert_eq!(json(&tuners_body)[0]["isUsing"], true);
+}
+
+#[tokio::test]
 async fn head_returns_the_stream_headers_without_a_body() {
     let (fixture, _) = stream_fixture();
     let state = fixture.state();

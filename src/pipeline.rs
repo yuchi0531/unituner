@@ -90,7 +90,17 @@ pub struct PipelineSpec {
 
 impl PipelineSpec {
     /// Builds a spec from the raw command strings of `pipelines.yml`.
+    ///
+    /// Stages that are exactly the `passthrough` pseudo-command (after
+    /// trimming, ASCII case-insensitively) are dropped. A spec made only of
+    /// those therefore has no stages and delivers the tuner stream unchanged.
     pub fn new(commands: Vec<String>) -> Self {
+        let mut commands = commands;
+        let reduced = commands.len();
+        commands.retain(|command| !is_passthrough(command));
+        if reduced > 0 && commands.is_empty() {
+            tracing::debug!("pipeline reduced to passthrough");
+        }
         Self { commands }
     }
 
@@ -596,8 +606,10 @@ pub async fn spawn_tuner_command(
 /// stdout. If any stage fails to spawn, the stages already started are killed
 /// before the error is returned.
 ///
-/// An empty `commands` list yields a pass-through handle with no children
-/// (SPEC §3.4: a type without a pipeline binding delivers the raw TS).
+/// Stages that are exactly the `passthrough` pseudo-command (after trimming,
+/// ASCII case-insensitively) are dropped, matching [`PipelineSpec::new`]. A
+/// list that is empty after the filter yields a pass-through handle with no
+/// children (SPEC §3.4: a type without a pipeline binding delivers the raw TS).
 pub async fn spawn_pipeline(
     commands: &[String],
     ctx: &PipelineCtx,
@@ -605,12 +617,20 @@ pub async fn spawn_pipeline(
     // Validate even for an empty chain: the values belong to the session, and a
     // bad one must fail consistently whether or not a pipeline is bound.
     validate_vars(&ctx.vars)?;
-    if commands.is_empty() {
+
+    let stages: Vec<&String> = commands
+        .iter()
+        .filter(|command| !is_passthrough(command))
+        .collect();
+    if stages.is_empty() {
+        if !commands.is_empty() {
+            tracing::debug!(label = %ctx.label, "pipeline reduced to passthrough");
+        }
         return Ok(PipelineHandle::passthrough(ctx.label.clone()));
     }
 
-    let mut plan = Vec::with_capacity(commands.len());
-    for command in commands {
+    let mut plan = Vec::with_capacity(stages.len());
+    for command in stages {
         let expanded = substitute(command, &ctx.vars);
         let argv = shell_split(&expanded);
         if argv.is_empty() || argv[0].is_empty() {
@@ -626,6 +646,15 @@ pub async fn spawn_pipeline(
     }
 
     spawn_chain(&plan, &ctx.label).await
+}
+
+/// Whether `command` is the `passthrough` pseudo-command.
+///
+/// Only the exact token is special: surrounding whitespace is ignored and the
+/// match is ASCII case-insensitive. `passthrough-x`, `/usr/bin/passthrough`
+/// and `passthrough something` are ordinary command lines.
+fn is_passthrough(command: &str) -> bool {
+    command.trim().eq_ignore_ascii_case("passthrough")
 }
 
 /// Validates the `{channel}` / `{type}` values used for substitution.
@@ -991,6 +1020,64 @@ mod tests {
         // Unbound type and a dangling binding both deliver the raw TS.
         assert!(PipelineSpec::for_type(&config, "CS").is_empty());
         assert!(PipelineSpec::for_type(&config, "BS").is_empty());
+    }
+
+    #[test]
+    fn passthrough_stages_are_dropped_from_the_spec() {
+        assert!(PipelineSpec::new(vec!["passthrough".to_string()]).is_empty());
+        assert!(PipelineSpec::new(vec!["Passthrough".to_string()]).is_empty());
+        assert!(PipelineSpec::new(vec!["  passthrough  ".to_string()]).is_empty());
+        assert!(
+            PipelineSpec::new(vec!["passthrough".to_string(), "passthrough".to_string()])
+                .is_empty()
+        );
+
+        assert_eq!(
+            PipelineSpec::new(vec!["passthrough".to_string(), "cat".to_string()]).commands,
+            ["cat"]
+        );
+        assert_eq!(
+            PipelineSpec::new(vec!["cat".to_string(), "passthrough".to_string()]).commands,
+            ["cat"]
+        );
+
+        // Only the exact token is special; longer names stay real commands.
+        assert_eq!(
+            PipelineSpec::new(vec!["passthrough-x".to_string()]).commands,
+            ["passthrough-x"]
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_pipeline_filters_passthrough_before_spawning() {
+        let mut pipeline = spawn_pipeline(&["passthrough".to_string()], &ctx())
+            .await
+            .expect("spawn");
+        assert!(pipeline.pids().is_empty());
+        assert!(pipeline.take_stdin().is_none());
+        assert!(pipeline.take_stdout().is_none());
+        assert!(!pipeline.is_alive());
+        pipeline.stop().await;
+
+        // Mixed chains keep only the real stages, in order.
+        for commands in [["passthrough", "cat"], ["cat", "passthrough"]] {
+            let pipeline = spawn_pipeline(&commands.map(str::to_string), &ctx())
+                .await
+                .expect("spawn mixed chain");
+            assert_eq!(pipeline.pids().len(), 1);
+            assert!(pipeline.is_alive());
+            pipeline.stop().await;
+        }
+
+        let pipeline = spawn_pipeline(
+            &["passthrough".to_string(), "passthrough".to_string()],
+            &ctx(),
+        )
+        .await
+        .expect("spawn all-passthrough chain");
+        assert!(pipeline.pids().is_empty());
+        assert!(!pipeline.is_alive());
+        pipeline.stop().await;
     }
 
     #[test]

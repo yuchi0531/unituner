@@ -165,12 +165,16 @@ pipelines:
   cas4k:
     - "arib-b25-stream-test"
     - "ts-converter <args>"
+  none:
+    - "passthrough"       # 何もしない（生 TS をそのまま流す）
 types:
   GR: { pipeline: cas }
   BS: { pipeline: cas4k }
 ```
 
 - 型にバインドしない場合は生 TS をそのまま配信する（`types` に書かなければよい）。
+- 段として `passthrough` とだけ書くと、外部プロセスを spawn しない疑似コマンドになる（前後の空白を除き ASCII 大文字小文字を無視して完全一致）。
+  全段が `passthrough` ならバインドなしと同じ生 TS になり、混合チェーンではその段だけが除かれる。`passthrough` はプレースホルダ置換より前に判定される。
 - 各段は `setsid` で独立したプロセスグループになる。停止はグループ全体へ SIGTERM → 2 秒の猶予 → SIGKILL。
 - 段の stderr はセッションラベルと段番号付きでログに出る（`error` / `fail` / `fatal` を含む行は `warn`）。
 - コマンドが 1 つも起動できなかった場合、起動済みの段は kill され、セッションは作られない。

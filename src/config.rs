@@ -1192,6 +1192,26 @@ types: {}
     }
 
     #[test]
+    fn a_passthrough_pipeline_is_accepted() {
+        // One `passthrough` stage satisfies the "at least one command" rule;
+        // at runtime it spawns nothing and delivers the raw TS (SPEC §3.4).
+        let pipelines = r#"
+pipelines:
+  none:
+    - "passthrough"
+types:
+  GR: { pipeline: none }
+"#;
+        let config = Fixture::new(SERVER, TUNERS, CHANNELS, pipelines)
+            .load()
+            .expect("passthrough pipeline is valid");
+        assert_eq!(
+            config.pipelines.pipelines["none"],
+            vec!["passthrough".to_string()]
+        );
+    }
+
+    #[test]
     fn empty_pipelines_map_is_accepted_as_raw_ts() {
         // No pipelines at all: every type streams raw TS (SPEC §3.4).
         let pipelines = r#"
