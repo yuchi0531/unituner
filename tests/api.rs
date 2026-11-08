@@ -17,6 +17,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 use unituner::api::{router, AppState};
 use unituner::config::Config;
+use unituner::scan::startup_scan;
 use unituner::services::{ServiceRecord, ServiceTable};
 use unituner::si::crc32_mpeg2;
 use unituner::tsfilter::ServiceFilter;
@@ -298,6 +299,22 @@ fn packet_bytes(seed: u8) -> Vec<u8> {
     let mut packet = vec![seed; TS_PACKET_SIZE];
     packet[0] = 0x47;
     packet
+}
+
+/// Bytes with no `0x47` sync byte at all, like a TLV/MMT stream.
+fn tlv_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for index in 0..256u16 {
+        bytes.extend_from_slice(&[
+            0x80 | ((index >> 8) as u8 & 0x01),
+            0xA0 | (index as u8 & 0x1F),
+            0x12,
+            0x34,
+            0x56,
+            0x78,
+        ]);
+    }
+    bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +633,90 @@ async fn the_channel_stream_returns_the_post_pipeline_bytes() {
 
     let first = read_first_chunk(response.into_body()).await;
     assert_eq!(first, ts);
+}
+
+#[tokio::test]
+async fn a_tlv_type_streams_converted_ts_and_decode_zero_returns_raw_tlv() {
+    let tlv = tlv_bytes();
+    let ts = scan_multiplex();
+    let fixture = Fixture::new(
+        &tuners("true"),
+        "- name: BS4K\n  type: BS4K\n  channel: \"BS01\"\n",
+        "pipelines:\n  mmt:\n    - \"passthrough\"\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n",
+    );
+    let tlv_path = fixture.write_ts("tlv.bin", &tlv);
+    let ts_path = fixture.write_ts("multiplex.ts", &ts);
+    let capture = fixture.path.join("pipeline-stdin.bin");
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: bs4k\n  types: [BS4K]\n  command: 'cat {}'\n",
+            tlv_path.display()
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    let pipelines = format!(
+        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt, input: tlv }}\n",
+        capture.display(),
+        ts_path.display()
+    );
+    std::fs::write(fixture.path.join("pipelines.yml"), pipelines).expect("write pipelines.yml");
+
+    let state = fixture.state();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::spawn(startup_scan(
+            state.manager.clone(),
+            state.config.clone(),
+            state.config_dir.clone(),
+            shutdown_rx,
+        )),
+    )
+    .await
+    .expect("startup scan finished")
+    .expect("startup scan task");
+
+    // The scan parsed the pipeline's TS and learned the two services.
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    assert_eq!(status, StatusCode::OK);
+    let services = json(&body);
+    assert_eq!(
+        services.as_array().expect("services array").len(),
+        2,
+        "{services}"
+    );
+    assert_eq!(services[0]["name"], "NHK General");
+    assert_eq!(services[0]["channel"]["type"], "BS4K");
+    let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
+    assert_eq!(recorded, tlv, "the converter must have seen raw TLV");
+
+    // The channel stream is the converted, 188-aligned TS.
+    let response = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/BS4K/BS01/stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = read_all(response.into_body()).await;
+    assert_eq!(first[0], 0x47);
+    assert_eq!(first.len() % TS_PACKET_SIZE, 0, "{}", first.len());
+    assert_eq!(first, ts);
+
+    // `decode=0` bypasses the pipeline and therefore delivers raw TLV for this
+    // type, not 188-byte TS (SPEC §4.1).
+    let response = send(
+        &state,
+        PEER,
+        request(Method::GET, "/api/channels/BS4K/BS01/stream?decode=0"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = read_all(response.into_body()).await;
+    assert_eq!(raw, tlv);
+    assert_ne!(raw[0], 0x47);
+    assert_ne!(raw.len() % TS_PACKET_SIZE, 0, "{}", raw.len());
 }
 
 #[tokio::test]

@@ -457,6 +457,80 @@ async fn startup_scan_populates_the_table_for_a_working_channel() {
     manager.shutdown().await;
 }
 
+/// Bytes with no `0x47` sync byte at all, like a TLV/MMT stream.
+fn tlv_bytes() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for index in 0..256u16 {
+        bytes.extend_from_slice(&[
+            0x80 | ((index >> 8) as u8 & 0x01),
+            0xA0 | (index as u8 & 0x1F),
+            0x12,
+            0x34,
+            0x56,
+            0x78,
+        ]);
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn startup_scan_finds_services_behind_a_tlv_pipeline() {
+    // The tuner emits TLV: the TS normalizer would discard this whole stream.
+    // The pipeline records its stdin and turns TLV into the synthetic TS.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let tlv = tlv_bytes();
+    let tlv_path = fixture.write_ts("tlv.bin", &tlv);
+    let ts = fixture.write_ts("mux.ts", &multiplex());
+    let capture = fixture.path.join("pipeline-stdin.bin");
+    let tuners_yml = format!(
+        "- name: bs4k\n  types: [BS4K]\n  command: 'cat {}'\n",
+        tlv_path.display()
+    );
+    std::fs::write(fixture.path.join("tuners.yml"), tuners_yml).expect("rewrite tuners.yml");
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        "- name: BS4K\n  type: BS4K\n  channel: \"BS01\"\n",
+    )
+    .expect("write channels.yml");
+    let pipelines = format!(
+        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt, input: tlv }}\n",
+        capture.display(),
+        ts.display()
+    );
+    std::fs::write(fixture.path.join("pipelines.yml"), pipelines).expect("write pipelines.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::spawn(startup_scan(
+            manager.clone(),
+            fixture.config(),
+            fixture.path.clone(),
+            shutdown_rx,
+        )),
+    )
+    .await
+    .expect("startup scan finished")
+    .expect("startup scan task");
+
+    let services = manager.services().list();
+    assert_eq!(services.len(), 2, "{services:?}");
+    assert_eq!(services[0].name, "NHK General");
+    assert_eq!(
+        services[0].channel,
+        Some(("BS4K".to_string(), "BS01".to_string()))
+    );
+
+    // Stage 0 received the tuner bytes byte-for-byte: no TS sync detection
+    // (which would have thrown TLV away) ran before the converter.
+    let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
+    assert_eq!(recorded, tlv);
+
+    assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn startup_scan_leaves_the_table_empty_when_the_tuner_fails() {
     // The only channel's tuner exits before producing any byte.
