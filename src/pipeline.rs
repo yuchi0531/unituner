@@ -197,10 +197,12 @@ pub enum PipelineError {
         reason: String,
     },
     /// `spawn` failed for one stage.
-    #[error("failed to spawn stage {stage} ({command:?}): {source}")]
+    #[error("failed to spawn stage {stage} ({argv:?}): {source}")]
     Spawn {
         stage: usize,
-        command: String,
+        /// The expanded argv that was actually handed to `spawn`, not the
+        /// `{channel}` template. Kept to one line by [`argv_summary`].
+        argv: String,
         #[source]
         source: io::Error,
     },
@@ -590,7 +592,6 @@ pub async fn spawn_tuner_command(
     }
 
     let plan = [SpawnPlan {
-        command: command.to_string(),
         argv,
         stdin_piped: false,
     }];
@@ -639,7 +640,6 @@ pub async fn spawn_pipeline(
             });
         }
         plan.push(SpawnPlan {
-            command: command.clone(),
             argv,
             stdin_piped: true,
         });
@@ -678,11 +678,32 @@ fn validate_vars(vars: &CommandVars) -> Result<(), PipelineError> {
 
 /// One stage to spawn.
 struct SpawnPlan {
-    command: String,
     argv: Vec<String>,
     /// Whether stdin is a pipe owned by the caller (`spawn_pipeline`) instead
     /// of `/dev/null` (`spawn_tuner_command`).
     stdin_piped: bool,
+}
+
+/// Renders the argv of one stage for a spawn failure.
+///
+/// The template (`command`) is deliberately not used: it still shows
+/// `{channel}`, which hides the program and argument that were actually
+/// executed. Control characters are collapsed so the error stays one line, and
+/// the result is capped well below the progress line's ~200-char budget (the
+/// spawn stage prefix and the OS error are added on top).
+fn argv_summary(argv: &[String]) -> String {
+    const MAX_CHARS: usize = 140;
+    let one_line = argv
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one_line.chars().count() <= MAX_CHARS {
+        return one_line;
+    }
+    let mut truncated: String = one_line.chars().take(MAX_CHARS - 3).collect();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, PipelineError> {
@@ -712,7 +733,7 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
                     let stdio: Stdio =
                         stdout.try_into().map_err(|source| PipelineError::Spawn {
                             stage,
-                            command: stage_plan.command.clone(),
+                            argv: argv_summary(&stage_plan.argv),
                             source,
                         })?;
                     command.stdin(stdio);
@@ -775,7 +796,7 @@ async fn spawn_chain(plan: &[SpawnPlan], label: &str) -> Result<PipelineHandle, 
                 let _ = handle.wait().await;
                 return Err(PipelineError::Spawn {
                     stage,
-                    command: stage_plan.command.clone(),
+                    argv: argv_summary(&stage_plan.argv),
                     source,
                 });
             }
@@ -1130,6 +1151,40 @@ mod tests {
                 })
             ));
         });
+    }
+
+    #[test]
+    fn a_spawn_error_reports_the_expanded_argv_instead_of_the_template() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let vars = CommandVars::new("27", "GR");
+        runtime.block_on(async {
+            let error = spawn_tuner_command("/nonexistent/unituner-tuner {channel}", &vars)
+                .await
+                .expect_err("the missing program must fail to spawn");
+            let message = error.to_string();
+            assert!(
+                message.contains("/nonexistent/unituner-tuner 27"),
+                "the expanded argv must be visible: {message}"
+            );
+            assert!(
+                !message.contains("{channel}"),
+                "the unsubstituted template must not leak: {message}"
+            );
+            assert!(!message.contains('\n'), "the message must stay one line");
+        });
+    }
+
+    #[test]
+    fn argv_summary_is_one_short_line() {
+        let argv = vec!["sh".to_string(), "-c".to_string(), "x\n".repeat(200)];
+        let summary = argv_summary(&argv);
+        assert!(!summary.contains('\n'), "{summary}");
+        assert_eq!(summary.chars().count(), 140, "{summary}");
+        assert!(summary.ends_with("..."), "{summary}");
+        assert_eq!(argv_summary(&["cat".to_string()]), "cat");
     }
 
     #[tokio::test]
