@@ -39,9 +39,46 @@
 //! two networks) the result is [`SidLookupError::Ambiguous`] (which the API
 //! maps to 404). Scanning is channel-scoped, so the scan path should use
 //! [`resolve_on_channel`](ServiceTable::resolve_on_channel) instead.
+//!
+//! # Persistent cache (`services.json`, SPEC §8.2)
+//!
+//! The table can be snapshotted to `config_dir/services.json` and restored at
+//! startup, so the API serves the last scan's services without tuning anything.
+//! The file carries the [`SERVICE_CACHE_VERSION`], a fingerprint of the enabled
+//! `channels.yml` entries (see [`service_fingerprint`]) and an RFC3339 UTC
+//! `generated_at` stamp.
+//!
+//! The cache has **no expiry**: it stays valid until the fingerprint changes
+//! (a channel was added, removed, disabled or had its routes / extra-args
+//! edited) or the operator presses the WebUI Re-scan button. A broadcast
+//! reorganisation that only changes service names / ids therefore keeps the old
+//! cache until the manual re-scan.
+//!
+//! Writes mirror the other configuration writes: `services.json.tmp` →
+//! `fsync` → `rename`, with mode `0600` on Unix (an existing mode is preserved).
+//! A failed write is a warning only; the in-memory table stays authoritative.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::ChannelConfig;
+
+/// The file name of the persistent service cache (SPEC §8.2).
+pub const SERVICE_CACHE_FILE: &str = "services.json";
+
+/// Schema version written into `services.json`.
+pub const SERVICE_CACHE_VERSION: u32 = 1;
+
+/// Prefix of the canonical string hashed by [`service_fingerprint`].
+///
+/// Bumping this (or changing the canonical encoding) deliberately invalidates
+/// every existing cache.
+const FINGERPRINT_SCHEMA: &str = "unituner-services-v1";
 
 /// Identifier of a service: `network_id * 100_000 + service_id`.
 ///
@@ -108,7 +145,7 @@ pub enum SidLookupError {
 }
 
 /// One service known to the server.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServiceRecord {
     /// Network id the service belongs to.
     pub network_id: u16,
@@ -122,13 +159,17 @@ pub struct ServiceRecord {
     /// ARIB-decoded service name.
     pub name: String,
     /// Remote-control key id from the NIT TS information descriptor, if known.
+    #[serde(default)]
     pub remote_control_key_id: Option<u8>,
     /// `(type, channel)` this service was found on, once the scan knows it.
+    #[serde(default)]
     pub channel: Option<(String, String)>,
     /// PID of the service's PMT, once a PAT has been seen.
+    #[serde(default)]
     pub pmt_pid: Option<u16>,
     /// Whether logo (CDT) data is available. Always `false`: SPEC §1 excludes
     /// logo handling, and §9 reports `hasLogoData: false`.
+    #[serde(default)]
     pub has_logo_data: bool,
 }
 
@@ -436,6 +477,28 @@ impl ServiceTable {
         records
     }
 
+    /// A stable snapshot of the table, used to persist it (`services.json`).
+    ///
+    /// Same order as [`list`](Self::list), so two snapshots of an unchanged
+    /// table compare equal and the cache writer can tell whether a retry pass
+    /// actually changed anything.
+    pub fn snapshot(&self) -> Vec<ServiceRecord> {
+        self.list()
+    }
+
+    /// Replaces the whole table with `records` (restoring `services.json`).
+    ///
+    /// Records are keyed exactly as [`upsert`](Self::upsert) keys them. A
+    /// duplicate key keeps the last record, which can only happen with a
+    /// hand-edited cache.
+    pub fn restore(&self, records: Vec<ServiceRecord>) {
+        let mut stored = self.write();
+        stored.clear();
+        for record in records {
+            stored.insert(ServiceKey::of(&record), record);
+        }
+    }
+
     /// Every record received on `(channel_type, channel)`, in list order.
     pub fn list_by_channel(&self, channel_type: &str, channel: &str) -> Vec<ServiceRecord> {
         let mut records: Vec<ServiceRecord> = self
@@ -654,6 +717,26 @@ impl ServiceTable {
         self.write().clear();
     }
 
+    /// Keeps only records bound to one of `channels` (`(type, channel)`).
+    ///
+    /// This is the channel-level retain step of a full re-scan: a channel that
+    /// was removed from `channels.yml` or set `disabled: true` loses its
+    /// records, while an enabled channel whose tuner was busy or had no signal
+    /// keeps the records the previous scan stored (it is still in `keep`).
+    /// Unbound records (no channel binding) are dropped as well. Returns how
+    /// many records were removed.
+    pub fn retain_bound_channels(&self, keep: &HashSet<(String, String)>) -> usize {
+        let mut records = self.write();
+        let before = records.len();
+        records.retain(|_, record| match &record.channel {
+            Some((channel_type, channel)) => {
+                keep.contains(&(channel_type.clone(), channel.clone()))
+            }
+            None => false,
+        });
+        before - records.len()
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<ServiceKey, ServiceRecord>> {
         self.records
             .read()
@@ -665,6 +748,260 @@ impl ServiceTable {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The persistent service table (`services.json`, SPEC §8.2).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServiceCache {
+    /// Must be [`SERVICE_CACHE_VERSION`]; an unknown version is ignored.
+    pub version: u32,
+    /// Fingerprint of the enabled `channels.yml` entries.
+    pub fingerprint: String,
+    /// RFC3339 UTC time the snapshot was written.
+    pub generated_at: String,
+    /// The services, in [`ServiceTable::snapshot`] order.
+    pub services: Vec<ServiceRecord>,
+}
+
+/// Path of `services.json` inside `config_dir`.
+pub fn service_cache_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(SERVICE_CACHE_FILE)
+}
+
+/// Reads and parses `services.json`.
+///
+/// `Ok(None)` means the file does not exist (the normal first boot); an
+/// unreadable or malformed file is an `Err` for the caller to warn about and
+/// treat as "no cache". The schema version and fingerprint are checked by the
+/// caller because only it knows which failure should trigger a scan.
+pub fn read_service_cache(config_dir: &Path) -> Result<Option<ServiceCache>, String> {
+    let path = service_cache_path(config_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    let cache = serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    Ok(Some(cache))
+}
+
+/// Loads the cache into a [`ServiceTable`] for startup.
+///
+/// A missing or corrupt cache only warns (a missing file is silent at info
+/// level) and yields an empty table; startup must never be aborted by a cache.
+pub fn load_service_cache(config_dir: &Path) -> ServiceTable {
+    let table = ServiceTable::new();
+    match read_service_cache(config_dir) {
+        Ok(Some(cache)) if cache.version == SERVICE_CACHE_VERSION => {
+            tracing::info!(
+                services = cache.services.len(),
+                generated_at = %cache.generated_at,
+                "restored services.json"
+            );
+            table.restore(cache.services);
+        }
+        Ok(Some(cache)) => tracing::warn!(
+            version = cache.version,
+            expected = SERVICE_CACHE_VERSION,
+            "ignoring services.json with an unsupported version"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "ignoring an unreadable services.json"),
+    }
+    table
+}
+
+/// FNV-1a 64 over the canonical encoding of the enabled channels.
+///
+/// `DefaultHasher` / `RandomState` are explicitly not used: their output is not
+/// guaranteed stable across Rust versions, and the fingerprint is persisted.
+///
+/// The canonical input is (in order):
+///
+/// * the schema constant [`FINGERPRINT_SCHEMA`],
+/// * every **enabled** entry (disabled entries are excluded), sorted by
+///   `(type, channel)`, contributing `type`, `channel`, `extra-args`, the route
+///   count and then each route's `tuner`, optional `channel` and optional
+///   `extra-args`.
+///
+/// Every string is length-prefixed, so a field containing the encoding's
+/// separators cannot collide with another field. `tuners.yml` is deliberately
+/// not part of the fingerprint: a channel's services belong to the broadcast,
+/// not to the tuner definition that receives it.
+pub fn service_fingerprint(channels: &[ChannelConfig]) -> String {
+    let mut canonical = Vec::new();
+    push_fingerprint_field(&mut canonical, FINGERPRINT_SCHEMA);
+
+    let mut enabled: Vec<&ChannelConfig> = channels
+        .iter()
+        .filter(|channel| !channel.disabled)
+        .collect();
+    enabled.sort_by(|left, right| {
+        (left.channel_type.as_str(), left.channel.as_str())
+            .cmp(&(right.channel_type.as_str(), right.channel.as_str()))
+    });
+
+    for channel in enabled {
+        push_fingerprint_field(&mut canonical, &channel.channel_type);
+        push_fingerprint_field(&mut canonical, &channel.channel);
+        push_fingerprint_field(&mut canonical, &channel.extra_args);
+        canonical.extend_from_slice(&(channel.routes.len() as u64).to_be_bytes());
+        for route in &channel.routes {
+            push_fingerprint_field(&mut canonical, &route.tuner);
+            push_fingerprint_optional(&mut canonical, route.channel.as_deref());
+            push_fingerprint_optional(&mut canonical, route.extra_args.as_deref());
+        }
+    }
+
+    format!("{:016x}", fnv1a(&canonical))
+}
+
+fn push_fingerprint_field(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn push_fingerprint_optional(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_fingerprint_field(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
+/// FNV-1a 64 (the same primitive the webui uses for its ETag).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Serialises one lock for the cache writer. The scan lock only serialises
+/// scans; a startup-scan write and a manual re-scan write can still overlap, so
+/// they must not share the fixed `services.json.tmp` path unprotected.
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Writes the current table to `services.json` atomically.
+///
+/// Called only after a completed scan pass; a failure is a warning for the
+/// caller and leaves the previous file untouched. The table itself is never
+/// changed by a failed write.
+pub fn write_service_cache(
+    config_dir: &Path,
+    fingerprint: &str,
+    table: &ServiceTable,
+) -> Result<(), String> {
+    let _guard = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = ServiceCache {
+        version: SERVICE_CACHE_VERSION,
+        fingerprint: fingerprint.to_owned(),
+        generated_at: generated_at(),
+        services: table.snapshot(),
+    };
+    let json = serde_json::to_vec(&cache)
+        .map_err(|error| format!("failed to serialize {SERVICE_CACHE_FILE}: {error}"))?;
+    let path = service_cache_path(config_dir);
+    let tmp = config_dir.join(format!("{SERVICE_CACHE_FILE}.tmp"));
+    write_cache_atomically(&path, &tmp, &json)
+}
+
+/// The atomic replacement: create/truncate `tmp` with `0600`, fsync, rename.
+///
+/// Mirrors the configuration writes (`store::write_atomic` / the scan's
+/// `write_atomically`): an existing `services.json` keeps its mode across the
+/// rename, and a failed write removes the temporary file.
+fn write_cache_atomically(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    let original_mode = path.metadata().ok().map(|metadata| {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    });
+
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A leftover tmp from a crashed write may already exist with another
+            // mode; apply the desired mode to the handle (also ignores umask).
+            file.set_permissions(std::fs::Permissions::from_mode(
+                original_mode.unwrap_or(0o600),
+            ))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(tmp, path)?;
+        // Best effort: persist the rename itself.
+        if let Some(dir) = path.parent() {
+            if let Ok(handle) = std::fs::File::open(dir) {
+                let _ = handle.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result.map_err(|error| format!("failed to write {}: {error}", path.display()))
+}
+
+/// RFC3339 UTC with millisecond precision, e.g. `2026-11-09T12:34:56.789Z`.
+///
+/// `std::time` only gives an epoch offset; the civil-date conversion is the
+/// standard days-from-civil algorithm, written out rather than adding a
+/// time-formatting dependency for one field.
+fn generated_at() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = elapsed.as_secs() as i64;
+    let millis = elapsed.subsec_millis();
+
+    let days = seconds.div_euclid(86_400);
+    let second_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// Converts days since 1970-01-01 into a proleptic Gregorian `(year, month,
+/// day)`. (Howard Hinnant's `civil_from_days`.)
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month as u32, day as u32)
 }
 
 #[cfg(test)]
@@ -1210,5 +1547,197 @@ mod tests {
             table.get(ServiceItemId::new(1, 7)).expect("record").name,
             "shared"
         );
+    }
+
+    #[test]
+    fn snapshot_and_restore_round_trip_the_table() {
+        let table = ServiceTable::new();
+        table.insert(on_channel(2, 20, 30, "second", "GR", "27"));
+        let mut first = on_channel(1, 10, 10, "first", "GR", "27");
+        first.pmt_pid = Some(0x1F0);
+        first.remote_control_key_id = Some(3);
+        table.insert(first);
+
+        let snapshot = table.snapshot();
+        assert_eq!(snapshot, table.list(), "snapshot keeps list order");
+
+        let restored = ServiceTable::new();
+        restored.restore(snapshot.clone());
+        assert_eq!(restored.snapshot(), snapshot);
+
+        // restore replaces the whole table rather than merging into it.
+        restored.restore(Vec::new());
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn retain_bound_channels_drops_removed_and_disabled_channels_only() {
+        let table = ServiceTable::new();
+        table.insert(on_channel(1, 10, 10, "keep", "GR", "27"));
+        table.insert(on_channel(1, 10, 11, "removed", "GR", "28"));
+        table.insert(record(1, 10, 12, "unbound"));
+
+        let keep: HashSet<(String, String)> = HashSet::from([("GR".to_owned(), "27".to_owned())]);
+        assert_eq!(table.retain_bound_channels(&keep), 2);
+        assert_eq!(table.len(), 1);
+        assert!(table
+            .get_on_channel("GR", "27", ServiceItemId::new(1, 10))
+            .is_some());
+    }
+
+    fn config_channel(
+        channel_type: &str,
+        channel: &str,
+        extra_args: &str,
+        disabled: bool,
+        routes: Vec<crate::config::ChannelRouteConfig>,
+    ) -> crate::config::ChannelConfig {
+        crate::config::ChannelConfig {
+            name: format!("{channel_type}-{channel}"),
+            channel_type: channel_type.to_owned(),
+            channel: channel.to_owned(),
+            extra_args: extra_args.to_owned(),
+            disabled,
+            routes,
+        }
+    }
+
+    fn route(
+        tuner: &str,
+        channel: Option<&str>,
+        extra_args: Option<&str>,
+    ) -> crate::config::ChannelRouteConfig {
+        crate::config::ChannelRouteConfig {
+            tuner: tuner.to_owned(),
+            channel: channel.map(str::to_owned),
+            extra_args: extra_args.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_canonical_over_enabled_channels() {
+        let a = config_channel("GR", "27", "", false, Vec::new());
+        let b = config_channel("BS", "BS13_1", "", false, Vec::new());
+
+        let forward = service_fingerprint(&[a.clone(), b.clone()]);
+        let backward = service_fingerprint(&[b, a.clone()]);
+        assert_eq!(forward, backward, "the entry order must not matter");
+
+        // Disabled entries are not part of the fingerprint.
+        let disabled = config_channel("CS", "CS01", "", true, Vec::new());
+        assert_eq!(
+            service_fingerprint(&[a.clone(), disabled]),
+            service_fingerprint(&[a])
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_extra_args_and_route_overrides() {
+        let base = config_channel("GR", "27", "", false, Vec::new());
+        let fingerprinted = service_fingerprint(std::slice::from_ref(&base));
+
+        let extra = config_channel("GR", "27", "--lnb 15", false, Vec::new());
+        assert_ne!(service_fingerprint(&[extra]), fingerprinted);
+
+        let routed = config_channel(
+            "GR",
+            "27",
+            "",
+            false,
+            vec![
+                route("t0", Some("13"), Some("--lnb 20")),
+                route("t1", None, None),
+            ],
+        );
+        assert_ne!(
+            service_fingerprint(std::slice::from_ref(&routed)),
+            fingerprinted
+        );
+
+        let reordered = config_channel(
+            "GR",
+            "27",
+            "",
+            false,
+            vec![
+                route("t1", None, None),
+                route("t0", Some("13"), Some("--lnb 20")),
+            ],
+        );
+        assert_ne!(
+            service_fingerprint(&[reordered]),
+            service_fingerprint(&[routed]),
+            "route order is part of the fingerprint"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_a_stable_hex_string() {
+        let fingerprint = service_fingerprint(&[config_channel("GR", "27", "", false, Vec::new())]);
+        assert_eq!(fingerprint.len(), 16);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    fn cache_fixture() -> (tempfile::TempDir, ServiceTable) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let table = ServiceTable::new();
+        let mut record = on_channel(1, 10, 7, "cached", "GR", "27");
+        record.pmt_pid = Some(0x1F0);
+        table.insert(record);
+        (dir, table)
+    }
+
+    #[test]
+    fn service_cache_round_trips_and_keeps_the_schema() {
+        let (dir, table) = cache_fixture();
+        write_service_cache(dir.path(), "abc123", &table).expect("write cache");
+
+        let path = service_cache_path(dir.path());
+        assert!(path.exists());
+        assert!(!dir.path().join("services.json.tmp").exists());
+
+        let cache = read_service_cache(dir.path())
+            .expect("read cache")
+            .expect("present");
+        assert_eq!(cache.version, SERVICE_CACHE_VERSION);
+        assert_eq!(cache.fingerprint, "abc123");
+        assert!(cache.generated_at.ends_with('Z'));
+        assert_eq!(cache.services, table.snapshot());
+
+        let restored = load_service_cache(dir.path());
+        assert_eq!(restored.snapshot(), table.snapshot());
+    }
+
+    #[test]
+    fn a_missing_cache_is_none_not_an_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(read_service_cache(dir.path()), Ok(None));
+        assert!(load_service_cache(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_or_old_cache_is_ignored_at_startup() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join(SERVICE_CACHE_FILE), "{\"version\":")
+            .expect("write truncated cache");
+        assert!(read_service_cache(dir.path()).is_err());
+        assert!(load_service_cache(dir.path()).is_empty());
+
+        std::fs::write(
+            dir.path().join(SERVICE_CACHE_FILE),
+            "{\"version\":99,\"fingerprint\":\"x\",\"generated_at\":\"\",\"services\":[]}",
+        )
+        .expect("write old cache");
+        assert!(load_service_cache(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn generated_at_uses_rfc3339_utc() {
+        let stamp = generated_at();
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(stamp.len(), "2026-11-09T12:34:56.789Z".len(), "{stamp}");
+        // 1970-01-01 is day 0 in the civil conversion.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 }
