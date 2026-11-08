@@ -7,7 +7,7 @@ use clap::Parser;
 use unituner::api::{self, AppState};
 use unituner::config::Config;
 use unituner::scan;
-use unituner::services::ServiceTable;
+use unituner::services;
 use unituner::webui;
 
 /// Tuner sharing and abstraction server (mirakurun-compatible subset).
@@ -86,10 +86,12 @@ fn main() -> ExitCode {
 /// Binds the configured address and serves the mirakurun-compatible API plus
 /// the management UI (SPEC §9, §10) until SIGINT/SIGTERM.
 async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
-    // Services are discovered by the startup scan below (SPEC §8); until it
-    // finds them the table is empty, so `/api/services` is `[]` and service
-    // streams 404.
-    let state = AppState::new(Arc::clone(&config), ServiceTable::new(), config_dir.clone());
+    // `/api/services` and service streams are usable immediately: the last
+    // scan's table is restored from `services.json` (SPEC §8.2) before the
+    // listener exists. A missing/corrupt cache only warns and starts empty;
+    // `startup_scan` below then decides from the fingerprint whether to tune.
+    let service_table = services::load_service_cache(&config_dir);
+    let state = AppState::new(Arc::clone(&config), service_table, config_dir.clone());
     let manager = state.manager.clone();
 
     // Install the signal handlers *before* the listener is announced: a
@@ -112,6 +114,7 @@ async fn serve(config: Arc<Config>, config_dir: PathBuf) -> Result<(), String> {
     let mut scan_task = tokio::spawn(scan::startup_scan(
         manager.clone(),
         Arc::clone(&config),
+        config_dir.clone(),
         shutdown,
     ));
 
