@@ -49,6 +49,13 @@
 //! skipped and the scan continues (SPEC §8.1). Each per-channel session is
 //! released before the next channel is tuned.
 //!
+//! Outcomes are reported truthfully (SPEC §8): a channel whose type has no
+//! configured tuner is `skipped (no tuner for type <type>)`, a tuner command
+//! that cannot start or exits before its first data is `tuner failed to start:
+//! <short reason>`, and only a channel whose session was actually acquired and
+//! produced no usable SI is `no signal`. The startup scan retries only `Busy`
+//! and `Preempted`; `NoTuner` and `TunerFailed` would only spin.
+//!
 //! A channel the scan loses to a **user request** (any non-negative priority
 //! beats [`SCAN_PRIORITY`]) is reported as preempted, never as "no signal": the
 //! user keeps the tuner and the startup scan retries the channel with the same
@@ -80,9 +87,11 @@
 //! The same per-channel helper ([`scan_channel`]) also drives the SPEC §8
 //! startup service scan ([`startup_scan`]): every enabled `channels.yml` entry
 //! is tuned once, the found services are upserted into the shared
-//! [`ServiceTable`], and channels whose tuner was busy, absent, or preempted by
-//! a user are retried in the background with exponential backoff. The task stops
-//! on a shutdown signal and never preempts a user ([`SCAN_PRIORITY`]).
+//! [`ServiceTable`], and channels that were busy or preempted by a user are
+//! retried in the background with exponential backoff. A channel with no tuner
+//! or a tuner that failed to start is not retried (that would only spin), and
+//! an all-start-failure pass does not persist an empty cache. The task stops on
+//! a shutdown signal and never preempts a user ([`SCAN_PRIORITY`]).
 //!
 //! # Writing `channels.yml`
 //!
@@ -1018,14 +1027,6 @@ pub async fn run_scan(
             }
         }
         match outcome {
-            ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
-            ChannelOutcome::Preempted => {
-                lines
-                    .push("skipped (preempted by a user request)\n".to_string())
-                    .await
-            }
-            ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
-            ChannelOutcome::Failed => lines.push("error (scan task failed)\n".to_string()).await,
             ChannelOutcome::Services(services) => {
                 let services: Vec<FoundService> = services
                     .into_iter()
@@ -1082,6 +1083,11 @@ pub async fn run_scan(
                         entries,
                         services,
                     });
+                }
+            }
+            other => {
+                if let Some(line) = outcome_line(&query.type_name, &other) {
+                    lines.push(line).await;
                 }
             }
         }
@@ -1290,22 +1296,65 @@ impl ParallelScan {
 /// Why a channel produced no entries.
 #[derive(Debug)]
 pub(crate) enum ChannelOutcome {
-    /// Every tuner was busy, or no configured tuner supports the type:
-    /// SPEC §8 skips the channel and retries it later.
+    /// Every tuner was busy: SPEC §8 skips the channel and retries it later
+    /// with the busy backoff.
     Busy,
+    /// No configured tuner supports the channel type. This is a configuration
+    /// problem, not a busy tuner: it is never retried (retrying would spin
+    /// forever), and the operator is told which type lacks a tuner.
+    NoTuner,
+    /// The tuner command could not be started (spawn failed, or the process
+    /// exited before its first data). The channel was never read, so this is
+    /// **not** "no signal"; it carries a short diagnostic and is never retried
+    /// (a broken command would only spin).
+    TunerFailed(String),
     /// A user request took the tuner over during the scan (SPEC §6.1: any
     /// non-negative priority beats [`SCAN_PRIORITY`]). This is **not** "no
     /// signal": the user won, and the channel must be retried with the same
     /// backoff as a busy tuner so its services still appear.
     Preempted,
-    /// No output, or output without SI, within the per-channel budget (also
-    /// what a tuner that failed to start is reported as).
+    /// A session was actually acquired and the read loop saw no usable SI
+    /// before the deadline.
     NoSignal,
     /// Worse than "no signal": the scan task ended without reporting (a panic
     /// or an aborted task). Never retried automatically.
     Failed,
     /// SDT services seen on the channel.
     Services(Vec<FoundService>),
+}
+
+/// The progress line for an outcome that produced no services.
+///
+/// Kept in one place so the discovery scan (`run_scan`) and the manual re-scan
+/// (`rescan_services`) always say the same thing for the same outcome.
+fn outcome_line(type_name: &str, outcome: &ChannelOutcome) -> Option<String> {
+    let line = match outcome {
+        ChannelOutcome::NoTuner => format!("skipped (no tuner for type {type_name})\n"),
+        ChannelOutcome::Busy => "skipped (tuner busy)\n".to_string(),
+        ChannelOutcome::TunerFailed(reason) => {
+            format!("tuner failed to start: {}\n", short_reason(reason))
+        }
+        ChannelOutcome::Preempted => "skipped (preempted by a user request)\n".to_string(),
+        ChannelOutcome::NoSignal => "no signal\n".to_string(),
+        ChannelOutcome::Failed => "error (scan task failed)\n".to_string(),
+        ChannelOutcome::Services(_) => return None,
+    };
+    Some(line)
+}
+
+/// Collapses a start-failure diagnostic to one line of at most ~200 chars.
+///
+/// A tuner command can print arbitrary stderr; the progress stream must stay
+/// readable and must never carry a huge multi-line dump.
+fn short_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let one_line = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX_CHARS {
+        return one_line;
+    }
+    let mut truncated: String = one_line.chars().take(MAX_CHARS - 3).collect();
+    truncated.push_str("...");
+    truncated
 }
 
 /// [`scan_channel`] with a shutdown watch.
@@ -1365,8 +1414,9 @@ async fn shutdown_fired(shutdown: &mut watch::Receiver<bool>) {
 ///
 /// Shared by the SPEC §8 startup scan and the SPEC §8.1 scan API so both parse
 /// SI the same way. The session is acquired through
-/// [`SessionManager::acquire_scan`], which may retire an idle session even at
-/// [`SCAN_PRIORITY`]; every path releases that session again before returning,
+/// [`SessionManager::acquire_scan_detailed`], which may retire an idle session
+/// even at [`SCAN_PRIORITY`] and keeps the start-failure diagnostic; every path
+/// releases that session again before returning,
 /// so the next channel always finds the tuner.
 pub(crate) async fn scan_channel(
     manager: &SessionManager,
@@ -1443,7 +1493,7 @@ async fn scan_channel_watched(
     let acquire_deadline = deadline.min(started + acquire_budget);
     let acquire = tokio::time::timeout_at(
         acquire_deadline,
-        manager.acquire_scan(type_name, channel, user, SessionTap::Raw, false),
+        manager.acquire_scan_detailed(type_name, channel, user, SessionTap::Raw, false),
     );
     // Shutdown must be honoured within about a second even while the acquire is
     // still waiting for readiness (which can take up to `acquire_budget`). The
@@ -1464,30 +1514,39 @@ async fn scan_channel_watched(
     let mut subscription = match acquired {
         Err(_) => {
             tracing::debug!(channel, "scan acquire timed out");
-            // The session layer is cancellation-safe and stops the reservation
-            // it had already taken, but that takes a moment (SIGTERM grace, then
-            // SIGKILL). Wait for it to be gone, otherwise the tuner still holds
-            // `Stopping`/`Starting` and the next channel of the scan would be
-            // refused with "busy" because of this one.
+            // The tuner process was started (otherwise this would have been
+            // `Unavailable`) but produced no first data before the scan's own
+            // budget; a live-but-silent tuner is genuine no signal, not a start
+            // failure. The session layer is cancellation-safe and stops the
+            // reservation it had already taken, but that takes a moment
+            // (SIGTERM grace, then SIGKILL). Wait for it to be gone, otherwise
+            // the tuner still holds `Stopping`/`Starting` and the next channel
+            // of the scan would be refused with "busy" because of this one.
             wait_for_release(manager, type_name, channel).await;
             return (ChannelOutcome::NoSignal, false);
         }
-        Ok(Err(error)) => {
-            tracing::debug!(channel, %error, "scan could not acquire a tuner");
-            return (
-                match error {
-                    // SPEC §8: "相手がbusyならskip＋次回retry". A busy tuner and a
-                    // channel type with no tuner at all are both remembered for
-                    // the next pass. A tuner whose command failed to start is
-                    // `Unavailable`: retrying it forever would only spin, so it
-                    // is reported like no signal.
-                    crate::session::AcquireError::Busy
-                    | crate::session::AcquireError::NoTuner
-                    | crate::session::AcquireError::DecodeModeConflict => ChannelOutcome::Busy,
-                    _ => ChannelOutcome::NoSignal,
-                },
-                false,
-            );
+        Ok(Err(failure)) => {
+            tracing::debug!(channel, ?failure, "scan could not acquire a tuner");
+            let outcome = match failure.error {
+                // SPEC §8: "相手がbusyならskip＋次回retry". Only a genuinely busy
+                // tuner is retried.
+                crate::session::AcquireError::Busy
+                | crate::session::AcquireError::DecodeModeConflict => ChannelOutcome::Busy,
+                // A missing tuner is a configuration problem: retrying it
+                // forever would only spin, and calling it "busy" hides the real
+                // cause from the operator.
+                crate::session::AcquireError::NoTuner => ChannelOutcome::NoTuner,
+                // The command failed to start (spawn error, or it exited before
+                // its first data). The channel was never read, so this must not
+                // be reported as "no signal".
+                crate::session::AcquireError::Unavailable => ChannelOutcome::TunerFailed(
+                    failure
+                        .reason
+                        .unwrap_or_else(|| "command failed".to_string()),
+                ),
+                _ => ChannelOutcome::Failed,
+            };
+            return (outcome, false);
         }
         Ok(Ok(subscription)) => subscription,
     };
@@ -1971,6 +2030,10 @@ struct PassSummary {
     skipped: usize,
     /// Services upserted into the table.
     found: usize,
+    /// Channels whose tuner never started (no tuner, spawn failure, or a scan
+    /// task panic). These are not retried, but they must not make an empty
+    /// cache look authoritative.
+    hard_failures: usize,
 }
 
 /// Scans every enabled `channels.yml` entry once and retries the skipped ones
@@ -2082,7 +2145,10 @@ pub async fn startup_scan(
         let should_write = if cache_written {
             summary.found > 0 && before != table.snapshot()
         } else {
-            summary.found > 0 || retry.is_empty()
+            // "Nothing left to retry" is only a legitimate empty answer when no
+            // tuner failed to start: a config whose tuner is missing must be
+            // re-probed on the next boot, not remembered as empty forever.
+            summary.found > 0 || (retry.is_empty() && summary.hard_failures == 0)
         };
         if should_write {
             // Drop records of channels that are no longer enabled. Busy or
@@ -2172,6 +2238,10 @@ pub async fn rescan_services(
     let table = manager.services();
     let mut scanned = 0usize;
     let mut found_total = 0usize;
+    // Channels whose tuner never started (no tuner / spawn failure). An
+    // all-hard-failure first pass must not persist an empty `services.json`
+    // that a later boot would trust as a valid "no services" answer.
+    let mut hard_failures = 0usize;
     // Channel-level refreshed sid sets, applied only after the whole pass
     // completes: a disconnect must not run any retain step (SPEC §8.2).
     let mut refreshed: Vec<(String, String, HashSet<u16>)> = Vec::new();
@@ -2205,14 +2275,6 @@ pub async fn rescan_services(
         };
 
         match outcome {
-            ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
-            ChannelOutcome::Preempted => {
-                lines
-                    .push("skipped (preempted by a user request)\n".to_string())
-                    .await
-            }
-            ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
-            ChannelOutcome::Failed => lines.push("error (scan task failed)\n".to_string()).await,
             ChannelOutcome::Services(services) => {
                 let services: Vec<FoundService> = services
                     .into_iter()
@@ -2235,6 +2297,19 @@ pub async fn rescan_services(
                     services.iter().map(|service| service.service_id).collect();
                 refreshed.push((channel.type_name.clone(), channel.channel.clone(), keep));
             }
+            other => {
+                if matches!(
+                    other,
+                    ChannelOutcome::NoTuner
+                        | ChannelOutcome::TunerFailed(_)
+                        | ChannelOutcome::Failed
+                ) {
+                    hard_failures += 1;
+                }
+                if let Some(line) = outcome_line(&channel.type_name, &other) {
+                    lines.push(line).await;
+                }
+            }
         }
     }
 
@@ -2251,11 +2326,23 @@ pub async fn rescan_services(
     }
     removed += retain_enabled_channels(table, config);
     let fingerprint = service_fingerprint(&config.channels);
-    let cache_note = match write_service_cache(config_dir, &fingerprint, table) {
-        Ok(()) => format!("wrote {}", config_dir.join(SERVICE_CACHE_FILE).display()),
-        Err(error) => {
-            tracing::warn!(%error, "failed to write services.json");
-            format!("warning: failed to write services.json: {error}")
+    // A first scan in which every channel's tuner failed to start has nothing
+    // to remember: writing an empty cache would mark the config as "scanned"
+    // and suppress the next boot's retry. Existing records are never dropped by
+    // this guard (the retain above already ran, and a non-empty table is
+    // written normally).
+    let cache_note = if scanned == 0 && table.is_empty() && hard_failures > 0 {
+        format!(
+            "did not write {} (no tuner could be started)",
+            config_dir.join(SERVICE_CACHE_FILE).display()
+        )
+    } else {
+        match write_service_cache(config_dir, &fingerprint, table) {
+            Ok(()) => format!("wrote {}", config_dir.join(SERVICE_CACHE_FILE).display()),
+            Err(error) => {
+                tracing::warn!(%error, "failed to write services.json");
+                format!("warning: failed to write services.json: {error}")
+            }
         }
     };
     lines
@@ -2271,9 +2358,11 @@ pub async fn rescan_services(
 
 /// Whether a startup-scan pass retries a channel after `outcome`.
 ///
-/// A busy tuner and a channel preempted by a user request are both transient:
-/// the next pass retries them with the same exponential backoff. A channel
-/// that legitimately produced no SI is not retried.
+/// Only `Busy` (the tuner is in use) and `Preempted` (a user took it over) are
+/// transient: the next pass retries them with the same exponential backoff.
+/// A channel that legitimately produced no SI (`NoSignal`) is not retried, and
+/// neither are the configuration failures `NoTuner` and `TunerFailed`: retrying
+/// them would spin forever without the tuner changing state.
 fn retries(outcome: &ChannelOutcome) -> bool {
     matches!(outcome, ChannelOutcome::Busy | ChannelOutcome::Preempted)
 }
@@ -2363,6 +2452,25 @@ async fn scan_pass(
                     "startup scan skipped the channel: no tuner available"
                 );
             }
+            ChannelOutcome::NoTuner => {
+                summary.skipped += 1;
+                summary.hard_failures += 1;
+                tracing::warn!(
+                    type_name = %channel.type_name,
+                    channel = %channel.channel,
+                    "startup scan skipped the channel: no tuner for this type"
+                );
+            }
+            ChannelOutcome::TunerFailed(reason) => {
+                summary.skipped += 1;
+                summary.hard_failures += 1;
+                tracing::warn!(
+                    type_name = %channel.type_name,
+                    channel = %channel.channel,
+                    reason = %short_reason(&reason),
+                    "startup scan skipped the channel: tuner failed to start"
+                );
+            }
             ChannelOutcome::NoSignal => {
                 summary.skipped += 1;
                 tracing::debug!(
@@ -2373,6 +2481,7 @@ async fn scan_pass(
             }
             ChannelOutcome::Failed => {
                 summary.skipped += 1;
+                summary.hard_failures += 1;
                 tracing::warn!(
                     type_name = %channel.type_name,
                     channel = %channel.channel,
@@ -3449,6 +3558,59 @@ mod tests {
         assert!(retries(&ChannelOutcome::Busy));
         assert!(retries(&ChannelOutcome::Preempted));
         assert!(!retries(&ChannelOutcome::NoSignal));
+        // A missing tuner or a broken command never changes state by waiting:
+        // retrying them would spin forever.
+        assert!(!retries(&ChannelOutcome::NoTuner));
+        assert!(!retries(&ChannelOutcome::TunerFailed(
+            "command failed".to_string()
+        )));
+    }
+
+    #[test]
+    fn every_outcome_has_its_own_progress_line() {
+        // The five non-service outcomes must be distinguishable at a glance:
+        // a broken tuner must never look like no signal, and an absent tuner
+        // must never look busy.
+        assert_eq!(
+            outcome_line("XX", &ChannelOutcome::NoTuner).as_deref(),
+            Some("skipped (no tuner for type XX)\n")
+        );
+        assert_eq!(
+            outcome_line("GR", &ChannelOutcome::Busy).as_deref(),
+            Some("skipped (tuner busy)\n")
+        );
+        assert_eq!(
+            outcome_line("GR", &ChannelOutcome::Preempted).as_deref(),
+            Some("skipped (preempted by a user request)\n")
+        );
+        assert_eq!(
+            outcome_line(
+                "GR",
+                &ChannelOutcome::TunerFailed("stream ended before any data".to_string())
+            )
+            .as_deref(),
+            Some("tuner failed to start: stream ended before any data\n")
+        );
+        assert_eq!(
+            outcome_line("GR", &ChannelOutcome::NoSignal).as_deref(),
+            Some("no signal\n")
+        );
+        assert_eq!(
+            outcome_line("GR", &ChannelOutcome::Failed).as_deref(),
+            Some("error (scan task failed)\n")
+        );
+        // A service outcome is rendered by the caller's "N services found".
+        assert!(outcome_line("GR", &ChannelOutcome::Services(Vec::new())).is_none());
+    }
+
+    #[test]
+    fn a_start_failure_reason_is_a_single_short_line() {
+        let long = format!("error\n\n{}", "x".repeat(500));
+        let short = short_reason(&long);
+        assert!(!short.contains('\n'), "{short}");
+        assert_eq!(short.chars().count(), 200, "{short}");
+        assert!(short.ends_with("..."), "{short}");
+        assert_eq!(short_reason("line one\nline two"), "line one line two");
     }
 
     #[test]
@@ -3592,6 +3754,70 @@ mod tests {
         );
 
         drop(viewer);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_tuner_that_exits_before_output_is_tuner_failed_not_no_signal() {
+        // The command starts but exits before its first TS byte: that is a
+        // start failure, not "no signal" (the channel was never read).
+        let (_dir, _config, manager) = scan_tuner("sh -c \"sleep 1; exit 0\"");
+        let started = tokio::time::Instant::now();
+        let outcome = scan_channel(&manager, "GR", "27", Duration::from_secs(5)).await;
+        match outcome {
+            ChannelOutcome::TunerFailed(reason) => {
+                assert!(
+                    reason.contains("ended before any data") || reason.contains("before any data"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("an early exit must be a tuner failure, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "the exit happened before the readiness gate: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the scan waited for the whole budget instead of noticing the exit: {elapsed:?}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn garbage_without_si_is_no_signal_after_the_budget() {
+        // The tuner delivers data continuously, but every packet is a null
+        // packet: a session was acquired and the read loop simply saw no
+        // usable SI, which is the only case that should say "no signal".
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let garbage = dir.path().join("garbage.ts");
+        let mut packet = vec![0xFFu8; crate::tsframe::TS_PACKET_SIZE];
+        packet[0] = 0x47;
+        packet[1] = 0x1F; // PID 0x1FFF: null packet, ignored by the parser.
+        packet[2] = 0xFF;
+        packet[3] = 0x10;
+        packet[4] = 0x00;
+        std::fs::write(&garbage, [packet.clone(), packet.clone(), packet].concat())
+            .expect("write garbage");
+        let command = format!("sh -c \"cat {}; sleep 30\"", garbage.display());
+        let (_config_dir, _config, manager) = scan_tuner(&command);
+
+        let started = tokio::time::Instant::now();
+        let outcome = scan_channel(&manager, "GR", "27", Duration::from_secs(1)).await;
+        assert!(
+            matches!(outcome, ChannelOutcome::NoSignal),
+            "garbage must be no signal, got {outcome:?}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the read loop gave up before its budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the read loop ignored its budget: {elapsed:?}"
+        );
         manager.shutdown().await;
     }
 

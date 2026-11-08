@@ -361,6 +361,53 @@ pub enum AcquireError {
     ShuttingDown,
 }
 
+/// An [`AcquireError`] plus the short diagnostic of the tuner attempt that
+/// failed.
+///
+/// The public acquisition entry points still return only [`AcquireError`], so
+/// the HTTP layer is unchanged. The scan uses the detailed form to tell a
+/// tuner that never started (spawn error, exit before the first data) from a
+/// channel that was tuned but carried no usable SI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquireFailure {
+    /// Why no session could be acquired.
+    pub error: AcquireError,
+    /// A one-line reason from the failed tuner attempt, when one is known.
+    pub reason: Option<String>,
+}
+
+impl From<AcquireError> for AcquireFailure {
+    fn from(error: AcquireError) -> Self {
+        Self::new(error)
+    }
+}
+
+impl AcquireFailure {
+    /// An error without a tuner-start diagnostic.
+    fn new(error: AcquireError) -> Self {
+        Self {
+            error,
+            reason: None,
+        }
+    }
+
+    /// An error with a short reason from the tuner attempt.
+    fn with_reason(error: AcquireError, reason: impl Into<String>) -> Self {
+        Self {
+            error,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// `Unavailable`, carrying the last start failure when there is one.
+    fn unavailable(reason: Option<String>) -> Self {
+        Self {
+            error: AcquireError::Unavailable,
+            reason,
+        }
+    }
+}
+
 impl AcquireError {
     /// Whether this error ends the request no matter how many routes remain
     /// (SPEC §6.4).
@@ -1258,6 +1305,7 @@ impl SessionManager {
     ) -> Result<Subscription, AcquireError> {
         self.acquire_inner(type_name, channel, user, pin, tap, bypass_pipeline, false)
             .await
+            .map_err(|failure| failure.error)
     }
 
     /// Like [`acquire_full`](Self::acquire_full) for the channel scan.
@@ -1276,6 +1324,24 @@ impl SessionManager {
         tap: SessionTap,
         bypass_pipeline: bool,
     ) -> Result<Subscription, AcquireError> {
+        self.acquire_scan_detailed(type_name, channel, user, tap, bypass_pipeline)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`acquire_scan`](Self::acquire_scan) with the failed tuner attempt's
+    /// short diagnostic.
+    ///
+    /// Only the scan needs this: it distinguishes "the tuner command failed"
+    /// from "the channel was tuned but carried no usable SI".
+    pub async fn acquire_scan_detailed(
+        &self,
+        type_name: &str,
+        channel: &str,
+        user: TunerUser,
+        tap: SessionTap,
+        bypass_pipeline: bool,
+    ) -> Result<Subscription, AcquireFailure> {
         self.acquire_inner(type_name, channel, user, None, tap, bypass_pipeline, true)
             .await
     }
@@ -1291,7 +1357,7 @@ impl SessionManager {
         tap: SessionTap,
         bypass_pipeline: bool,
         scan: bool,
-    ) -> Result<Subscription, AcquireError> {
+    ) -> Result<Subscription, AcquireFailure> {
         let inner = Arc::clone(&self.inner);
         let pin = pin.and_then(|name| {
             let name = name.trim();
@@ -1303,7 +1369,7 @@ impl SessionManager {
         });
 
         if inner.shutting_down.load(Ordering::SeqCst) {
-            return Err(AcquireError::ShuttingDown);
+            return Err(AcquireError::ShuttingDown.into());
         }
         // Answer 400-style errors without a spawn.
         if let Some(name) = &pin {
@@ -1337,13 +1403,16 @@ impl SessionManager {
         // broken tuner cannot loop the pool (SPEC §6.2 fall-through is ON), but
         // a later request may try it again.
         let mut failed: HashSet<String> = HashSet::new();
+        // The most recent start-failure diagnostic, carried to the final
+        // `Unavailable` so the scan can explain *why* no session was acquired.
+        let mut last_reason: Option<String> = None;
         // Waiting is only for concurrent spawns; bound the whole wait so a
         // wedged spawn cannot hold a request open indefinitely.
         let wait_deadline = wait_deadline();
 
         loop {
             if inner.shutting_down.load(Ordering::SeqCst) {
-                return Err(AcquireError::ShuttingDown);
+                return Err(AcquireError::ShuttingDown.into());
             }
 
             let selection = {
@@ -1368,7 +1437,7 @@ impl SessionManager {
                     match join(&inner, &session, &user, tap) {
                         Ok(subscription) => return Ok(subscription),
                         // A SPEC §7 cap: answer 429 instead of waiting.
-                        Err(AttachError::Rejected(error)) => return Err(error),
+                        Err(AttachError::Rejected(error)) => return Err(error.into()),
                         // The session changed between selection and join. Wait
                         // for the next change instead of spinning on a repeated
                         // miss.
@@ -1376,13 +1445,19 @@ impl SessionManager {
                     }
                     if !wait_before_retry(&inner, &session, wait_deadline, type_name, channel).await
                     {
-                        return Err(AcquireError::Unavailable);
+                        return Err(AcquireFailure::with_reason(
+                            AcquireError::Unavailable,
+                            "timed out waiting for the tuner",
+                        ));
                     }
                 }
                 Selection::Wait(session) => {
                     if !wait_before_retry(&inner, &session, wait_deadline, type_name, channel).await
                     {
-                        return Err(AcquireError::Unavailable);
+                        return Err(AcquireFailure::with_reason(
+                            AcquireError::Unavailable,
+                            "timed out waiting for the tuner",
+                        ));
                     }
                     // Do not retry a tuner whose stream failed to start. A
                     // natural EOF (a short recording, a channel that stopped)
@@ -1391,6 +1466,7 @@ impl SessionManager {
                         && !session.clean_eof.load(Ordering::SeqCst)
                     {
                         failed.insert(session.key.tuner.clone());
+                        last_reason = Some("stream ended before any data".to_string());
                     }
                 }
                 Selection::Spawn { session, victim } => {
@@ -1404,21 +1480,29 @@ impl SessionManager {
                     match notify.await {
                         Ok(Ok(subscription)) => return Ok(subscription),
                         Ok(Err(SpawnFailure::ShuttingDown)) => {
-                            return Err(AcquireError::ShuttingDown)
+                            return Err(AcquireError::ShuttingDown.into())
                         }
-                        Ok(Err(SpawnFailure::TakeoverAbandoned)) => return Err(AcquireError::Busy),
-                        Ok(Err(SpawnFailure::Rejected(error))) => return Err(error),
-                        Ok(Err(SpawnFailure::Failed { tuner })) => {
+                        Ok(Err(SpawnFailure::TakeoverAbandoned)) => {
+                            return Err(AcquireError::Busy.into())
+                        }
+                        Ok(Err(SpawnFailure::Rejected(error))) => return Err(error.into()),
+                        Ok(Err(SpawnFailure::Failed { tuner, reason })) => {
+                            last_reason = Some(reason);
                             // Pinned requests never fall back to another tuner.
                             if pin.is_some() {
-                                return Err(AcquireError::Unavailable);
+                                return Err(AcquireFailure::unavailable(last_reason));
                             }
                             failed.insert(tuner);
                         }
                         // The detached task ended without reporting: only a
                         // panicking spawn (whose own guard cleaned up after it)
                         // can do that.
-                        Err(_) => return Err(AcquireError::Unavailable),
+                        Err(_) => {
+                            return Err(AcquireFailure::with_reason(
+                                AcquireError::Unavailable,
+                                "spawn task ended without reporting",
+                            ))
+                        }
                     }
                 }
                 Selection::Fail(error) => {
@@ -1426,9 +1510,9 @@ impl SessionManager {
                     return Err(if broke && !failed.is_empty() {
                         // A candidate was tried and failed before this: 503
                         // unavailable is more accurate than 503 busy.
-                        AcquireError::Unavailable
+                        AcquireFailure::unavailable(last_reason)
                     } else {
-                        error
+                        error.into()
                     });
                 }
             }
@@ -1456,10 +1540,11 @@ impl SessionManager {
         bypass_pipeline: bool,
         scan: bool,
         wait_deadline: tokio::time::Instant,
-    ) -> Result<Subscription, AcquireError> {
+    ) -> Result<Subscription, AcquireFailure> {
         let inner = Arc::clone(&self.inner);
         let mut failed: HashSet<String> = HashSet::new();
         let mut start_failure = false;
+        let mut last_reason: Option<String> = None;
 
         'routes: for route in &routes {
             // A disabled tuner, or one that does not support the channel type,
@@ -1480,7 +1565,7 @@ impl SessionManager {
 
             loop {
                 if inner.shutting_down.load(Ordering::SeqCst) {
-                    return Err(AcquireError::ShuttingDown);
+                    return Err(AcquireError::ShuttingDown.into());
                 }
                 let selection = {
                     let mut state = lock(&inner.state);
@@ -1503,7 +1588,7 @@ impl SessionManager {
                         match join(&inner, &session, &user, tap) {
                             Ok(subscription) => return Ok(subscription),
                             // A SPEC §7 cap is terminal for the request.
-                            Err(AttachError::Rejected(error)) => return Err(error),
+                            Err(AttachError::Rejected(error)) => return Err(error.into()),
                             Err(AttachError::Gone) => {}
                         }
                         if !wait_before_retry(
@@ -1541,6 +1626,7 @@ impl SessionManager {
                         {
                             failed.insert(session.key.tuner.clone());
                             start_failure = true;
+                            last_reason = Some("stream ended before any data".to_string());
                             continue 'routes;
                         }
                     }
@@ -1554,7 +1640,7 @@ impl SessionManager {
                         match notify.await {
                             Ok(Ok(subscription)) => return Ok(subscription),
                             Ok(Err(SpawnFailure::ShuttingDown)) => {
-                                return Err(AcquireError::ShuttingDown)
+                                return Err(AcquireError::ShuttingDown.into())
                             }
                             Ok(Err(SpawnFailure::TakeoverAbandoned)) => {
                                 // The takeover was abandoned, but the next route
@@ -1562,18 +1648,25 @@ impl SessionManager {
                                 continue 'routes;
                             }
                             // A cap rejection during promotion is terminal.
-                            Ok(Err(SpawnFailure::Rejected(error))) => return Err(error),
-                            Ok(Err(SpawnFailure::Failed { tuner })) => {
+                            Ok(Err(SpawnFailure::Rejected(error))) => return Err(error.into()),
+                            Ok(Err(SpawnFailure::Failed { tuner, reason })) => {
                                 tracing::warn!(
                                     tuner = %tuner,
                                     channel = %route.channel,
+                                    %reason,
                                     "route tuner failed to start; trying the next route"
                                 );
                                 failed.insert(tuner);
                                 start_failure = true;
+                                last_reason = Some(reason);
                                 continue 'routes;
                             }
-                            Err(_) => return Err(AcquireError::Unavailable),
+                            Err(_) => {
+                                return Err(AcquireFailure::with_reason(
+                                    AcquireError::Unavailable,
+                                    "spawn task ended without reporting",
+                                ))
+                            }
                         }
                     }
                     // A decode conflict or a SPEC §7 cap ends the request: the
@@ -1581,7 +1674,7 @@ impl SessionManager {
                     // would either start a second stream under the other decode
                     // mode or bypass the cap. The genuinely per-route cases
                     // (busy, unusable, unsupported) fall through.
-                    Selection::Fail(error) if error.is_terminal() => return Err(error),
+                    Selection::Fail(error) if error.is_terminal() => return Err(error.into()),
                     Selection::Fail(_) => continue 'routes,
                 }
             }
@@ -1595,8 +1688,8 @@ impl SessionManager {
         );
         // Every route was exhausted: the same 503 as mirakc-BS4K's
         // `TunerUnavailable`, whether the route tuners were busy or failed to
-        // start.
-        Err(AcquireError::Unavailable)
+        // start. The last start failure explains why when there was one.
+        Err(AcquireFailure::unavailable(last_reason))
     }
 
     /// Validates a pinned tuner name (SPEC §6.3).
@@ -1899,6 +1992,9 @@ enum SpawnFailure {
     ShuttingDown,
     Failed {
         tuner: String,
+        /// Short one-line diagnostic of the start failure (spawn error, exit
+        /// before the first data, readiness timeout).
+        reason: String,
     },
     /// The takeover stopped being legal (a subscriber joined the victim); the
     /// victim is left running. A routed request may try the next route, while a
@@ -2537,16 +2633,20 @@ async fn spawn_and_promote(
         Err(error) => {
             tracing::warn!(session_id = session.id, %label, %error, "spawn failed");
             release_reservation(inner, &session, None);
-            let _ = notify.send(Err(SpawnFailure::Failed { tuner: tuner_name }));
+            let _ = notify.send(Err(SpawnFailure::Failed {
+                tuner: tuner_name,
+                reason: error,
+            }));
             return;
         }
     };
 
-    let ready = match await_readiness(inner, &session, readiness, &mut notify, probe).await {
-        Readiness::Ready => true,
+    let start_failure = match await_readiness(inner, &session, readiness, &mut notify, probe).await
+    {
+        Readiness::Ready => None,
         Readiness::Ended(reason) => {
             tracing::warn!(session_id = session.id, %label, %reason, "no output before EOF");
-            false
+            Some(reason)
         }
         Readiness::TimedOut => {
             tracing::warn!(
@@ -2555,7 +2655,7 @@ async fn spawn_and_promote(
                 timeout_ms = READINESS_TIMEOUT.as_millis(),
                 "readiness timed out"
             );
-            false
+            Some("timed out waiting for the first data".to_string())
         }
         Readiness::ShuttingDown => {
             tracing::debug!(session_id = session.id, %label, "shutdown during readiness");
@@ -2581,10 +2681,13 @@ async fn spawn_and_promote(
             return;
         }
     };
-    if !ready {
+    if let Some(reason) = start_failure {
         session.stop_process().await;
         release_reservation(inner, &session, None);
-        let _ = notify.send(Err(SpawnFailure::Failed { tuner: tuner_name }));
+        let _ = notify.send(Err(SpawnFailure::Failed {
+            tuner: tuner_name,
+            reason,
+        }));
         return;
     }
 
@@ -2611,6 +2714,7 @@ async fn spawn_and_promote(
             } else {
                 Err(SpawnFailure::Failed {
                     tuner: tuner_name.clone(),
+                    reason: "the session ended before it became ready".to_string(),
                 })
             }
         } else if inner.shutting_down.load(Ordering::SeqCst) {
@@ -2618,12 +2722,14 @@ async fn spawn_and_promote(
         } else if session.phase() != SessionPhase::Starting {
             Err(SpawnFailure::Failed {
                 tuner: tuner_name.clone(),
+                reason: "the session stopped before it became ready".to_string(),
             })
         } else {
             session.set_phase(SessionPhase::Ready);
             match attach(inner, &state, &session, &user, tap) {
                 Err(AttachError::Gone) => Err(SpawnFailure::Failed {
                     tuner: tuner_name.clone(),
+                    reason: "the session ended before it became ready".to_string(),
                 }),
                 Err(AttachError::Rejected(error)) => Err(SpawnFailure::Rejected(error)),
                 Ok((subscription, pump)) => {
@@ -2640,6 +2746,7 @@ async fn spawn_and_promote(
                     {
                         Err(SpawnFailure::Failed {
                             tuner: tuner_name.clone(),
+                            reason: "stream ended before any data".to_string(),
                         })
                     } else {
                         if session.ended.load(Ordering::SeqCst) {
