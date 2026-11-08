@@ -315,6 +315,20 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
   - scan 専用に大きな購読バッファを持つ（通常購読者の 1024 chunks とは別）。
   - 中間的に通常購読者と同一の購読扱いで scan が溢れて自己切断しないようにする。
 - スキャンは全 channel に対して通常セッションとして扱わず、scan 用セッションで取得する。相手が busy なら skip + 次回 retry。
+- **結果の分類**（進捗テキストとログで区別する。チューナーが起動できなかったことを `no signal` と混同しない）:
+
+  | 内部結果 | 進捗テキスト | 意味 | 起動時スキャンの再試行 |
+  |---|---|---|---|
+  | `Services` | `-> N services found.` | PAT/PMT/SDT/NIT からサービスを取得 | なし（完了） |
+  | `Busy` | `skipped (tuner busy)` | 全チューナーが使用中（または decode mode 衝突） | **する**（30→60→120→240→300 秒の backoff） |
+  | `Preempted` | `skipped (preempted by a user request)` | 利用者の要求（priority ≥ 0）がチューナーを奪った | **する**（busy と同じ backoff） |
+  | `NoTuner` | `skipped (no tuner for type <type>)` | その type をサポートする有効チューナーが無い（設定不備） | **しない**（待っても状態は変わらず spin するだけ） |
+  | `TunerFailed` | `tuner failed to start: <短い理由>` | チューナーコマンドの spawn 失敗、または最初のデータ前に終了 | **しない**（壊れたコマンドを繰り返すだけ） |
+  | `NoSignal` | `no signal` | セッションを取得でき、期限までに使用可能な SI が無かった | しない |
+  | `Failed` | `error (scan task failed)` | スキャンタスクが結果を返さず終了（panic / abort） | しない |
+
+  短い理由は 1 行・最大約 200 文字に丸める。spawn エラー（例: `No such file or directory`）や `stream ended before any data`（最初のデータ前に EOF）が入る。stderr 全体は進捗に出さない（ログ側で従来どおり stage ごとに記録される）。
+- `tuner failed to start` は「チューナーコマンド／デバイスが使えなかった」、`no signal` は「チューンはできたが使用可能な SI が無かった」を表す。前者を後者として扱うと、デバイス未接続でも全チャンネルが一瞬で「無信号」に見えてしまう。
 - テーブルが ready に至るまでは `/api/services/{id}/stream` が 404 を返してよい（README に記載）。
 - ARIB サービス名/SDT デコード：`siketyan/arib-rs`（MIT、STD-B24 text / STD-B10 TS SI tables）を第一候補とし、実 TS で早期検証する。動かなければ手書き SI パーサにフォールバックする。
 - スキャンのスケジュール（定期 re-scan）は行わない。結果は `services.json` に永続化し、起動時はキャッシュが有効ならチューナーに触れない。再スキャンは webui の **Re-scan** ボタン（`POST /webui/api/services/scan`）で手動実行する（§8.2）。
@@ -325,7 +339,7 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 
 - 目的: `channels.yml` に未登録のチャンネルを列挙して追加する。既存の登録済みエントリは維持し、探索は未登録チャンネルを実際にチューニングして SDT/NIT から名前とサービスを取得する。
 - 既存 channels.yml の **登録済みエントリは維持**する（`disabled: true` のエントリは再スキャン対象）。`refresh` オプションが真のときは既存エントリを列挙し直して上書きする。refresh で既存エントリを置換するときも、手書きの `routes` と `extra-args` は保持する（scan が発見するのはサービスであり、経路設定ではないため）。
-- エラー（`no_signal` 等）はそのチャンネルを**スキップして継続**する。dry run でもログ出力のみ。
+- エラー（`no_signal` / `tuner failed to start` / `no tuner for type` / `tuner busy` / preempted）はそのチャンネルを**スキップして継続**する。分類と再試行規則は §8 の表を参照。dry run でもログ出力のみ。
 - channels.yml の書き換えは**追加のみ**とする（type 単位で完全置換しない）。他の type は一切触らない。
 - 完了後は**手動再起動**が必要とする（`**RESTART REQUIRED**` メッセージを出力。restart はしない）。
 - 返し方は `text/plain` ストリーミング（mirakurun 通り：完了まで curl の応答が返り、進捗テキストを逐次書き出す）。
@@ -387,13 +401,13 @@ Found 1 channels for 13
 - **フィンガープリント**: 有効（`disabled` でない）`channels.yml` エントリだけを対象に、`(type, channel)` でソートした各エントリの `type` / `channel` / `extra-args` / `routes`（route ごとの `tuner`・`channel` 上書き・`extra-args` 上書きを含む）を、長さプレフィックス付きで連結した文字列を FNV-1a 64 でハッシュする。スキーマ定数 `"unituner-services-v1"` も入力に含む。`DefaultHasher` / `RandomState` は Rust バージョン間で安定でないため使わない。`disabled` エントリと `tuners.yml` は含めない（Tuner 定義ではなく放送の性質で決まるため）。チャンネルの追加・削除・disable・`routes` / `extra-args` 変更で自動的に再スキャンされる。
 - **起動時**: `services.json` が読め、`version == 1` かつフィンガープリントが一致すれば、チューナーを一切起動せずにキャッシュを復元して終了する（`startup scan skipped: service cache is valid`）。`services: []` も「その設定にはスキャン対象が無い」という有効な結果として受理する。ファイル欠落・破損・バージョン不一致・フィンガープリント不一致は warn して通常のスキャンにフォールバックし、完了後に上書きする。
 - **書き込み**: `services.json.tmp` → `fsync` → `rename`。Unix では `0600` で作成し、既存ファイルのモードは保持する。部分的 JSON は残らない。書き込み失敗は警告のみで、メモリ上のサービス表は有効なまま。
-- **起動時スキャンの永続化**: 最初のパスで 1 件以上見つかった、または再試行対象が残らない（全チャンネルが成功または無信号）場合にキャッシュを書く。以後の再試行パスは、表が実際に変わったときだけ書き換える。全チャンネルが busy の初回パスでは、空のキャッシュを「有効」として残さないよう書き込まない。キャッシュが書かれた後の再起動では busy チャンネルの再試行は行われない（無期限キャッシュの仕様）。
+- **起動時スキャンの永続化**: 最初のパスで 1 件以上見つかった、または再試行対象が残らず **`NoTuner` / `TunerFailed` / `Failed` が無い**（全チャンネルが成功または無信号）場合にキャッシュを書く。以後の再試行パスは、表が実際に変わったときだけ書き換える。全チャンネルが busy の初回パスや、チューナーが 1 台も起動できなかった初回パスでは、空のキャッシュを「有効」として残さないよう書き込まない（次回起動時に再プローブする）。キャッシュが書かれた後の再起動では busy チャンネルの再試行は行われない（無期限キャッシュの仕様）。
 - **手動 Re-scan** (`POST /webui/api/services/scan`):
   - 他の webui mutation と同じ CSRF / Host / JSON Content-Type ガードを通る。
   - 共有 `scan_lock`（`PUT /api/config/channels/scan` と同一）を取得する。実行中なら **409** `{"code":409,"reason":"Already Scanning"}`。
   - 有効な `channels.yml` の全エントリを **ちょうど 1 パス** スキャンし、進捗を `text/plain` でストリーミングする（無限 backoff はしない）。
-  - パス完了後に、**有効な**チャンネルに属するレコードだけを残す（削除・disable されたチャンネルのレコードを落とす）。busy / 無信号のチャンネルは有効なままなので、以前のレコードを保持する。スキャンに成功したチャンネルでは、そのチャンネルから消えたサービスも（通常の探索と同じ `retain_channel` で）落とす。
-  - その後 `services.json` を書き、`**RE-SCAN COMPLETE**` と件数を出力する。
+  - パス完了後に、**有効な**チャンネルに属するレコードだけを残す（削除・disable されたチャンネルのレコードを落とす）。busy / 無信号 / チューナー起動失敗のチャンネルは有効なままなので、以前のレコードを保持する。スキャンに成功したチャンネルでは、そのチャンネルから消えたサービスも（通常の探索と同じ `retain_channel` で）落とす。
+  - その後 `services.json` を書き、`**RE-SCAN COMPLETE**` と件数を出力する。ただし **1 件もサービスが無く、全チャンネルが `NoTuner` / `TunerFailed` / `Failed`** の場合は空のキャッシュを書かない（`did not write ... (no tuner could be started)` と表示する）。既存レコードがある場合は通常どおり書き、有効チャンネルのレコードは落とさない。
   - `channels.yml` は一切書かない（チャンネル探索 API とは別物）。
   - クライアントが途中で切断した場合、キャッシュは書かず、チャンネル単位の retain も適用しない（メモリ上の表には途中までの upsert が残りうる）。終了時の retain と保存は行わない。
 
