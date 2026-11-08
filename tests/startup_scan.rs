@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use unituner::config::Config;
 use unituner::scan::startup_scan;
-use unituner::services::ServiceTable;
+use unituner::services::{
+    load_service_cache, read_service_cache, service_fingerprint, write_service_cache, ServiceTable,
+};
 use unituner::session::{SessionManager, SessionPhase};
 use unituner::si::crc32_mpeg2;
 use unituner::tsframe::TS_PACKET_SIZE;
@@ -344,7 +346,12 @@ async fn startup_scan_populates_the_table_for_a_working_channel() {
 
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
 
     // One pass: 27 succeeds and the failing channel is not retried.
     tokio::time::timeout(Duration::from_secs(20), task)
@@ -379,7 +386,12 @@ async fn startup_scan_leaves_the_table_empty_when_the_tuner_fails() {
 
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
 
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
@@ -402,7 +414,12 @@ async fn startup_scan_stops_on_shutdown() {
 
     let manager = fixture.manager();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
 
     // Let the scan reach the acquire, then shut down the way `serve` does.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -447,7 +464,12 @@ async fn startup_scan_releases_the_tuner_for_the_next_channel() {
 
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
 
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
@@ -510,7 +532,12 @@ async fn startup_scan_ignores_an_sdt_other_and_still_finds_the_real_services() {
 
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
         .expect("startup scan finished")
@@ -592,7 +619,12 @@ async fn startup_scan_collects_every_section_of_a_multi_section_sdt() {
 
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
         .expect("startup scan finished")
@@ -779,7 +811,12 @@ async fn startup_scan_tunes_two_channels_on_two_tuners_at_once() {
     };
 
     let started = Instant::now();
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
         .expect("startup scan finished")
@@ -852,7 +889,12 @@ async fn startup_scan_exits_once_the_core_tables_are_complete() {
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let started = Instant::now();
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
         .expect("startup scan finished")
@@ -894,7 +936,12 @@ async fn startup_scan_falls_back_to_the_sdt_network_id_after_the_grace() {
     let manager = fixture.manager();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let started = Instant::now();
-    let task = tokio::spawn(startup_scan(manager.clone(), fixture.config(), shutdown_rx));
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
     tokio::time::timeout(Duration::from_secs(20), task)
         .await
         .expect("startup scan finished")
@@ -922,5 +969,234 @@ async fn startup_scan_falls_back_to_the_sdt_network_id_after_the_grace() {
     assert_eq!(services[0].pmt_pid, Some(0x01F0));
     assert_eq!(services[1].name, "NHK E");
     assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent service cache (SPEC §8.2)
+// ---------------------------------------------------------------------------
+
+/// A fixture whose GR tuner streams a complete multiplex on channel 27.
+fn cacheable_fixture() -> Fixture {
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let ts = fixture.write_ts("mux.ts", &core_multiplex(SERVICES_27, true, true));
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&streaming_command(&ts), "sh -c \"exit 1\""),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+    fixture
+}
+
+async fn run_startup(fixture: &Fixture, manager: SessionManager) {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+}
+
+#[tokio::test]
+async fn startup_scan_persists_the_cache_and_a_restart_restores_it() {
+    let fixture = cacheable_fixture();
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    let data = std::fs::read_to_string(fixture.path.join("services.json")).expect("cache");
+    let value: serde_json::Value = serde_json::from_str(&data).expect("valid JSON");
+    assert_eq!(value["version"], 1);
+    assert_eq!(
+        value["fingerprint"],
+        service_fingerprint(&fixture.config().channels)
+    );
+    assert!(
+        value["generated_at"]
+            .as_str()
+            .expect("generated_at")
+            .ends_with('Z'),
+        "{value}"
+    );
+    assert_eq!(value["services"].as_array().expect("services").len(), 2);
+    assert!(!fixture.path.join("services.json.tmp").exists());
+
+    let cache = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    assert_eq!(cache.version, 1);
+    assert_eq!(cache.services, manager.services().snapshot());
+
+    // A restart only has the file: build the table from it, as `serve` does.
+    let restored = load_service_cache(&fixture.path);
+    assert_eq!(restored.snapshot(), manager.services().snapshot());
+    assert_eq!(restored.list()[0].name, "NHK General");
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_valid_cache_skips_the_scan_without_spawning_a_tuner() {
+    let fixture = cacheable_fixture();
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+    manager.shutdown().await;
+
+    // Every command would leave a marker if it were spawned. The cache matches
+    // the unchanged channels.yml, so startup must not touch a tuner at all.
+    let marker = fixture.path.join("spawned");
+    let command = format!("sh -c \"touch {}; exec /nonexistent/x\"", marker.display());
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command, &command))
+        .expect("rewrite tuners.yml");
+
+    // A fresh, empty table: startup_scan itself restores the cache.
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    assert!(!marker.exists(), "a valid cache must not spawn a tuner");
+    assert_eq!(
+        manager.services().list().len(),
+        2,
+        "the cached services are restored"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_empty_cache_with_a_matching_fingerprint_is_valid() {
+    let fixture = cacheable_fixture();
+    let config = fixture.config();
+    let fingerprint = service_fingerprint(&config.channels);
+    write_service_cache(&fixture.path, &fingerprint, &ServiceTable::new()).expect("write cache");
+
+    let marker = fixture.path.join("spawned");
+    let command = format!("sh -c \"touch {}; sleep 30\"", marker.display());
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command, &command))
+        .expect("rewrite tuners.yml");
+
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+    assert!(
+        !marker.exists(),
+        "an empty service list is a valid cache, not a reason to scan"
+    );
+    assert!(manager.services().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn adding_a_channel_invalidates_the_cache_and_rescans() {
+    let fixture = cacheable_fixture();
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+    manager.shutdown().await;
+
+    let old = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    let old_fingerprint = old.fingerprint.clone();
+
+    // A second channel plus a command that records every spawn. The same TS is
+    // served for both channels, which keeps the fixture simple.
+    let ts = fixture.path.join("mux.ts");
+    let command = format!(
+        "sh -c \"date +%s%N > {}/spawn_{{channel}}; cat {}; sleep 30\"",
+        fixture.path.display(),
+        ts.display()
+    );
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!(
+            "- name: good\n  types: [GR]\n  command: '{command}'\n\
+             - name: second\n  types: [GR]\n  command: '{command}'\n"
+        ),
+    )
+    .expect("rewrite tuners.yml");
+    std::fs::write(
+        fixture.path.join("channels.yml"),
+        format!("{GOOD_CHANNEL}{SECOND_CHANNEL}"),
+    )
+    .expect("write channels.yml");
+
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    assert!(
+        fixture.path.join("spawn_27").exists(),
+        "channel 27 was scanned"
+    );
+    assert!(
+        fixture.path.join("spawn_28").exists(),
+        "channel 28 was scanned"
+    );
+
+    let new = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    let expected = service_fingerprint(&fixture.config().channels);
+    assert_eq!(new.fingerprint, expected);
+    assert_ne!(new.fingerprint, old_fingerprint);
+    assert!(
+        new.generated_at != old.generated_at,
+        "the rewritten cache has a new timestamp"
+    );
+    assert!(
+        manager
+            .services()
+            .list()
+            .iter()
+            .any(|record| record.channel.as_ref() == Some(&("GR".to_owned(), "28".to_owned()))),
+        "the new channel's services are cached"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_corrupt_cache_falls_back_to_a_scan_and_rewrites_it() {
+    let fixture = cacheable_fixture();
+    std::fs::write(
+        fixture.path.join("services.json"),
+        "{\"version\":1,\"fingerprint\":\"truncated",
+    )
+    .expect("write corrupt cache");
+
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    let cache = read_service_cache(&fixture.path)
+        .expect("the corrupt file was replaced")
+        .expect("present");
+    assert_eq!(cache.version, 1);
+    assert_eq!(
+        cache.fingerprint,
+        service_fingerprint(&fixture.config().channels)
+    );
+    assert_eq!(cache.services.len(), 2);
+    assert_eq!(manager.services().list().len(), 2);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wrong_version_cache_falls_back_to_a_scan_and_rewrites_it() {
+    let fixture = cacheable_fixture();
+    std::fs::write(
+        fixture.path.join("services.json"),
+        "{\"version\":99,\"fingerprint\":\"x\",\"generated_at\":\"x\",\"services\":[]}",
+    )
+    .expect("write old cache");
+
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    let cache = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    assert_eq!(cache.version, 1, "the scan rewrites the supported version");
+    assert_eq!(cache.services.len(), 2);
     manager.shutdown().await;
 }

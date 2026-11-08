@@ -3,9 +3,10 @@
 //! restart hook and the interaction with the existing `/api/*` routes.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
@@ -14,7 +15,12 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 use unituner::api::AppState;
 use unituner::config::Config;
-use unituner::services::ServiceTable;
+use unituner::scan::startup_scan;
+use unituner::services::{
+    load_service_cache, read_service_cache, service_fingerprint, ServiceRecord, ServiceTable,
+};
+use unituner::si::crc32_mpeg2;
+use unituner::tsframe::TS_PACKET_SIZE;
 use unituner::webui::{self, Webui};
 
 const SERVER: &str = r#"
@@ -135,6 +141,156 @@ fn routed_fixture() -> Fixture {
     let fixture = Fixture::with(ROUTED_CHANNELS);
     std::fs::write(fixture.path.join("tuners.yml"), TUNERS_TWO).expect("write tuners.yml");
     fixture
+}
+
+// ---------------------------------------------------------------------------
+// Fake tuner TS fixture (PAT + SDT-actual + NIT, two services)
+// ---------------------------------------------------------------------------
+
+const CACHE_NETWORK_ID: u16 = 0x7FE0;
+const CACHE_TSID: u16 = 0x7FE0;
+const GOOD_CHANNEL: &str = "- name: NHK\n  type: GR\n  channel: \"27\"\n";
+const DEAD_CHANNEL: &str = "- name: Broken\n  type: DEAD\n  channel: \"1\"\n";
+
+fn ts_packet(pid: u16, first: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
+    let mut packet = vec![0xFFu8; TS_PACKET_SIZE];
+    packet[0] = 0x47;
+    packet[1] = ((first as u8) << 6) | (pid >> 8) as u8;
+    packet[2] = pid as u8;
+    packet[3] = 0x10 | (cc & 0x0F);
+    packet[4..4 + payload.len()].copy_from_slice(payload);
+    packet
+}
+
+fn ts_section(table_id: u8, id: u16, rest: &[u8]) -> Vec<u8> {
+    let section_length = 5 + rest.len() + 4;
+    let mut bytes = vec![
+        table_id,
+        0xB0 | ((section_length >> 8) as u8 & 0x0F),
+        section_length as u8,
+        (id >> 8) as u8,
+        id as u8,
+        0xC1,
+        0x00,
+        0x00,
+    ];
+    bytes.extend_from_slice(rest);
+    let crc = crc32_mpeg2(&bytes);
+    bytes.extend_from_slice(&crc.to_be_bytes());
+    bytes
+}
+
+fn pat_section() -> Vec<u8> {
+    let mut rest = vec![0x00, 0x00];
+    rest.extend_from_slice(&(0xE000u16 | 0x0010).to_be_bytes());
+    for (program, pmt_pid) in [(0x0408u16, 0x01F0u16), (0x0409, 0x01F1)] {
+        rest.extend_from_slice(&program.to_be_bytes());
+        rest.extend_from_slice(&(0xE000 | pmt_pid).to_be_bytes());
+    }
+    ts_section(0x00, CACHE_TSID, &rest)
+}
+
+fn sdt_section() -> Vec<u8> {
+    let mut rest = vec![(CACHE_NETWORK_ID >> 8) as u8, CACHE_NETWORK_ID as u8, 0xFF];
+    for (service_id, name) in [(0x0408u16, "NHK General"), (0x0409, "NHK E")] {
+        let mut encoded = vec![0x1B, 0x28, 0x4A];
+        encoded.extend_from_slice(name.as_bytes());
+        let mut descriptor = vec![0x01, 0x00, encoded.len() as u8];
+        descriptor.extend_from_slice(&encoded);
+        rest.extend_from_slice(&service_id.to_be_bytes());
+        rest.push(0xFD);
+        let loop_length = 2 + descriptor.len();
+        rest.extend_from_slice(&[((loop_length >> 8) & 0x0F) as u8, loop_length as u8]);
+        rest.push(0x48);
+        rest.push(descriptor.len() as u8);
+        rest.extend_from_slice(&descriptor);
+    }
+    ts_section(0x42, CACHE_TSID, &rest)
+}
+
+fn nit_section() -> Vec<u8> {
+    ts_section(0x40, CACHE_NETWORK_ID, &[0xF0, 0x00, 0xF0, 0x00])
+}
+
+fn section_packets(pid: u16, section: &[u8]) -> Vec<u8> {
+    let mut packets = Vec::new();
+    let mut remaining = section;
+    let mut cc = 0u8;
+    let mut first = true;
+    while first || !remaining.is_empty() {
+        let capacity = TS_PACKET_SIZE - 4 - usize::from(first);
+        let take = capacity.min(remaining.len());
+        let mut payload = Vec::with_capacity(take + 1);
+        if first {
+            payload.push(0x00);
+        }
+        payload.extend_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        packets.extend_from_slice(&ts_packet(pid, first, cc, &payload));
+        cc = cc.wrapping_add(1) & 0x0F;
+        first = false;
+    }
+    packets
+}
+
+/// A complete multiplex for channels 27/28 (two services, no PMT).
+fn cache_multiplex() -> Vec<u8> {
+    [
+        section_packets(0x0000, &pat_section()),
+        section_packets(0x0011, &sdt_section()),
+        section_packets(0x0010, &nit_section()),
+    ]
+    .concat()
+}
+
+/// `sh -c "cat <path>; sleep 30"`: streams the fixture then holds the pipe.
+fn cache_streaming_command(path: &Path) -> String {
+    format!("sh -c \"cat {}; sleep 30\"", path.display())
+}
+
+/// A fixture with `channels` and a GR tuner streaming `cache_multiplex()`.
+///
+/// `extra_tuners` is appended to `tuners.yml` (for a DEAD type, for example).
+fn cache_fixture(channels: &str, extra_tuners: &str) -> Fixture {
+    let fixture = Fixture::with(channels);
+    let ts = fixture.path.join("mux.ts");
+    std::fs::write(&ts, cache_multiplex()).expect("write ts");
+    let command = cache_streaming_command(&ts);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: good\n  types: [GR]\n  command: '{command}'\n{extra_tuners}"),
+    )
+    .expect("write tuners.yml");
+    fixture
+}
+
+fn cache_record(type_name: &str, channel: &str, sid: u16, name: &str) -> ServiceRecord {
+    let mut record = ServiceRecord::new(CACHE_NETWORK_ID, CACHE_TSID, sid, 0x01, name);
+    record.channel = Some((type_name.to_owned(), channel.to_owned()));
+    record
+}
+
+/// Runs the startup scan against the fixture's on-disk configuration.
+async fn populate_cache(state: &AppState) {
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(startup_scan(
+        state.manager.clone(),
+        Arc::clone(&state.config),
+        state.config_dir.clone(),
+        shutdown_rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+}
+
+fn scan_request() -> Request<Body> {
+    json_request(
+        Method::POST,
+        "/webui/api/services/scan",
+        serde_json::json!({}),
+    )
 }
 
 /// A restart hook that records how often it ran, so a test can assert that a
@@ -432,6 +588,39 @@ async fn the_index_has_a_channel_subtab_container() {
     assert!(html.contains("id=\"channels-table\""), "{html}");
     assert!(html.contains("<th>Extra-args</th>"), "{html}");
     assert!(html.contains("<th>Routes</th>"), "{html}");
+}
+
+#[tokio::test]
+async fn the_index_has_a_rescan_action_and_the_script_streams_it() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let (status, _, body) = get(&state, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    let html = text(&body);
+    assert!(html.contains("id=\"rescan\""), "{html}");
+    assert!(html.contains("aria-label=\"Re-scan services\""), "{html}");
+    assert!(html.contains("rescan-label"), "{html}");
+
+    let (status, _, body) = send_body(
+        &state,
+        Webui::default(),
+        request(Method::GET, "/assets/app.js"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let script = text(&body);
+    assert!(
+        script.contains("/webui/api/services/scan"),
+        "the button calls the re-scan endpoint"
+    );
+    assert!(
+        script.contains("getReader"),
+        "the progress is consumed as a stream"
+    );
+    assert!(
+        script.contains("textContent +="),
+        "server text is appended without innerHTML"
+    );
 }
 
 #[tokio::test]
@@ -1538,5 +1727,244 @@ async fn a_failed_exec_resumes_the_manager() {
         unituner::session::AcquireError::ShuttingDown,
         "a failed exec must not leave the manager shut down"
     );
+    state.manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent service cache + manual Re-scan (SPEC §8.2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_restart_serves_the_cached_services_without_a_scan() {
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let state = fixture.state();
+    populate_cache(&state).await;
+    state.manager.shutdown().await;
+
+    // Every tuner command would leave a marker if spawned; the cache matches the
+    // unchanged channels.yml, so the restart must not tune anything.
+    let marker = fixture.path.join("spawned");
+    let command = format!("sh -c \"touch {}; exec /nonexistent/x\"", marker.display());
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: good\n  types: [GR]\n  command: '{command}'\n"),
+    )
+    .expect("rewrite tuners.yml");
+
+    let config = Arc::new(Config::load(&fixture.path).expect("config loads"));
+    let table = load_service_cache(&fixture.path);
+    let restarted = AppState::new(config, table, fixture.path.clone());
+
+    // The production startup path: it sees the valid cache and returns.
+    populate_cache(&restarted).await;
+    assert!(!marker.exists(), "a valid cache must not spawn a tuner");
+
+    let response = webui::app(restarted.clone())
+        .oneshot(request(Method::GET, "/api/services"))
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = json(&body);
+    let names: Vec<&str> = value
+        .as_array()
+        .expect("services")
+        .iter()
+        .map(|service| service["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, ["NHK General", "NHK E"], "{value}");
+    assert_eq!(value[0]["channel"]["type"], "GR");
+    assert_eq!(value[0]["channel"]["channel"], "27");
+}
+
+#[tokio::test]
+async fn the_manual_rescan_streams_and_rewrites_the_cache() {
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let state = fixture.state();
+    populate_cache(&state).await;
+
+    let before = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    let channels_before = fixture.read("channels.yml");
+    // Millisecond precision in generated_at: leave at least one tick between
+    // the two writes.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let (status, headers, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    let log = text(&body);
+    assert!(log.contains("service re-scan"), "{log}");
+    assert!(log.contains("channel: \"27\""), "{log}");
+    assert!(log.contains("**RE-SCAN COMPLETE**"), "{log}");
+
+    let after = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    assert_ne!(after.generated_at, before.generated_at, "{after:?}");
+    assert_eq!(
+        after.fingerprint,
+        service_fingerprint(&state.config.channels),
+        "the re-scan keeps the current config's fingerprint"
+    );
+    assert_eq!(after.services.len(), 2);
+    assert_eq!(state.manager.services().list().len(), 2);
+    // The endpoint is strictly about services: the channel file is byte-identical.
+    assert_eq!(fixture.read("channels.yml"), channels_before);
+
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_concurrent_manual_rescan_is_409() {
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let state = fixture.state();
+
+    // The first request holds the shared scan lock for its whole pass.
+    let first = send(&state, Webui::default(), None, scan_request()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let value = json(&body);
+    assert_eq!(value["code"], 409);
+    assert_eq!(value["reason"], "Already Scanning");
+
+    // Dropping the body disconnects the first scan; wait until its tuner is
+    // released so the test does not leak a process into the TempDir cleanup.
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !state.manager.sessions_snapshot().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled re-scan never released its tuner"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_disconnected_manual_rescan_leaves_the_cache_untouched() {
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let state = fixture.state();
+    populate_cache(&state).await;
+    state.manager.shutdown().await;
+
+    // A slow tuner gives the client time to disconnect mid-pass.
+    let marker = fixture.path.join("spawned");
+    let ts = fixture.path.join("mux.ts");
+    let command = format!(
+        "sh -c \"touch {}; sleep 1; cat {}; sleep 30\"",
+        marker.display(),
+        ts.display()
+    );
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: good\n  types: [GR]\n  command: '{command}'\n"),
+    )
+    .expect("rewrite tuners.yml");
+
+    let config = Arc::new(Config::load(&fixture.path).expect("config loads"));
+    let table = load_service_cache(&fixture.path);
+    let state = AppState::new(config, table, fixture.path.clone());
+
+    let cache_before = std::fs::read(fixture.path.join("services.json")).expect("cache");
+    let response = send(&state, Webui::default(), None, scan_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-scan never reached the tuner"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(response);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !state.manager.sessions_snapshot().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the disconnected re-scan never released its tuner"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let cache_after = std::fs::read(fixture.path.join("services.json")).expect("cache");
+    assert_eq!(
+        cache_after, cache_before,
+        "a disconnected client must leave services.json untouched"
+    );
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_manual_rescan_drops_removed_channels_and_keeps_busy_ones() {
+    let fixture = cache_fixture(
+        &format!("{GOOD_CHANNEL}{DEAD_CHANNEL}"),
+        "- name: dead\n  types: [DEAD]\n  command: 'sh -c \"exit 1\"'\n",
+    );
+    let state = fixture.state();
+    let table = state.manager.services();
+    // A stale service on a scanned channel, a service of a channel that no
+    // longer exists, and a previous record of a no-signal channel.
+    table.insert(cache_record("GR", "27", 0x0999, "stale on 27"));
+    table.insert(cache_record("GR", "28", 0x0901, "removed channel"));
+    table.insert(cache_record("DEAD", "1", 0x0900, "kept no-signal"));
+
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&body).contains("**RE-SCAN COMPLETE**"));
+
+    let records = table.list();
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert!(
+        records.iter().any(|record| record.name == "NHK General"),
+        "the scanned channel was refreshed"
+    );
+    assert!(
+        !records.iter().any(|record| record.name == "stale on 27"),
+        "a service the channel no longer carries is dropped"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.name == "removed channel"),
+        "a channel removed from channels.yml is dropped"
+    );
+    assert!(
+        records.iter().any(|record| record.name == "kept no-signal"),
+        "a no-signal channel keeps its previous records"
+    );
+
+    let cache = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("present");
+    assert!(
+        !cache
+            .services
+            .iter()
+            .any(|record| record.name == "removed channel"),
+        "the cache follows the retain step"
+    );
+    assert!(cache
+        .services
+        .iter()
+        .any(|record| record.name == "kept no-signal"));
+
     state.manager.shutdown().await;
 }
