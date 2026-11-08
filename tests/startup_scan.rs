@@ -482,6 +482,92 @@ async fn startup_scan_leaves_the_table_empty_when_the_tuner_fails() {
 }
 
 #[tokio::test]
+async fn startup_scan_tolerates_twelve_seconds_before_the_first_byte() {
+    // `tune` on the failing deployment needs 6–11 s to lock and dantto4k needs
+    // 9–15 s before its first output, so 12 s must fit the default budgets.
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let ts = fixture.write_ts("mux.ts", &core_multiplex(SERVICES_27, true, true));
+    let command = format!("sh -c \"sleep 12; cat {}; sleep 30\"", ts.display());
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command, "true"))
+        .expect("rewrite tuners.yml");
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+
+    let manager = fixture.manager();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let started = Instant::now();
+    let task = tokio::spawn(startup_scan(
+        manager.clone(),
+        fixture.config(),
+        fixture.path.clone(),
+        shutdown_rx,
+    ));
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("startup scan finished")
+        .expect("startup scan task");
+    let elapsed = started.elapsed();
+
+    let services = manager.services().list();
+    assert_eq!(services.len(), 2, "{services:?}");
+    assert!(
+        elapsed >= Duration::from_secs(12),
+        "the scan did not wait for the delayed output: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(18),
+        "the default budget wasted time after the first byte: {elapsed:?}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_explicit_five_second_scan_budget_times_out_a_twelve_second_startup() {
+    use unituner::scan::{run_scan, ScanQuery};
+
+    let fixture = Fixture::new(&tuners("true", "true"), "");
+    let ts = fixture.write_ts("mux.ts", &core_multiplex(SERVICES_27, true, true));
+    let command = format!("sh -c \"sleep 12; cat {}; sleep 30\"", ts.display());
+    std::fs::write(fixture.path.join("tuners.yml"), tuners(&command, "true"))
+        .expect("rewrite tuners.yml");
+    let config = fixture.config();
+    // Channel 27 is already configured, so `refresh` is required for the
+    // discovery scan to tune it again. `dryRun` keeps channels.yml untouched.
+    std::fs::write(fixture.path.join("channels.yml"), GOOD_CHANNEL).expect("write channels.yml");
+    let mut query = ScanQuery::from_params(&std::collections::HashMap::from([
+        ("type".to_string(), "GR".to_string()),
+        ("minCh".to_string(), "27".to_string()),
+        ("maxCh".to_string(), "27".to_string()),
+        ("refresh".to_string(), "true".to_string()),
+        ("dryRun".to_string(), "true".to_string()),
+    ]))
+    .expect("query");
+    query.timeout = Duration::from_secs(5);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        run_scan(&fixture.manager(), &config, &fixture.path, &query, tx, None),
+    )
+    .await
+    .expect("the explicit budget must end the scan")
+    .expect("scan");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(4), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+
+    let mut progress = String::new();
+    while let Ok(line) = rx.try_recv() {
+        progress.push_str(&line);
+    }
+    assert!(
+        progress.contains("tuner failed to start: timed out waiting for the tuner to start"),
+        "a 5 s budget must report a timeout, not services: {progress:?}"
+    );
+    assert!(!progress.contains("services found"), "{progress:?}");
+}
+
+#[tokio::test]
 async fn startup_scan_does_not_cache_an_all_start_failure_pass() {
     // A broken command must not be remembered as "this config has no services":
     // an empty services.json would suppress the next boot's retry.

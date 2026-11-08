@@ -235,14 +235,15 @@ pub const PRELUDE_CHUNKS: usize = 2;
 /// happens if the runtime itself is starved.
 pub const BROADCAST_CAPACITY_CHUNKS: usize = 16;
 
-/// How long [`SessionManager::acquire`] waits for the first pipeline output
+/// Default time [`SessionManager::acquire`] waits for the first pipeline output
 /// before treating the spawn as failed (SPEC §6.2 readiness).
 ///
-/// Not specified by SPEC; a tuner that produces no byte at all in this window
-/// is treated as broken so a request cannot hang forever. With a working tuner
-/// the first packet arrives in milliseconds (a 204-framed source needs two
-/// packets for framing detection, still well under a second).
-pub const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// This is only the **default**; `server.tuner_readiness_timeout_secs`
+/// configures the live value (SPEC §3.1, §8). A tuner that produces no byte at
+/// all in this window is treated as broken so a request cannot hang forever.
+/// Real deployments need 6–11 s to lock before the first packet, so the default
+/// is 30 s rather than the old 10 s.
+pub const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Re-check interval while waiting for a concurrent spawn.
 ///
@@ -1390,7 +1391,7 @@ impl SessionManager {
                         tap,
                         bypass_pipeline,
                         scan,
-                        wait_deadline(),
+                        wait_deadline(inner.config.server.tuner_readiness_timeout()),
                     )
                     .await;
             }
@@ -1408,7 +1409,7 @@ impl SessionManager {
         let mut last_reason: Option<String> = None;
         // Waiting is only for concurrent spawns; bound the whole wait so a
         // wedged spawn cannot hold a request open indefinitely.
-        let wait_deadline = wait_deadline();
+        let wait_deadline = wait_deadline(inner.config.server.tuner_readiness_timeout());
 
         loop {
             if inner.shutting_down.load(Ordering::SeqCst) {
@@ -2652,7 +2653,11 @@ async fn spawn_and_promote(
             tracing::warn!(
                 session_id = session.id,
                 %label,
-                timeout_ms = READINESS_TIMEOUT.as_millis(),
+                timeout_ms = inner
+                    .config
+                    .server
+                    .tuner_readiness_timeout()
+                    .as_millis(),
                 "readiness timed out"
             );
             Some("timed out waiting for the first data".to_string())
@@ -2870,7 +2875,7 @@ async fn await_readiness(
     let timeout = if probe {
         Duration::from_millis(inner.config.server.tuner_startup_probe_ms)
     } else {
-        READINESS_TIMEOUT
+        inner.config.server.tuner_readiness_timeout()
     };
     let deadline = tokio::time::Instant::now() + timeout;
     // Fast path: the pump may have emitted (or ended) before we even wait.
@@ -2884,8 +2889,9 @@ async fn await_readiness(
         // `shutdown()` fires `notify_waiters()`. A `Notified` created after the
         // wake-up only sees the single sticky permit `notify_one` leaves, and a
         // second concurrent waiter can consume it, leaving this one asleep
-        // until `sleep_until(deadline)` — up to the whole probe window or
-        // READINESS_TIMEOUT — while `shutdown()` waits on `spawns_in_flight`.
+        // until `sleep_until(deadline)` — up to the whole probe window or the
+        // configured readiness timeout — while `shutdown()` waits on
+        // `spawns_in_flight`.
         let shutdown_wait = inner.shutdown_notify.notified();
         tokio::select! {
             // The readiness report wins over the timer. Without this, tokio may
@@ -2981,9 +2987,10 @@ fn release_reservation(inner: &Arc<Inner>, session: &Arc<Session>, victim: Optio
 /// The request-wide deadline for waiting on a concurrent spawn.
 ///
 /// Bounded so a wedged spawn cannot hold a request open indefinitely; the
-/// timeout is the readiness window plus a margin for the takeover teardown.
-fn wait_deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + READINESS_TIMEOUT + Duration::from_secs(5)
+/// timeout is the configured readiness window plus a margin for the takeover
+/// teardown.
+fn wait_deadline(readiness: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + readiness + Duration::from_secs(5)
 }
 
 /// Waits for a concurrent spawn/takeover to change `session`'s phase.
@@ -3008,7 +3015,7 @@ async fn wait_before_retry(
     // Without (2) a waiter that landed on a `Stopping` session could never
     // make progress: `unregister_stopped` removes the registry entry without
     // changing the phase, so the old predicate stayed false until the whole
-    // `wait_deadline` (READINESS_TIMEOUT + 5 s) expired and turned a perfectly
+    // `wait_deadline` (readiness + 5 s) expired and turned a perfectly
     // serviceable request, or a scan channel, into a 503 / `NoSignal`.
     //
     // Waiting is still correct for a *registered* `Stopping`/`Failed` session

@@ -968,10 +968,13 @@ async fn scan_channels(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let query = match ScanQuery::from_params(&params) {
+    let mut query = match ScanQuery::from_params(&params) {
         Ok(query) => query,
         Err(reason) => return error_response(StatusCode::BAD_REQUEST, reason),
     };
+    // The discovery scan obeys the same per-channel budget as the startup scan
+    // and the manual re-scan (SPEC §8). `from_params` only knows the default.
+    query.timeout = state.config.server.scan_channel_timeout();
     // The scan reads and rewrites channels.yml, so a corrupt file must fail the
     // request before the response starts streaming: once the body is a stream
     // the status is already 200 and an error can only be a progress line.

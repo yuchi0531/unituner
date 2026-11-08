@@ -143,23 +143,26 @@ use crate::session::{SessionManager, SessionTap, TunerUser, SCAN_PRIORITY};
 use crate::si::{SdtInfo, SiEvent, SiParser, TableCompleteness};
 use crate::webui::store;
 
-/// Default per-channel scan budget (SPEC §8: "既定 timeout 10s/ch").
+/// Default per-channel scan budget (SPEC §8).
 ///
-/// This budget covers **both** the acquire (including the session readiness
-/// wait, [`crate::session::READINESS_TIMEOUT`] = 10 s) and reading SI, so it
-/// must stay strictly greater than the readiness timeout: otherwise the scan's
-/// own `timeout_at` would always fire first and cut the acquire off from
-/// outside. 25 s leaves the readiness gate its 10 s plus up to 5 s of waiting
-/// for a concurrent spawn, with the rest for SI.
+/// This is only the **default**; `server.scan_channel_timeout_secs` configures
+/// the live value. The budget covers **both** the acquire (which waits up to
+/// the readiness gate, [`crate::session::READINESS_TIMEOUT`] by default) and
+/// reading SI, so it must stay strictly greater than the readiness timeout:
+/// otherwise the scan's own `timeout_at` would always fire first and cut the
+/// acquire off from outside. 60 s leaves the 30 s readiness gate plus up to 5 s
+/// of waiting for a concurrent spawn, with the rest for SI — enough for a
+/// descrambler that needs more than 25 s before its first output.
 ///
 /// The session layer is cancellation-safe (see [`crate::session`]), so even a
 /// cut-off acquire now stops its tree instead of leaking the tuner; the larger
 /// budget simply avoids the cancellation on a merely slow tuner.
-pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(25);
+pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Compile-time guard for the budget relationship documented on
+/// Compile-time guard for the default budget relationship documented on
 /// [`CHANNEL_TIMEOUT`]: a channel budget at or below the readiness timeout would
-/// make the scan cancel every slow spawn.
+/// make the scan cancel every slow spawn. The configured values are checked at
+/// startup (`server.yml` validation).
 const _: () = assert!(CHANNEL_TIMEOUT.as_secs() > crate::session::READINESS_TIMEOUT.as_secs());
 
 /// Hard cap on the channels one scan request may touch.
@@ -615,7 +618,7 @@ struct ChannelSink {
 /// ~0.4-0.8 s (and PAT/PMT/SDT faster), so a 700 ms window could still miss
 /// one NIT repetition — and with it the `network_id` and the
 /// `remote_control_key_id` of every service on that channel. 1.5 s covers at
-/// least one repetition while staying far below the 25 s budget.
+/// least one repetition while staying far below the configured channel budget.
 const SI_GRACE_AFTER_SDT: Duration = Duration::from_millis(1500);
 
 /// Accumulates SDT-actual sections until one table version is complete.
@@ -1491,7 +1494,7 @@ async fn scan_channel_watched(
     // for SI; the read then uses what is left of the channel deadline.
     let started = Instant::now();
     let deadline = started + timeout;
-    let acquire_budget = crate::session::READINESS_TIMEOUT + Duration::from_secs(5);
+    let acquire_budget = manager.config().server.tuner_readiness_timeout() + Duration::from_secs(5);
     let acquire_deadline = deadline.min(started + acquire_budget);
     let acquire = tokio::time::timeout_at(
         acquire_deadline,
@@ -2051,7 +2054,8 @@ struct PassSummary {
 ///   re-scan replaces it.
 /// * Each channel runs through [`scan_channel`] at [`SCAN_PRIORITY`], so a user
 ///   request always wins and a busy tuner is skipped rather than preempted.
-/// * The per-channel budget is [`CHANNEL_TIMEOUT`], covering acquire + SI read.
+/// * The per-channel budget is `server.scan_channel_timeout_secs`
+///   ([`CHANNEL_TIMEOUT`] by default), covering acquire + SI read.
 /// * Channels that failed for lack of a tuner ([`ChannelOutcome::Busy`], i.e.
 ///   busy or no supporting tuner) or because a user request preempted the scan
 ///   ([`ChannelOutcome::Preempted`]) are retried; a no-signal channel is not.
@@ -2285,7 +2289,7 @@ pub async fn rescan_services(
             manager,
             &channel.type_name,
             &channel.channel,
-            CHANNEL_TIMEOUT,
+            config.server.scan_channel_timeout(),
             shutdown.clone(),
         )
         .await;
@@ -2431,6 +2435,7 @@ async fn scan_pass(
         });
     }
 
+    let channel_timeout = config.server.scan_channel_timeout();
     let mut tasks = tokio::task::JoinSet::new();
     for (index, channel) in pending.iter().enumerate() {
         let manager = manager.clone();
@@ -2455,7 +2460,7 @@ async fn scan_pass(
                 &manager,
                 &channel.type_name,
                 &channel.channel,
-                CHANNEL_TIMEOUT,
+                channel_timeout,
                 Some(shutdown.clone()),
             )
             .await;
@@ -3656,6 +3661,9 @@ mod tests {
             CHANNEL_TIMEOUT > crate::session::READINESS_TIMEOUT,
             "a channel budget at or below the readiness timeout would cancel every slow spawn"
         );
+        // The same relationship for the configured values.
+        let manager_config = crate::config::ServerConfig::default();
+        assert!(manager_config.scan_channel_timeout() > manager_config.tuner_readiness_timeout());
     }
 
     /// A scan fixture: one `GR` tuner whose command depends on the channel.
