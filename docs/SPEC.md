@@ -476,6 +476,7 @@ Found 1 channels for 13
 | `GET /api/tuners` | index, name, types, isAvailable, isFree, isUsing, isFault:false, users:[{date,id,priority,provider}] |
 | `GET /api/tuners/{index}` | 同上（単体） |
 | `GET /api/programs` | **200 `[]` 固定**（EPG 非実装の明示） |
+| `GET / HEAD /api/iptv/playlist` | mirakurun 互換 M3U。EPG 非実装のため `url-tvg` なし。service type 1 / 173 のみ |
 | `PUT /api/config/channels/scan` | チャンネル探索（8.1）。`text/plain` ストリーミング、完了まで応答が返る |
 | `GET /api/config/channels/scan` | **404**（`async` 非対応のため） |
 
@@ -483,7 +484,12 @@ Found 1 channels for 13
 - `decode=0` は 4.1 通り。
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` は 6.3 通り。
 - `/api/channels` は 1 リクエストにつきサービス表のスナップショット（`ServiceTable::list()`）を 1 回だけ取り、各チャンネルの services はそこから該当分をフィルタして埋める（チャンネル数ぶんの全件 clone + sort をしない）。`/api/channels/{type}/{channel}` は `list_by_channel` で該当チャンネル分だけを取得する。
-- 未実装（404 `{code,reason}`）: `/api/programs/{id}(/stream)`, jobs/events/log, config CRUD（mirakurun 互換外。`PUT /api/config/channels/scan` のみ例外）, `/api/config/channels/scan` の GET ポーリング, `/api/restart`, iptv/HDHR/websocket, logos, `/rpc`, `/docs`, mirakurun 静的 web UI。
+- `/api/iptv/playlist` は mirakurun の `playlist.ts` 互換。先頭は `#EXTM3U` のみで、`url-tvg` は付けない（EPG 非実装）。`/api/iptv/xmltv` と `/api/iptv/epg` は 404 のまま。
+  - 掲載対象は service type `0x01` (1) と `0xAD` (173) のみ。ラジオ (0x02)・データ (0xC0) などは出さない。ロゴ非実装のため `tvg-logo` も出さない。
+  - エントリは `#KODIPROP:mimetype=video/mp2t`、`#EXTINF:-1 tvg-id="<ServiceItemId>" group-title="<channel type>",<service name>`、`http://<Host>/api/services/<ServiceItemId>/stream`。名前の `\n` / `\r` は空白に置換し、それ以外のエスケープはしない（mirakurun と同じ）。
+  - `Host` ヘッダがあればその authority を `http://` の後に使う。無ければ `server.yml` の `addr` を `<host>:<port>` として使う。`0.0.0.0:40772` / `:40772` のようなワイルドカード bind は `127.0.0.1:40772` に読み替える。
+  - 並び順は GR → BS → CS → SKY → その他の type のアルファベット順、各グループ内はチャンネル値の自然順（両方整数なら数値、そうでなければ辞書順）、最後に serviceId。空のサービス表でも `#EXTM3U` を返す。Content-Type は `application/x-mpegURL; charset=utf-8`。
+- 未実装（404 `{code,reason}`）: `/api/programs/{id}(/stream)`, jobs/events/log, config CRUD（mirakurun 互換外。`PUT /api/config/channels/scan` のみ例外）, `/api/config/channels/scan` の GET ポーリング, `/api/restart`, HDHR/websocket, EPG (`/api/iptv/xmltv`、`/api/iptv/epg`), logos, `/rpc`, `/docs`, mirakurun 静的 web UI。
   - `hasLogoData:false` なので KonomiTV は `/api/services/{id}/logo` を呼ばない。
 
 ## 10. webui（フル管理 UI）
@@ -567,6 +573,7 @@ unituner/
 - priority の multi-header 集約は未対応（単一値前提）
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
+- IPTV はプレイリスト（`/api/iptv/playlist`）のみ実装済み。EPG は非実装なので `url-tvg` を付けず、`/api/iptv/xmltv` / `/api/iptv/epg` は 404。ロゴも非実装なので `tvg-logo` を出さない
 - webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
 - `Host` が無い/空のリクエストは webui / `/api/*` とも受理する（BonDriver_Mirakurun 等のネイティブクライアント用）。存在するが許可外の `Host` は 403。ブラウザは authority 無しで送れないため DNS リバインディング対策は弱まらない
 - 初回起動など `services.json` が無い/無効なとき、スキャン完了までは `/api/services/{id}/stream` が 404 しうる（有効なキャッシュがあれば起動直後から配信できる）

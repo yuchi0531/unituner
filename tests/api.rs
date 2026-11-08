@@ -2809,6 +2809,249 @@ fn loopback_ip(last: u8) -> SocketAddr {
     )
 }
 
+// ---------------------------------------------------------------------------
+// IPTV playlist (SPEC §9)
+// ---------------------------------------------------------------------------
+
+fn playlist_fixture(server: &str) -> Fixture {
+    Fixture::new_with_server(server, &tuners("true"), &channels(&[]), PIPELINE_CAT)
+}
+
+fn playlist_table(entries: &[(u16, u8, &str, &str, &str)]) -> ServiceTable {
+    let table = ServiceTable::new();
+    for &(sid, service_type, name, channel_type, channel) in entries {
+        let mut record = ServiceRecord::new(NETWORK_ID, TSID, sid, service_type, name);
+        record.channel = Some((channel_type.to_string(), channel.to_string()));
+        table.upsert(record);
+    }
+    table
+}
+
+fn playlist_extinf(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter(|line| line.starts_with("#EXTINF"))
+        .collect()
+}
+
+#[tokio::test]
+async fn iptv_playlist_lists_only_type_1_and_173() {
+    let fixture = playlist_fixture(SERVER);
+    let services = playlist_table(&[
+        (0x0401, 0x01, "NHK General", "GR", "27"),
+        (0x0402, 0x01, "NHK E", "GR", "27"),
+        (0x0403, 0xAD, "BS Premium", "BS", "BS01"),
+        (0x0404, 0x02, "NHK Radio", "GR", "27"),
+        (0x0405, 0xC0, "Data", "GR", "27"),
+    ]);
+    let state = fixture.state_with(services);
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/iptv/playlist",
+            &[("host", "example.lan:40772")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    let entries = playlist_extinf(&text);
+    assert_eq!(entries.len(), 3, "playlist:\n{text}");
+    assert!(
+        !text.contains("NHK Radio"),
+        "radio must be skipped:\n{text}"
+    );
+    assert!(
+        !text.contains("Data"),
+        "data service must be skipped:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn iptv_playlist_entry_has_the_mirakurun_shape() {
+    let fixture = playlist_fixture(SERVER);
+    let services = playlist_table(&[(TARGET_SID, 0x01, "NHK General", "GR", "27")]);
+    let state = fixture.state_with(services);
+    let item_id = u64::from(NETWORK_ID) * 100_000 + u64::from(TARGET_SID);
+
+    let (status, headers, body) = send_body(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/iptv/playlist",
+            &[("host", "example.lan:40772")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header_str(&headers, "content-type"),
+        "application/x-mpegURL; charset=utf-8"
+    );
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    let expected = format!(
+        "#EXTM3U\n\
+         #KODIPROP:mimetype=video/mp2t\n\
+         #EXTINF:-1 tvg-id=\"{item_id}\" group-title=\"GR\",NHK General\n\
+         http://example.lan:40772/api/services/{item_id}/stream\n"
+    );
+    assert_eq!(text, expected);
+    assert!(!text.contains("tvg-logo"), "logos are not implemented");
+    assert!(!text.contains("url-tvg"), "EPG is not implemented");
+}
+
+#[tokio::test]
+async fn iptv_playlist_orders_by_channel_type_then_natural_channel() {
+    let fixture = playlist_fixture(SERVER);
+    let services = playlist_table(&[
+        (0x0401, 0x01, "GR 27", "GR", "27"),
+        (0x0402, 0x01, "GR 26", "GR", "26"),
+        (0x0403, 0x01, "GR 2", "GR", "2"),
+        (0x0404, 0xAD, "BS 01", "BS", "BS01"),
+        (0x0405, 0x01, "CS 01", "CS", "CS01"),
+        (0x0406, 0x01, "SKY 01", "SKY", "SKY01"),
+        (0x0407, 0x01, "AA 1", "AA", "1"),
+        (0x0408, 0x01, "ZZ 1", "ZZ", "1"),
+    ]);
+    let state = fixture.state_with(services);
+
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/iptv/playlist",
+            &[("host", "example.lan:40772")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    let names: Vec<&str> = playlist_extinf(&text)
+        .into_iter()
+        .map(|line| line.split_once(',').expect("EXTINF name").1)
+        .collect();
+    assert_eq!(
+        names,
+        ["GR 2", "GR 26", "GR 27", "BS 01", "CS 01", "SKY 01", "AA 1", "ZZ 1"],
+        "playlist:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn iptv_playlist_uses_host_then_the_configured_address() {
+    let services = playlist_table(&[(TARGET_SID, 0x01, "NHK General", "GR", "27")]);
+    let item_id = u64::from(NETWORK_ID) * 100_000 + u64::from(TARGET_SID);
+
+    // A present Host wins over the configured listen address.
+    let fixture = playlist_fixture(r#"addr: "192.168.1.5:40772""#);
+    let state = fixture.state_with(services.clone());
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request_with_headers(
+            Method::GET,
+            "/api/iptv/playlist",
+            &[("host", "example.lan:40772")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    assert!(
+        text.contains(&format!(
+            "http://example.lan:40772/api/services/{item_id}/stream"
+        )),
+        "playlist:\n{text}"
+    );
+
+    // No Host: use the literal configured address.
+    let (status, _, body) =
+        send_body(&state, PEER, request(Method::GET, "/api/iptv/playlist")).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    assert!(
+        text.contains(&format!(
+            "http://192.168.1.5:40772/api/services/{item_id}/stream"
+        )),
+        "playlist:\n{text}"
+    );
+
+    // No Host and a wildcard bind: point at loopback rather than 0.0.0.0.
+    for addr in [r#"addr: ":40772""#, r#"addr: "0.0.0.0:40772""#] {
+        let fixture = playlist_fixture(addr);
+        let state = fixture.state_with(services.clone());
+        let (status, _, body) =
+            send_body(&state, PEER, request(Method::GET, "/api/iptv/playlist")).await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).expect("utf-8 playlist");
+        assert!(
+            text.contains(&format!(
+                "http://127.0.0.1:40772/api/services/{item_id}/stream"
+            )),
+            "addr {addr} must fall back to loopback:\n{text}"
+        );
+        assert!(
+            !text.contains("0.0.0.0"),
+            "a wildcard bind must not leak into the playlist"
+        );
+    }
+}
+
+#[tokio::test]
+async fn iptv_playlist_head_returns_headers_without_a_body() {
+    let fixture = playlist_fixture(SERVER);
+    let services = playlist_table(&[(TARGET_SID, 0x01, "NHK General", "GR", "27")]);
+    let state = fixture.state_with(services);
+
+    let (status, headers, body) =
+        send_body(&state, PEER, request(Method::GET, "/api/iptv/playlist")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        header_str(&headers, "content-type"),
+        "application/x-mpegURL; charset=utf-8"
+    );
+    assert!(!body.is_empty());
+
+    let head = send(&state, PEER, request(Method::HEAD, "/api/iptv/playlist")).await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(head.headers(), "content-type"),
+        "application/x-mpegURL; charset=utf-8"
+    );
+    assert!(read_all(head.into_body()).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_empty_iptv_playlist_is_just_the_m3u_header() {
+    let fixture = playlist_fixture(SERVER);
+    let state = fixture.state();
+
+    let (status, _, body) =
+        send_body(&state, PEER, request(Method::GET, "/api/iptv/playlist")).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 playlist");
+    assert_eq!(text, "#EXTM3U\n");
+    assert!(!text.contains("url-tvg"));
+}
+
+#[tokio::test]
+async fn iptv_epg_endpoints_remain_404() {
+    let fixture = playlist_fixture(SERVER);
+    let state = fixture.state();
+
+    for path in ["/api/iptv/xmltv", "/api/iptv/epg"] {
+        let (status, _, body) = send_body(&state, PEER, request(Method::GET, path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        let error = json(&body);
+        assert_eq!(error["code"], 404, "{path}");
+        assert_eq!(error["reason"], "Not Found", "{path}");
+    }
+}
+
 #[tokio::test]
 async fn subscriber_caps_answer_429_and_ignore_forwarded_for() {
     let log_dir = tempfile::TempDir::new().expect("spawn log dir");

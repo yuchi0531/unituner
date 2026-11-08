@@ -16,6 +16,7 @@
 //! | `GET /api/tuners` / `{index}` | tuner state and users |
 //! | `GET /api/programs` | always `[]` (no EPG, SPEC §1) |
 //! | `GET /api/programs/{id}` | 404 |
+//! | `GET /api/iptv/playlist` / `HEAD` | mirakurun-compatible M3U (no EPG) |
 //! | `PUT /api/config/channels/scan` | channel discovery (SPEC §8.1) |
 //! | `GET /api/config/channels/scan` | 404 (`async` is not implemented) |
 //!
@@ -69,6 +70,7 @@
 //! using the socket peer ([`ConnectInfo`]) for the per-IP bucket; a header is
 //! never trusted for that.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -109,6 +111,9 @@ const TUNER_USER_ID: &str = "x-mirakurun-tuner-user-id";
 
 /// `VIDEO/MP2T` as sent by mirakurun; the case is preserved verbatim.
 const TS_CONTENT_TYPE: &str = "video/MP2T";
+
+/// mirakurun's IPTV playlist content type (SPEC §9).
+const IPTV_CONTENT_TYPE: &str = "application/x-mpegURL; charset=utf-8";
 
 /// Shared state of the HTTP layer.
 #[derive(Clone)]
@@ -246,6 +251,10 @@ fn api_routes() -> Router<AppState> {
         .route("/api/tuners/{index}", get(tuner))
         .route("/api/programs", get(programs))
         .route("/api/programs/{program}", get(program_not_found))
+        .route(
+            "/api/iptv/playlist",
+            get(iptv_playlist).head(iptv_playlist_head),
+        )
         // `async` is not implemented (SPEC §8.1): a GET must be a 404, not a
         // 405, because mirakurun clients poll this path.
         .route(
@@ -527,6 +536,147 @@ async fn programs() -> Json<Value> {
 
 async fn program_not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "Program Not Found")
+}
+
+// ---------------------------------------------------------------------------
+// IPTV playlist (no EPG)
+// ---------------------------------------------------------------------------
+
+/// mirakurun's IPTV playlist, minus `url-tvg` because unituner serves no EPG
+/// (SPEC §9). Only service types `0x01` (TV) and `0xAD` (BS4K/180) are listed.
+async fn iptv_playlist(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let api_root = format!("http://{}/api", playlist_authority(&state, &headers));
+    let records = state.manager.services().list();
+    playlist_response(Body::from(iptv_playlist_body(&api_root, &records)))
+}
+
+/// `HEAD /api/iptv/playlist`: the GET response headers, without a body.
+async fn iptv_playlist_head() -> Response {
+    playlist_response(Body::empty())
+}
+
+fn playlist_response(body: Body) -> Response {
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(IPTV_CONTENT_TYPE),
+    );
+    response
+}
+
+/// The request's authority, or the configured listen address when the client
+/// omitted `Host` (native clients do that; SPEC §3.1).
+fn playlist_authority(state: &AppState, headers: &HeaderMap) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback_authority(&state.config.server.addr))
+}
+
+/// `server.addr` as `<host>:<port>`, with a wildcard bind pointing at loopback.
+fn fallback_authority(addr: &str) -> String {
+    match bind_address(addr) {
+        Ok(bind) if bind.ip().is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), bind.port()).to_string()
+        }
+        Ok(bind) => bind.to_string(),
+        // Config validation rejects this, but never return an empty host.
+        Err(_) => "127.0.0.1:40772".to_string(),
+    }
+}
+
+fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord]) -> String {
+    let mut services: Vec<&ServiceRecord> = records
+        .iter()
+        .filter(|record| matches!(record.service_type, 1 | 173))
+        .collect();
+    services.sort_by(|left, right| playlist_order(left, right));
+
+    let mut body = String::from("#EXTM3U\n");
+    // The same item id can appear on two channels; mirakurun lists one service
+    // entry per id, and so does `/api/services`.
+    let mut seen = HashSet::new();
+    for record in services {
+        if !seen.insert(record.item_id()) {
+            continue;
+        }
+        let item_id = record.item_id();
+        let channel_type = record
+            .channel
+            .as_ref()
+            .map(|(channel_type, _)| channel_type.as_str())
+            .unwrap_or("");
+        let name = record.name.replace(['\r', '\n'], " ");
+        body.push_str("#KODIPROP:mimetype=video/mp2t\n");
+        body.push_str(&format!(
+            "#EXTINF:-1 tvg-id=\"{item_id}\" group-title=\"{channel_type}\",{name}\n"
+        ));
+        body.push_str(&format!("{api_root}/services/{item_id}/stream\n"));
+    }
+    body
+}
+
+/// Channel-oriented order: GR, BS, CS, SKY, then any other type alphabetically;
+/// each group by natural channel value, then service id.
+fn playlist_order(left: &ServiceRecord, right: &ServiceRecord) -> Ordering {
+    playlist_type_rank(left)
+        .cmp(&playlist_type_rank(right))
+        .then_with(|| playlist_other_type(left).cmp(&playlist_other_type(right)))
+        .then_with(|| {
+            cmp_channel(
+                left.channel.as_ref().map(|(_, channel)| channel.as_str()),
+                right.channel.as_ref().map(|(_, channel)| channel.as_str()),
+            )
+        })
+        .then_with(|| left.service_id.cmp(&right.service_id))
+        .then_with(|| left.item_id().0.cmp(&right.item_id().0))
+}
+
+fn playlist_type_rank(record: &ServiceRecord) -> u8 {
+    match record
+        .channel
+        .as_ref()
+        .map(|(channel_type, _)| channel_type.as_str())
+    {
+        Some("GR") => 0,
+        Some("BS") => 1,
+        Some("CS") => 2,
+        Some("SKY") => 3,
+        _ => 4,
+    }
+}
+
+/// The channel type for the alphabetical tie-break among non-GR/BS/CS/SKY
+/// types; `None` for the four ranked types (and for an unbound service).
+fn playlist_other_type(record: &ServiceRecord) -> Option<&str> {
+    match record
+        .channel
+        .as_ref()
+        .map(|(channel_type, _)| channel_type.as_str())
+    {
+        None | Some("GR" | "BS" | "CS" | "SKY") => None,
+        Some(other) => Some(other),
+    }
+}
+
+/// Natural channel order: numeric when both sides are integers, else lexical.
+fn cmp_channel(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left_number), Ok(right_number)) => {
+                left_number.cmp(&right_number).then_with(|| left.cmp(right))
+            }
+            _ => left.cmp(right),
+        },
+        // An unbound service has no channel to sort by; keep it after bound ones.
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 // ---------------------------------------------------------------------------

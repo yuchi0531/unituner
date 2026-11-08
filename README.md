@@ -228,7 +228,7 @@ types:
 
 ## API
 
-ベースは `http://host:40772`。すべて JSON。エラーは `{"code":<status>,"reason":"…","errors":[]}` 形式（`errors` は通常空で、設定検証エラー時のみ issue の一覧が入る）。
+ベースは `http://host:40772`。JSON が基本で、IPTV プレイリストだけ M3U テキスト。エラーは `{"code":<status>,"reason":"…","errors":[]}` 形式（`errors` は通常空で、設定検証エラー時のみ issue の一覧が入る）。
 
 | メソッド | パス | 内容 |
 |---|---|---|
@@ -246,10 +246,13 @@ types:
 | GET | `/api/tuners/{index}` | 単体。数値でない・範囲外は 404 |
 | GET | `/api/programs` | 常に `[]`（EPG 非実装） |
 | GET | `/api/programs/{id}` | 404 |
+| GET / HEAD | `/api/iptv/playlist` | mirakurun 互換の M3U プレイリスト。VLC などの IPTV クライアントに読み込ませる |
 | PUT | `/api/config/channels/scan` | チャンネル探索（`text/plain` ストリーミング） |
 | GET | `/api/config/channels/scan` | 404（`async` 非対応） |
 
 サービスの JSON は `logoId: 0`、`hasLogoData: false` を常に持つ（ロゴは扱わない）。`channel` は探索で紐付くまで `null`。
+
+`/api/iptv/playlist` は `curl http://host:40772/api/iptv/playlist` で取得できる M3U。EPG は実装していないため `url-tvg` は付けず、`/api/iptv/xmltv` は 404 のまま。ロゴも非実装なので `tvg-logo` は出さない。掲載対象は service type 1 / 173 のみ（GR 27 などの TV と BS4K）。`Host` ヘッダが無い場合は `server.yml` の `addr` を使い、`0.0.0.0:40772` / `:40772` のようなワイルドカードは `127.0.0.1:40772` に読み替える。
 
 ### 共通ヘッダ
 
@@ -484,7 +487,7 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 
 ## 制限事項
 
-- EPG・録画・タイムシフト・ロゴ（CDT）・MMT/TLV の内部処理・websocket・HDHR/xmltv は実装していない。TLV は pipeline 内の外部コマンドで MPEG-TS に変換してから渡す前提。
+- EPG（xmltv）・録画・タイムシフト・ロゴ（CDT）・MMT/TLV の内部処理・websocket・HDHR は実装していない。IPTV はプレイリスト（`/api/iptv/playlist`）のみで、`/api/iptv/xmltv` / `/api/iptv/epg` は 404。TLV は pipeline 内の外部コマンドで MPEG-TS に変換してから渡す前提。
 - `/api/programs` は常に `[]`、`/api/programs/{id}` は 404。
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応。例外は `PUT /api/config/channels/scan` のみ。
 - チャンネル探索の `async` と `GET` ポーリングは非対応。`GET /api/config/channels/scan` は 404。
