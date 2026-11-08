@@ -784,6 +784,127 @@ async function waitForServer() {
 }
 
 // ---------------------------------------------------------------------------
+// Service re-scan
+// ---------------------------------------------------------------------------
+
+/** Appends a stream chunk to the dialog log without interpreting markup. */
+function appendScanLog(log, chunk) {
+  log.textContent += chunk;
+  log.scrollTop = log.scrollHeight;
+}
+
+/** Builds the modal that shows the `text/plain` progress stream. */
+function openRescanDialog(onAbort) {
+  const log = el('pre', { class: 'scan-log', text: '' });
+  const status = el('p', { class: 'hint', text: 'Starting…' });
+  const closeButton = el('button', { type: 'button', text: 'Close' });
+  const modal = el('div', {
+    class: 'modal',
+    role: 'dialog',
+    'aria-modal': 'true',
+    'aria-label': 'Service re-scan progress',
+  }, [
+    el('h3', { text: 'Re-scan services' }),
+    status,
+    log,
+    el('div', { class: 'modal-actions' }, [closeButton]),
+  ]);
+  const backdrop = el('div', { class: 'modal-backdrop' }, [modal]);
+
+  let finished = false;
+  const close = () => {
+    if (!backdrop.parentNode) return;
+    backdrop.remove();
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (event) => {
+    if (event.key === 'Escape') close();
+  };
+  closeButton.addEventListener('click', () => {
+    // Closing mid-pass aborts the request: the server then leaves
+    // services.json untouched (SPEC §8.2).
+    if (!finished) onAbort();
+    close();
+  });
+  document.addEventListener('keydown', onKey);
+  document.body.append(backdrop);
+
+  return {
+    log,
+    status,
+    markDone() {
+      finished = true;
+    },
+    close,
+  };
+}
+
+async function rescanServices() {
+  const confirmed = window.confirm(
+    'Re-scan the service table?\n\nEvery enabled channel is tuned once. channels.yml is not changed; services.json is rewritten.',
+  );
+  if (!confirmed) return;
+
+  const controller = new AbortController();
+  const dialog = openRescanDialog(() => controller.abort());
+  $('#rescan').disabled = true;
+  message('Re-scanning services…');
+  try {
+    const response = await fetch('/webui/api/services/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+      signal: controller.signal,
+    });
+    if (response.status === 409) {
+      dialog.close();
+      message('Already scanning', 'error');
+      return;
+    }
+    if (!response.ok) {
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        // Not JSON: keep the status text.
+      }
+      const error = new Error((body && body.reason) || response.statusText);
+      error.body = body;
+      error.status = response.status;
+      throw error;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      if (chunk) appendScanLog(dialog.log, chunk);
+    }
+    const tail = decoder.decode();
+    if (tail) appendScanLog(dialog.log, tail);
+
+    dialog.status.textContent = 'Re-scan complete.';
+    dialog.markDone();
+    message('Service re-scan complete.', 'ok');
+    // Refresh both the Services table and the Status counts.
+    await Promise.allSettled([loadServices(), refreshStatus()]);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      dialog.close();
+      message('Re-scan cancelled.', 'error');
+    } else {
+      dialog.status.textContent = 'Re-scan failed.';
+      dialog.markDone();
+      message('Re-scan failed:\n' + describe(error), 'error');
+    }
+  } finally {
+    $('#rescan').disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Theme
 // ---------------------------------------------------------------------------
 
@@ -858,6 +979,7 @@ function init() {
     });
   });
   $('#restart').addEventListener('click', restart);
+  $('#rescan').addEventListener('click', rescanServices);
   startStatusPolling();
   showTab('status');
 }

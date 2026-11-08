@@ -679,6 +679,56 @@ td input[type="checkbox"] { width: 18px; }
 .route label { display: grid; gap: 4px; font-size: 12px; color: var(--md-text-secondary); }
 .route-actions { display: flex; gap: 4px; }
 
+/* Re-scan dialog: a streaming log over a dimmed backdrop. The log is plain
+   text (server progress lines are never interpreted as markup). */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(720px, 100%);
+  max-height: min(80vh, 720px);
+  padding: 20px;
+  border-radius: var(--md-radius);
+  background: var(--md-surface-1);
+  color: var(--md-text);
+  box-shadow: var(--md-elevation-6);
+}
+
+.modal h3 { margin: 0; }
+
+.modal .scan-log {
+  flex: 1 1 auto;
+  min-height: 200px;
+  max-height: 60vh;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--md-divider);
+  border-radius: var(--md-radius);
+  background: var(--md-code-bg);
+  color: var(--md-text);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* Footer and snackbar. */
 
 footer {
@@ -732,6 +782,8 @@ footer {
      and let aria-label carry the name. */
   .restart { padding: 0; width: 40px; min-width: 40px; }
   .restart-label { display: none; }
+  .rescan { padding: 0; width: 40px; min-width: 40px; }
+  .rescan-label { display: none; }
   .tabs { padding: 0; }
   .tabs button { flex: 1 0 auto; padding: 0 16px; }
   .subtabs button { flex: 0 1 auto; }

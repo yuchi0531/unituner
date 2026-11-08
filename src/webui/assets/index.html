@@ -41,6 +41,12 @@
       </svg>
       <span class="restart-label">Restart</span>
     </button>
+    <button id="rescan" class="appbar-action rescan" type="button" aria-label="Re-scan services">
+      <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M12 4a8 8 0 0 0-7.75 6H2l3.5 4L9 10H6.35A6 6 0 1 1 6.1 15.2l-1.45 1.45A8 8 0 1 0 12 4z"/>
+      </svg>
+      <span class="rescan-label">Re-scan</span>
+    </button>
   </div>
   <nav class="tabs" id="tabs" role="tablist" aria-label="Sections">
     <button data-tab="status" class="active" role="tab" aria-selected="true">Status</button>
@@ -64,7 +70,7 @@
 
   <section id="tab-services" class="tab">
     <h2>Services</h2>
-    <p class="hint">Services discovered by a scan. The table is empty until one runs.</p>
+    <p class="hint">Services discovered by a scan. The table is empty until one runs; use <strong>Re-scan</strong> in the app bar after a broadcast reorganisation.</p>
     <div class="scroll"><table id="services-table">
       <thead><tr><th>ID</th><th>SID</th><th>NID</th><th>Name</th><th>Type</th><th>Channel</th></tr></thead>
       <tbody></tbody>
