@@ -72,11 +72,15 @@
 //! * an IP literal inside `server.allowed_cidrs`, or
 //! * one of `server.allowed_hosts` (exact, ASCII-case-insensitive).
 //!
-//! Anything else (including a missing `Host`) is
-//! `403 {"code":403,…}`. The rebinding check is per request, not per method, so
-//! reads are covered too. A deployment behind a reverse proxy, or reached by a
-//! host name, must list that name in `allowed_hosts`: the peer-address guard
-//! cannot see the name the browser used.
+//! A present but disallowed `Host` is `403 {"code":403,…}`. An **absent or
+//! empty** `Host` (and no URI authority) is allowed through: browsers cannot
+//! issue a request without an authority (HTTP/1.1 requires `Host`, HTTP/2 uses
+//! `:authority`), so skipping the guard for that case does not weaken
+//! DNS-rebinding protection — only non-browser clients such as
+//! BonDriver_Mirakurun send no `Host`. The rebinding check is per request, not
+//! per method, so reads are covered too. A deployment behind a reverse proxy, or
+//! reached by a host name, must list that name in `allowed_hosts`: the
+//! peer-address guard cannot see the name the browser used.
 //!
 //! # CSRF hardening
 //!
@@ -215,8 +219,8 @@ pub fn router_with(state: AppState, webui: Webui) -> Router {
 // Host allowlist (DNS rebinding)
 // ---------------------------------------------------------------------------
 
-/// Rejects a request whose `Host` is not `localhost`, not an IP inside
-/// `allowed_cidrs` and not listed in `allowed_hosts` (SPEC §3.1).
+/// Rejects a request whose `Host` is present but not `localhost`, not an IP
+/// inside `allowed_cidrs` and not listed in `allowed_hosts` (SPEC §3.1).
 ///
 /// This runs for every method and every path (the static page and assets
 /// included): a DNS-rebinding page reaches this server with its own name in
@@ -224,6 +228,12 @@ pub fn router_with(state: AppState, webui: Webui) -> Router {
 /// also wraps the merged router in [`app`], `/api/*` is covered as well. A
 /// deployment reached by a name (or behind a reverse proxy that forwards the
 /// browser's `Host`) must add it to `allowed_hosts`.
+///
+/// An **absent or empty** `Host` is accepted instead of rejected. Browsers
+/// cannot send a request without an authority (HTTP/1.1 mandates `Host`,
+/// HTTP/2 uses `:authority`), so this cannot let a rebinding page through; it
+/// exists because native clients such as BonDriver_Mirakurun omit `Host`
+/// entirely and would otherwise get a 403 on every request.
 ///
 /// The allowlist comes from the configuration the process started with (there
 /// is no `PUT` for `server.yml`, so a hand edit needs the documented restart
@@ -245,6 +255,16 @@ async fn host_guard(
         .authority()
         .map(|authority| authority.as_str());
     let host = header_host.or(uri_host).unwrap_or_default();
+    // Only non-browser clients (BonDriver_Mirakurun and the like) omit the
+    // authority; a browser always sends `Host` (HTTP/1.1) or `:authority`
+    // (HTTP/2), so letting this through does not weaken rebinding protection.
+    if host.trim().is_empty() {
+        tracing::debug!(
+            path = %request.uri().path(),
+            "request has no Host; allowing a non-browser client"
+        );
+        return next.run(request).await;
+    }
     if !host_is_allowed(
         host,
         &state.config.server.allowed_hosts,
@@ -308,6 +328,9 @@ async fn csrf_guard(request: axum::extract::Request, next: axum::middleware::Nex
             .and_then(|value| value.to_str().ok())
             .or_else(|| request.uri().authority().map(|a| a.as_str()))
             .unwrap_or_default();
+        // `host_guard` accepts a request with no authority, but an `Origin`
+        // without any `Host` is anomalous: a browser-originated mutation always
+        // carries one. Keep rejecting it rather than treating it as same-origin.
         // Host names are ASCII-case-insensitive, so `LOCALHOST:40772` and
         // `localhost:40772` are the same origin.
         if !origin_host(origin).is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host)) {

@@ -1516,12 +1516,17 @@ async fn a_foreign_host_is_403_for_reads_and_writes() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
     assert_eq!(json(&body)["code"], 403);
 
+    // A missing Host is accepted, but a present non-allowlisted one is not.
+    let (status, body) = get_with_host(&state, "/", "other.example.lan").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+
     for uri in [
         "/",
         "/assets/app.js",
         "/assets/style.css",
         "/webui/api/status",
         "/webui/api/channels",
+        "/api/version",
         "/api/status",
         "/api/channels",
     ] {
@@ -1602,18 +1607,134 @@ allowed_hosts:
 }
 
 #[tokio::test]
-async fn a_missing_host_header_is_rejected() {
+async fn a_missing_host_header_is_accepted() {
+    // Native clients such as BonDriver_Mirakurun send no `Host` at all, so the
+    // guard must not turn their reads or streams into a 403. The streaming
+    // request goes through the merged router (the guard wraps `/api/*` there).
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let state = fixture.state();
+
+    for uri in ["/", "/api/version"] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let (status, _, body) = send_app_body(&state, request).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {}", text(&body));
+    }
+
+    // A real tuner fixture: a 200 with bytes proves the session actually
+    // streamed and was not just an empty success.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/channels/GR/27/stream")
+        .body(Body::empty())
+        .expect("request");
+    let response = webui::app(state)
+        .layer(axum::Extension(ConnectInfo(PEER)))
+        .oneshot(request)
+        .await
+        .expect("infallible");
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = read_first_chunk(response.into_body()).await;
+    assert!(!first.is_empty(), "the stream must carry TS bytes");
+    assert_eq!(first[0], 0x47, "the first byte must be a TS sync byte");
+}
+
+/// Sends one request through the merged [`webui::app`] router (which applies the
+/// Host guard to `/api/*` as well) and reads the whole body.
+async fn send_app_body(
+    state: &AppState,
+    request: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let response = webui::app(state.clone())
+        .oneshot(request)
+        .await
+        .expect("infallible");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body read")
+        .to_bytes()
+        .to_vec();
+    (status, headers, body)
+}
+
+/// Reads the first non-empty data frame of a possibly endless body.
+async fn read_first_chunk(body: Body) -> Vec<u8> {
+    let mut body = body;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(20), body.frame())
+            .await
+            .expect("first chunk timed out")
+            .expect("body ended before any data")
+            .expect("frame");
+        if let Ok(data) = frame.into_data() {
+            if !data.is_empty() {
+                return data.to_vec();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_mutation_without_host_still_needs_json_and_passes_the_host_guard() {
     let fixture = Fixture::new();
     let state = fixture.state();
 
-    // HTTP/1.1 requires Host; refusing an empty one is the safe default.
+    // No Host and no JSON content type: the CSRF guard rejects it, as before.
     let request = Request::builder()
-        .method(Method::GET)
-        .uri("/")
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
         .body(Body::empty())
         .expect("request");
-    let (status, _, _) = send_body(&state, Webui::default(), request).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(
+        json(&body)["reason"],
+        "Content-Type: application/json is required"
+    );
+
+    // JSON content type and no Origin: the Host guard accepts the absent Host
+    // (native clients, not browsers) and the CSRF guard only compares Origin
+    // when it is present, so the write is accepted.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "channels": [{ "name": "No Host", "type": "GR", "channel": "1" }]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert!(fixture.read("channels.yml").contains("No Host"));
+
+    // An Origin without a Host is still rejected: a browser mutation always
+    // carries an authority, so this combination is anomalous.
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri("/webui/api/channels")
+        .header("origin", "http://127.0.0.1:40772")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "channels": [{ "name": "Origin Only", "type": "GR", "channel": "2" }]
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    let (status, _, body) = send_body(&state, Webui::default(), request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert_eq!(json(&body)["reason"], "Cross-origin request rejected");
+    assert!(!fixture.read("channels.yml").contains("Origin Only"));
 }
 
 // ---------------------------------------------------------------------------

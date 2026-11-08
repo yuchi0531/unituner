@@ -56,7 +56,7 @@ tuner_startup_probe_ms: 1000
 |---|---|---|
 | `addr` | `":40772"` | 空不可。`IP:port` として解釈できること。先頭 `:` は `0.0.0.0` を補う |
 | `allowed_cidrs` | RFC1918 + loopback の 4 件 | 各要素が CIDR として妥当であること。空リストは全拒否 |
-| `allowed_hosts` | `[]`（空） | web UI が `Host` として受け付けるホスト名の追加リスト。空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理。ポート・スキーム・ブラケットなしのホスト名か IP リテラル。逆プロキシや mDNS 名で公開する場合は必ず列挙する |
+| `allowed_hosts` | `[]`（空） | web UI が `Host` として受け付けるホスト名の追加リスト。空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理。`Host` が無い/空のリクエストは受理する（BonDriver_Mirakurun 等のネイティブクライアント用。ブラウザは authority 無しで送れないため DNS リバインディング対策は弱まらない）。存在するが許可外の `Host` は 403。ポート・スキーム・ブラケットなしのホスト名か IP リテラル。逆プロキシや mDNS 名で公開する場合は必ず列挙する |
 | `idle_timeout_secs` | `5` | 検証なし（0 も受理）。最後の購読者が抜けてからこの秒数後にプロセス木を止める |
 | `subscriber_buffer_chunks` | `1024` | 1 以上。購読者ごとの bounded queue 容量（chunks） |
 | `chunk_size_bytes` | `65536` | 1 以上。実際の chunk は 188 の倍数に切り下げる（65536 → 65424） |
@@ -72,6 +72,7 @@ tuner_startup_probe_ms: 1000
 
 - `allowed_cidrs` は TCP 接続元 IP の許可リスト。範囲外は API / web UI とも 403。
 - `allowed_hosts` は web UI の `Host` 許可リスト。空なら loopback / `allowed_cidrs` 内の IP / `localhost` だけを受け付け、DNS リバインディングを防ぐ。名前や逆プロキシ経由で公開するなら、そのホスト名を列挙する。
+- `Host` が無い/空のリクエストは受理する。BonDriver_Mirakurun のようなネイティブクライアントは `Host` を送らず、これを拒否するとチャンネル一覧は通っても選局・ストリームが 403 になるため。ブラウザは authority 無しでリクエストを送れない（HTTP/1.1 は `Host` 必須、HTTP/2 は `:authority`）ので、DNS リバインディング対策は弱まらない。**存在するが許可外**の `Host` は従来どおり 403。
 - 購読者数とセッション数は `max_subscribers_per_session` / `max_subscribers_per_ip` / `max_sessions` / `max_subscriber_buffer_bytes` で制限する。上限を超えたストリーム要求は **429** `{"code":429,"reason":"Too Many Requests"}` を返し、既存の購読者とチューナーには影響しない（参加の判定はチューナー起動より前）。per-IP は `X-Forwarded-For` を無視し、TCP 接続元だけで数える。同時視聴を増やすには `max_subscriber_buffer_bytes` を上げるか `subscriber_buffer_chunks` を下げる。
 
 ### `tuners.yml`

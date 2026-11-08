@@ -51,6 +51,7 @@ tuner_startup_probe_ms: 1000         # 既定 1000、上限 10000。routes 使�
 - `allowed_cidrs` はネットワーク制御であり認証ではない（webui も同じ）。README 制限欄に明記する。
 - `allowed_hosts` は webui の `Host` 許可リスト（任意・既定は空）。
   - 空のときは loopback / `allowed_cidrs` 内の IP / `localhost` の `Host` だけを受け付ける。これは DNS リバインディング対策であり、名前や逆プロキシ経由で公開する配備では、そのホスト名を `allowed_hosts` に**必ず列挙する**。
+  - **`Host` が無い（または空の）リクエストは拒否しない**。BonDriver_Mirakurun のようなネイティブクライアントは `Host` を送らないため、これを拒否するとチャンネル一覧は通るのに選局・ストリームが 403 になる。ブラウザは authority 無しでリクエストを送れない（HTTP/1.1 は `Host` 必須、HTTP/2 は `:authority`）ので、この緩和で DNS リバインディング対策が弱まることはない。**存在するが許可外**の `Host` は従来どおり 403。
   - 値はポート・スキーム・ブラケットを含まないホスト名か IP リテラル。大文字小文字は区別しない。
 - 上限フィールド（`max_*`）はすべて 1 以上。0 は「無制限」ではなく設定エラーとして拒否する。
   - `max_subscribers_per_session` は 1 セッションあたりの同時購読者数。
@@ -426,7 +427,7 @@ Found 1 channels for 13
 ## 10. webui（フル管理 UI）
 
 - 埋め込み静的アセット + vanilla JS。フロントエンドビルド工程なし。axum で配信。
-- 認証なし（`allowed_cidrs` + `allowed_hosts`）。`allowed_hosts` は `Host` 許可リストで、空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理する（DNS リバインディング対策）。単一バイナリに埋め込むため、遠隔コード実行面であることは README に明記する。
+- 認証なし（`allowed_cidrs` + `allowed_hosts`）。`allowed_hosts` は `Host` 許可リストで、空なら loopback / `allowed_cidrs` 内の IP / `localhost` のみ受理する（DNS リバインディング対策）。ただし `Host` が無い/空のリクエストは受理する（BonDriver_Mirakurun 等のネイティブクライアント用。ブラウザは authority 無しで送れないため対策は弱まらない）。存在するが許可外の `Host` は 403。単一バイナリに埋め込むため、遠隔コード実行面であることは README に明記する。
 - 編集対象：**tuners / channels / pipelines**（追加・編集・削除）。**server.yml は閲覧のみ**。
   - Channels タブは `routes`（順序・`tuner`・route ごとの `channel` / `extra-args` 上書き）と `extra-args` も編集できる。route の追加・削除・並べ替えに対応する。
 - 内部 API は mirakurun 互換外の独自名前空間 `/webui/api/*`：
@@ -504,6 +505,7 @@ unituner/
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
 - webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
+- `Host` が無い/空のリクエストは webui / `/api/*` とも受理する（BonDriver_Mirakurun 等のネイティブクライアント用）。存在するが許可外の `Host` は 403。ブラウザは authority 無しで送れないため DNS リバインディング対策は弱まらない
 - 初回起動など `services.json` が無い/無効なとき、スキャン完了までは `/api/services/{id}/stream` が 404 しうる（有効なキャッシュがあれば起動直後から配信できる）
 - `services.json` は無期限キャッシュである。放送再編（サービス名/SID の変更）は設定フィンガープリントを変えないため、自動検出されず webui の **Re-scan**（`POST /webui/api/services/scan`）が必要
 - `routes` を持つチャンネルは**列挙したチューナーだけ**を使う（type 非依存）。フォールバックは起動失敗のときだけで、起動 probe（既定 1000 ms）のタイムアウトは「起動成功」として扱う（no signal はフォールバックしない）。pinning（`X-Mirakc-Tuner` / `X-Mirakurun-Tuner`）は routes を無視する
