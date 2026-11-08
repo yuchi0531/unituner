@@ -44,6 +44,14 @@ max_subscribers_per_ip: 16           # 既定 16。1 クライアント IP の�
 max_sessions: 16                     # 既定 16。同時セッション数（Starting/Stopping 含む）。超過は 429
 max_subscriber_buffer_bytes: 2147483648   # 既定 2GiB。全購読者キューの合計上限。超過は 429
 tuner_startup_probe_ms: 1000         # 既定 1000、上限 10000。routes 使用チャンネルの起動 probe 窓（ms）
+tuner_readiness_timeout_secs: 30     # 既定 30、1..=600。最初のデータを待つ readiness gate（秒）
+scan_channel_timeout_secs: 60        # 既定 60、1..=600。1 チャンネルの scan 予算（秒）。readiness より大
+child_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                                     # 子プロセスの PATH（空不可）
+child_home: "/var/lib/unituner"      # 子プロセスの HOME（空不可）
+child_tmpdir: "/tmp"                 # 子プロセスの TMPDIR（空不可）
+child_cwd: "/var/lib/unituner"       # 子プロセスの cwd。"" はサーバの cwd を継承
+child_env: {}                        # 子プロセスの追加環境変数（PATH/HOME/TMPDIR より優先）
 ```
 
 - `addr` の既定値（loopback か全インタフェースか）は実装時に確定し、本書と README に記す。
@@ -62,8 +70,14 @@ tuner_startup_probe_ms: 1000         # 既定 1000、上限 10000。routes 使�
 - `tuner_startup_probe_ms` は `routes` を持つチャンネルの**起動 probe 窓**（ミリ秒、既定 1000、1 以上、上限 10000）。詳細は §6.4。
   - 窓内に最初のデータが来れば起動成功。窓内にデータ無しでプロセスが終了すれば起動失敗として次の route を試す。
   - **窓を過ぎてもプロセスが生きていれば（データ未着でも）起動成功とみなす**（no signal はフォールバックの理由にしない）。
-  - 上限 10000 は、probe がリクエスト全体の待ち期限（readiness 10 秒 + 余裕）を超えないようにするための制約。超える値は起動エラー。
+  - 上限 10000 は、probe がリクエスト全体の待ち期限（設定された readiness timeout + 余裕）を超えないようにするための制約。超える値は起動エラー。
   - routes を持たないチャンネルには影響しない（従来の readiness gate のまま）。
+  - **probe と readiness gate は別物**。probe は route をフォールバックするか（起動 probe 窓）だけを決め、readiness gate はストリーム開始（最初のデータ）を待つ上限を決める。
+- `tuner_readiness_timeout_secs` は、最初のデータが来るまで待つ **readiness gate**（秒、既定 30、1..=600）。tune が 6–11 秒かかり、デスクランブラが最初の出力まで 9–15 秒かかる実機に合わせた既定値。0 や 600 超は起動エラー。
+- `scan_channel_timeout_secs` は 1 チャンネルの **scan 予算**（秒、既定 60、1..=600）。起動時スキャン・手動 Re-scan・探索 API のすべてで使う。acquire と SI 読みの合計であり、`tuner_readiness_timeout_secs` より**厳密に大きく**なければ起動エラー（そうでないと scan 自身の期限が acquire を先に切ってしまう）。acquire は `readiness + 5 秒` に制限し、残りを SI に使う。
+- `child_path` / `child_home` / `child_tmpdir` は子プロセスの `PATH` / `HOME` / `TMPDIR`（いずれも空不可）。NUL・改行を含む値は起動エラー。
+  - `child_cwd` だけは空を許し、その場合はサーバの作業ディレクトリを継承する。存在しない非空の `child_cwd` は**起動エラーにしない**: 起動時に 1 回 warn し、各 spawn では `current_dir` を付けずに warn する（既定の `/var/lib/unituner` が未作成の既存配備を壊さないため）。
+- `child_env` は子プロセスへ追加する環境変数（既定 `{}`）。`PATH` / `HOME` / `TMPDIR` と同じ名前を書いた場合は `child_env` が**優先**する。名前は空でなく NUL・改行を含まないこと、値は NUL を含まないこと。
 - webui では **閲覧のみ**（編集不可。意図的に誤設定でロックアウトすることを防ぐ）。
 
 ### 3.2 `tuners.yml`
@@ -143,6 +157,12 @@ types:                                # チャンネルタイプ → pipeline �
   - 未知の `{...}`（例: `{chanel}`, `{extra_argz}`）は空白化せず**そのまま残す**。typo がコマンド側で目に見える形で失敗するようにするため。
   - `passthrough` の判定はプレースホルダ置換より**前**に行う。疑似コマンド自身は `{channel}` / `{type}` / `{extra_args}` の置換対象にならない
     （`{channel}` が偶然 `passthrough` に展開されても疑似コマンドにはならない）。
+- **子プロセスの環境は明示する**（§3.1 の `child_*`）。チューナーコマンドと pipeline の全段の spawn で:
+  1. 継承した環境を `env_clear()` で捨てる。サービスマネージャ経由の `PATH`（例 `/root/.cargo/bin`）や未設定の `HOME` を子へ漏らさない。
+  2. `PATH` / `HOME` / `TMPDIR` を `child_path` / `child_home` / `child_tmpdir` から設定する。
+  3. `child_env` を最後にマージする（同じ名前なら `child_env` が勝つ）。
+  4. `child_cwd` が非空なら `current_dir` に設定する。存在しなければ省略し、プロセスごとに warn する。
+  - したがって `dantto4k` のような子が `dtv.names` を探す場合も、`HOME` と `PATH` はサーバプロセスの環境に依存せず、配備ごとに `server.yml` で決められる。
 - コマンドは **argv 分割して直接 spawn** する（`/bin/sh -c` は使わない）。`{channel}`/`{type}` の値は生成時に charset 検証 + クォーティングを通す。
   - config 値と URL パス由来の値（`/api/channels/{type}/{channel}/stream`）は同じ検証関数に通す。URL 由来のメタ文字がシェルに流入しないこと（command injection 防止）。
   - 確定（Phase 1）: `{channel}` の許容文字は ASCII 英数字と `. _ + - : @ ,` のみ（空白・引用符・`\`・`/`・シェルメタ文字は拒否）。{type} は §3.3 の正規表現 `^[A-Za-z0-9][A-Za-z0-9_-]*$`。
@@ -283,8 +303,8 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 - **全 route 失敗**は既存の `TunerUnavailable` 経路（HTTP **503**）。
 - **pinning は routes に優先する**（§6.3）。`X-Mirakc-Tuner` / `X-Mirakurun-Tuner` を指定した要求は routes を無視し、そのチューナーだけを使う。フォールバックは一切しない。
 - `disabled: true` のチャンネルは route を試す前に 404（§9）。routes は `disabled` 判定の後。
-- `routes` を持たないチャンネルは従来どおり §6.2 の選択（全 type 適合チューナーからの fall-through あり）で、起動 probe は使わず従来の readiness gate（10 秒）で成否を決める。
-- 起動 probe と readiness gate の関係: probe は**route フォールバックの可否**を決め、通常の readiness gate は**ストリーム開始**を決める。routes 使用時は probe のタイムアウトを「起動成功」として扱うため、10 秒の readiness gate は実質使われない。routes 非使用時は従来の readiness gate のみ。
+- `routes` を持たないチャンネルは従来どおり §6.2 の選択（全 type 適合チューナーからの fall-through あり）で、起動 probe は使わず readiness gate（`tuner_readiness_timeout_secs`、既定 30 秒）で成否を決める。
+- 起動 probe と readiness gate の関係: probe は**route フォールバックの可否**を決め、通常の readiness gate は**ストリーム開始**を決める。routes 使用時は probe のタイムアウトを「起動成功」として扱うため readiness gate は実質使われない。routes 非使用時は readiness gate のみを使う。
 
 ## 7. バックプレッシャとリソース
 
@@ -315,6 +335,10 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
   - scan 専用に大きな購読バッファを持つ（通常購読者の 1024 chunks とは別）。
   - 中間的に通常購読者と同一の購読扱いで scan が溢れて自己切断しないようにする。
 - スキャンは全 channel に対して通常セッションとして扱わず、scan 用セッションで取得する。相手が busy なら skip + 次回 retry。
+- 1 チャンネルの予算は `server.scan_channel_timeout_secs`（既定 60 秒、1..=600）を起動時スキャン・手動 Re-scan・探索 API のすべてで使う。予算は acquire と SI 読みの合計で、`server.tuner_readiness_timeout_secs`（既定 30 秒、1..=600）より厳密に大きいこと。
+  - acquire 部分は `readiness + 5 秒` に制限し、残りを SI に使う。したがって遅いデスクランブラが最初の出力に 9–15 秒かかっても、既定値なら acquire がそれを待ち、SI のための時間も残る。
+  - readiness gate は「最初のデータまでの待ち」、`tuner_startup_probe_ms` は「route をフォールバックするか」の判定であり、両者を混同しない（§3.1、§6.4）。
+  - 遅いデスクランブラで `tuner failed to start: timed out waiting for the tuner to start` が出る場合は、まず `tuner_readiness_timeout_secs` と `scan_channel_timeout_secs` を実測に合わせて広げる（常に scan > readiness）。
 - **結果の分類**（進捗テキストとログで区別する。チューナーが起動できなかったことを `no signal` と混同しない）:
 
   | 内部結果 | 進捗テキスト | 意味 | 起動時スキャンの再試行 |
@@ -359,7 +383,7 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 - 実行中の重複リクエストは **409 `{"code":409,"reason":"Already Scanning"}`**。
 - 探索は「未登録のチャンネルを実際にチューニング → SDT/NIT から名前とサービスを取得 → channels.yml に追加」の流れ。既存の登録済みエントリには触れない。`refresh=true` のときだけ既存エントリを列挙し直して置き換える。
 - 完了後はユーザーに restart を案内する（`**RESTART REQUIRED**` を出力。自動再起動はしない）。
-- **早期終了**: 探索と起動時スキャンは、1 チャンネルにつき PAT + PMT + 完全な SDT-actual + NIT-actual が揃った時点でそのチャンネルの読み取りを打ち切る。SDT-actual の完了だけでは打ち切らない（NIT-actual が未着のまま終わると network id が SDT の `original_network_id` に落ちるため）。SDT 完了後は `SI_GRACE_AFTER_SDT`（1.5 秒）だけ残りのコアテーブルを待つ（実測で PAT は約 100 ms、PMT/SDT は約 200〜500 ms、NIT-actual は約 0.4〜0.8 秒で繰り返す。700 ms では NIT の 1 周期を取りこぼしうるため 1.5 秒とする）。猶予内に NIT-actual が来なければ SDT の `original_network_id` を使う。1 チャンネルが 25 秒の予算（`CHANNEL_TIMEOUT`）を最後まで使うことはない。
+- **早期終了**: 探索と起動時スキャンは、1 チャンネルにつき PAT + PMT + 完全な SDT-actual + NIT-actual が揃った時点でそのチャンネルの読み取りを打ち切る。SDT-actual の完了だけでは打ち切らない（NIT-actual が未着のまま終わると network id が SDT の `original_network_id` に落ちるため）。SDT 完了後は `SI_GRACE_AFTER_SDT`（1.5 秒）だけ残りのコアテーブルを待つ（実測で PAT は約 100 ms、PMT/SDT は約 200〜500 ms、NIT-actual は約 0.4〜0.8 秒で繰り返す。700 ms では NIT の 1 周期を取りこぼしうるため 1.5 秒とする）。猶予内に NIT-actual が来なければ SDT の `original_network_id` を使う。1 チャンネルが `scan_channel_timeout_secs`（既定 60 秒）の予算を最後まで使うことはない。
 - **並列度**: その type の**有効チューナー数**（`tuner_count_for`）を上限に並列でスキャンする。1 台なら従来どおり直列、N 台なら 1 パスが概ね「チャンネル数 / N」の時間で終わる。結果は設定順に畳み込むため、進捗テキストと再試行キューは完了順に依存しない。
 - 起動時スキャンのパスでは、busy / 奪取（preempted）のチャンネルは他のチャンネルを塞がず再試行キューへ回る。奪取されたチャンネルでも、部分受信の SDT から得られたサービスは捨てずに反映する。
 

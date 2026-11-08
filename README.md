@@ -50,6 +50,13 @@ max_subscribers_per_ip: 16
 max_sessions: 16
 max_subscriber_buffer_bytes: 2147483648
 tuner_startup_probe_ms: 1000
+tuner_readiness_timeout_secs: 30
+scan_channel_timeout_secs: 60
+child_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+child_home: "/var/lib/unituner"
+child_tmpdir: "/tmp"
+child_cwd: "/var/lib/unituner"
+child_env: {}
 ```
 
 | フィールド | 既定値 | 検証・挙動 |
@@ -64,7 +71,18 @@ tuner_startup_probe_ms: 1000
 | `max_subscribers_per_ip` | `16` | 1 以上。1 クライアント IP が全セッション合計で持てる購読者数。超えた要求は 429 |
 | `max_sessions` | `16` | 1 以上。同時に存在できるセッション数（登録中の `Starting` / `Stopping` も含む）。超えた要求は 429。チューナー数が 16 を超える構成ではこの値も上げる |
 | `max_subscriber_buffer_bytes` | `2147483648`（2 GiB） | 1 以上。全購読者キューの合計上限バイト数。1 購読者は `chunk_size_bytes × subscriber_buffer_chunks`（既定 ≈64 MiB）を worst-case で予約する。既定 2 GiB は 32 購読者分にあたり `max_subscribers_per_session: 32` と同じなので、通常は per-session 上限の方が先に効く。この予算は「最悪ケースの予約」であり実使用量ではない（実際のキューは配信中の分しか持たない）ため、2 GiB の予約は一般的なホストで許容できる。メモリが制約されたホストでは `max_subscriber_buffer_bytes` をさらに上げるか `subscriber_buffer_chunks` を下げる |
-| `tuner_startup_probe_ms` | `1000` | 1 以上 10000 以下。`routes` を持つチャンネルの起動 probe 窓（ms）。窓内にチューナーが最初のデータを出せば起動成功、データ前に終了すれば起動失敗として次の route を試す。窓を過ぎても生きていれば（no signal でも）起動成功とみなす。`routes` を持たないチャンネルには効かない |
+| `tuner_startup_probe_ms` | `1000` | 1 以上 10000 以下。`routes` を持つチャンネルの起動 probe 窓（ms）。窓内にチューナーが最初のデータを出せば起動成功、データ前に終了すれば起動失敗として次の route を試す。窓を過ぎても生きていれば（no signal でも）起動成功とみなす。`routes` を持たないチャンネルには効かない。**readiness gate とは別物**（下記） |
+| `tuner_readiness_timeout_secs` | `30` | 1 以上 600 以下。最初のデータが来るまで待つ readiness gate（秒）。tune が 6–11 秒、デスクランブラの初回出力が 9–15 秒かかる構成でも既定で足りる。0 や 600 超は起動エラー |
+| `scan_channel_timeout_secs` | `60` | 1 以上 600 以下。1 チャンネルの scan 予算（秒、acquire + SI 読み）。起動時スキャン・手動 Re-scan・探索 API のすべてで使う。`tuner_readiness_timeout_secs` より**厳密に大きい**こと（そうでなければ起動エラー）。acquire は `readiness + 5 秒` に制限し、残りを SI に使う |
+| `child_path` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` | 子プロセスの `PATH`。空不可。サーバの `PATH` は継承しない |
+| `child_home` | `/var/lib/unituner` | 子プロセスの `HOME`。空不可。未設定の `HOME` を継承させない（`dtv.names` 等の探索先を固定できる） |
+| `child_tmpdir` | `/tmp` | 子プロセスの `TMPDIR`。空不可 |
+| `child_cwd` | `/var/lib/unituner` | 子プロセスの作業ディレクトリ。`""` はサーバの作業ディレクトリを継承。存在しない値は起動時に warn し、各 spawn では `current_dir` を省略する（起動エラーにはしない） |
+| `child_env` | `{}` | 子プロセスへ追加する環境変数。`PATH` / `HOME` / `TMPDIR` と同じ名前なら**こちらが優先**。名前は空でなく NUL・改行を含まないこと、値は NUL を含まないこと |
+
+- `tuner_startup_probe_ms` は **route フォールバックの窓**、`tuner_readiness_timeout_secs` は **ストリーム開始までの待ち**。routes 使用時は probe のタイムアウトを「起動成功」として扱うため、readiness gate は実質使われない。
+- 子プロセス（チューナーと pipeline の全段）は環境を継承しない。spawn ごとに `env_clear()` → `PATH` / `HOME` / `TMPDIR` → `child_env` の順に適用し、`child_cwd` が存在すれば `current_dir` を設定する。
+- 遅いデスクランブラで `tuner failed to start: timed out waiting for the tuner to start` が出る場合は、実測に合わせて `tuner_readiness_timeout_secs` と `scan_channel_timeout_secs` を広げる（常に scan > readiness）。`no signal` はチューンできたが SI が無い場合であり、readiness タイムアウトとは別の結果。
 
 `allowed_cidrs` はネットワーク制御であり認証ではない。API と web UI の両方に効く。
 
@@ -154,6 +172,7 @@ types:
 - `{extra_args}` が空のときは何も置換しない。引用符なしの `cmd {channel} {extra_args}` は `{extra_args}` のトークンが消え、引用した `"{extra_args}"` は空トークン 1 個になる（シェルと同じ）。
 - `{channel}` の値は英数字と `. _ + - : @ ,` のみ、`{type}` は上記正規表現。URL パス由来の値にも同じ検証を適用する。`{extra_args}` は `--lnb 15` のように複数トークンへ展開する前提のため charset ホワイトリスト検証は行わないが、定義値に引用符・バックスラッシュ・改行は含められない。
 - コマンドは argv 分割して**直接 spawn** する。`/bin/sh -c` は使わない。引用符・バックスラッシュは解釈するが、変数展開・glob・リダイレクトは行わない。
+- チューナーと pipeline の全段は環境を継承しない。`server.yml` の `child_path` / `child_home` / `child_tmpdir` / `child_env` / `child_cwd` が spawn ごとに適用される（§`server.yml` の表を参照）。`dantto4k` 等が `dtv.names` を `HOME` から探す構成では `child_home` を固定できる。
 
 ### サービスキャッシュ（`services.json`）
 
@@ -370,7 +389,7 @@ Found 1 channels for 24
   - `skipped (tuner busy)` / `skipped (preempted by a user request)` — 一時的な競合。
 - その type の有効チューナーが複数なら、その台数を上限に並列でスキャンする（1 台なら従来どおり直列）。
 - 候補は 1 リクエストあたり 512 まで（サブチャンネル展開を含む）。`skipCh` も 512 件まで。超過は 400。
-- 1 チャンネルあたりの上限は 25 秒（チューニング + SI 読み取り）。設定不可。PAT・PMT・SDT-actual・NIT-actual が揃えば上限を待たずに終了する（SDT 完了後に残りのコアテーブルを待つ猶予は最大 1.5 秒（NIT-actual の 1 周期以上））。
+- 1 チャンネルあたりの上限は `scan_channel_timeout_secs`（既定 60 秒、チューニング + SI 読み取り）。起動時スキャン・手動 Re-scan・探索 API のすべてで同じ値を使う。PAT・PMT・SDT-actual・NIT-actual が揃えば上限を待たずに終了する（SDT 完了後に残りのコアテーブルを待つ猶予は最大 1.5 秒（NIT-actual の 1 周期以上））。
 - 同時実行は 1 本のみ。2 本目は 409 `Already Scanning`。
 - 書き込みは `.tmp` + `rename` で原子的に行い、マージ後の一覧を起動時と同じ規則で検証してから書く。意味的に同一の一覧ならファイルを書き換えない。
 - 完了時に `**RESTART REQUIRED**` を出す。**自動再起動はしない**（起動中のサーバはメモリ上の設定を保持し続ける）。
@@ -382,7 +401,7 @@ Found 1 channels for 24
 
 - 優先度 `-1000` で動くため、利用者のセッションを奪取しない。busy なチューナーはスキップする。
 - 有効なチューナーが複数ある type では、その台数を上限に並列でスキャンする（1 台なら従来どおり直列）。busy / 奪取されたチャンネルはそのパスを塞がず、再試行キューに回る。
-- PAT・PMT・SDT-actual・NIT-actual が揃ったチャンネルは、25 秒の予算を待たずに終了する（SPEC §8.1）。
+- PAT・PMT・SDT-actual・NIT-actual が揃ったチャンネルは、`scan_channel_timeout_secs`（既定 60 秒）の予算を待たずに終了する（SPEC §8.1）。
 - busy / 利用者に奪取されたチャンネルだけを 30 秒 → 60 秒 → 120 秒 → 240 秒 → 300 秒（上限）の backoff で再試行する。無信号・チューナー不在（`no tuner for type`）・起動失敗（`tuner failed to start`）は再試行しない（待っても状態が変わらず spin するだけ）。
 - 1 パスで 1 チャンネル以上を試し、そのすべてが `NoTuner` / `TunerFailed` / `Failed` だった場合は、そのパスの終わりに `every channel failed to start its tuner; check tuners.yml (command/device path)` を 1 回 warn する（一部だけの失敗や 0 チャンネルでは出さない）。
 - チューナーが 1 台も起動できなかった初回パスでは、空の `services.json` を「有効なキャッシュ」として書かない（次回起動時に再プローブする）。
@@ -394,7 +413,8 @@ Found 1 channels for 24
 
 - **全チャンネルが `tuner failed to start: ...`**: チューナーコマンド／デバイスを確認する。典型的には DVB デバイスのパス（例: `/dev/dvb/adapter0/frontend0`）が存在するか、コマンドが実行可能か、権限があるか。`/dev/dvb` が無い（機器未接続）状態では、実チューナーコマンドは即座に終了し、全チャンネルがこれになる。
 - **`skipped (no tuner for type <type>)`**: `tuners.yml` にその type をサポートする有効なチューナーが無い。設定の `types` を確認する。
-- **`no signal`**: チューナーは起動してデータを流したが、期限内に使用可能な SI（PAT/PMT/SDT/NIT）が無かった。アンテナ・受信状態・チャンネル番号を確認する。
+- **`tuner failed to start: timed out waiting for the tuner to start`**: readiness gate の既定 30 秒以内に最初のデータが来なかった。遅いデスクランブラ（`dantto4k` 等が 9–15 秒かかる構成）でも通常は足りるが、さらに遅い場合は `tuner_readiness_timeout_secs` を上げ、`scan_channel_timeout_secs` もそれより大きくする。
+- **`no signal`**: チューナーは起動してデータを流したが、期限内に使用可能な SI（PAT/PMT/SDT/NIT）が無かった。アンテナ・受信状態・チャンネル番号を確認する。readiness タイムアウトとは別の結果。
 - **`skipped (tuner busy)` / `skipped (preempted by a user request)`**: 他の利用と競合した。起動時スキャンは backoff で再試行する。
 
 ## 実機での確認
@@ -444,10 +464,10 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 | 冷たいチャンネルへの切り替え（TTFB） | 約 2.0〜2.2 秒 | recisdb 自身が最初のバイトまでに約 2.05 秒。unituner のオーバーヘッドは約 0.0〜0.15 秒 |
 | 配信中セッションへの再参加 | ほぼ即時（5 ms 未満） | 既存セッションへの相乗りだけで、チューナーを起動しない |
 | 同じ冷チャンネルへの同時 3 要求 | 3 本とも同じ時刻に最初のバイト | spawn は 1 回だけ。1 本のセッションを共有する |
-| 起動時スキャン（GR 12 チャンネル） | 約 38 秒（約 3.2 秒/チャンネル） | recisdb のチューンと SDT の繰り返し待ちが支配的。SI が揃うチャンネルは 25 秒の予算を使い切らない |
+| 起動時スキャン（GR 12 チャンネル） | 約 38 秒（約 3.2 秒/チャンネル） | recisdb のチューンと SDT の繰り返し待ちが支配的。SI が揃うチャンネルは 60 秒の予算を使い切らない |
 | 配信中セッションの奪取 | 冷たいチャンネルと同程度 | kill-first の victim 停止（SIGTERM → プロセスグループ消滅の確認）は約 50 ms 未満 |
 
-- 待ち時間の大半は recisdb のチューニング（同調と最初の TS パケット）であり、unituner 側はプロセス起動・readiness gate・ヘッダ生成のみ。
+- 待ち時間の大半は recisdb のチューニング（同調と最初の TS パケット）であり、unituner 側はプロセス起動・readiness gate（`tuner_readiness_timeout_secs`、既定 30 秒）・ヘッダ生成のみ。
 - 「同時 3 要求」が同じ時刻に始まるのは `(type, channel)` 単位のセッション共有が効いているため。2 本目以降は spawn しない。
 - 奪取は kill-first（victim を止めてデバイスを解放してから spawn）なので、冷たいチャンネルと同じチューン時間に victim の停止時間が加わる。
 
