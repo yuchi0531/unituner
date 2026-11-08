@@ -163,6 +163,9 @@ types:
 |---|---|---|
 | `pipelines` | なし（必須） | 1 エントリ以上。各 pipeline は 1 コマンド以上、各コマンドは空不可 |
 | `types` | 空（未バインド type は生 TS） | キーが type 名正規表現に一致し、値の `pipeline` が実在すること |
+| `types.<type>.input` | `ts` | `ts` / `tlv` のみ。`tlv` は実在する pipeline へのバインドが必須で、その pipeline に TLV→TS 変換の実段（`passthrough` 以外）が 1 つ以上必要 |
+
+`input` はチューナー出力の種類を宣言する。省略時は従来どおり `ts`（MPEG-TS）で、204→188 正規化を行ってから pipeline 1 段目へ渡す。BS4K のように **TLV/MMT** を出すチューナーは `input: tlv` を指定する。この場合 unituner は tuner stdout を一切正規化せず byte-for-byte で pipeline へ渡し、pipeline が出力する TS を pump 側で 188B に揃える。TLV に対して TS の `0x47` 同期バイト探索をかけるとストリームが破壊されるため、この区別は必須である。
 
 ### プレースホルダとコマンド実行
 
@@ -194,7 +197,7 @@ types:
 
 ## パイプライン
 
-`pipelines.<name>` は stdin→stdout で直列につながる外部コマンドの配列。1 段目の stdin にチューナー出力（188/204 を 188 に正規化したもの）が入り、最終段の stdout が broadcast される。パイプライン通過後の TS だけが service 検出・フィルタ・配信に使われる。
+`pipelines.<name>` は stdin→stdout で直列につながる外部コマンドの配列。`input: ts`（既定）では 1 段目の stdin にチューナー出力（188/204 を 188 に正規化したもの）が入る。`input: tlv` では正規化せず TLV/MMT をそのまま渡す。最終段（pipeline 無しの場合は tuner）の出力は pump で 188B に正規化されて broadcast される。パイプライン通過後の TS だけが service 検出・フィルタ・配信に使われる。
 
 ```yaml
 pipelines:
@@ -205,14 +208,19 @@ pipelines:
     - "ts-converter <args>"
   none:
     - "passthrough"       # 何もしない（生 TS をそのまま流す）
+  mmt:                    # BS4K: TLV/MMT → MPEG-TS
+    - "b61dec-remote <args>"   # 前段も TLV 入力前提
+    - "dantto4k"               # または "mmt2ts"
 types:
-  GR: { pipeline: cas }
-  BS: { pipeline: cas4k }
+  GR:   { pipeline: cas }
+  BS:   { pipeline: cas4k }
+  BS4K: { pipeline: mmt, input: tlv }
 ```
 
+- BS4K チューナーは TS ではなく TLV/MMT を出す。`input: tlv` を付けなければ unituner が TLV を TS として正規化し、`0x47` を探して捨ててしまうため、pipeline にはゴミしか届かず scan が `no signal` になる。`dantto4k` / `mmt2ts` のチェーンは `input: tlv` で使い、その前段の `b61dec-remote` も TLV を受ける。
 - 型にバインドしない場合は生 TS をそのまま配信する（`types` に書かなければよい）。
 - 段として `passthrough` とだけ書くと、外部プロセスを spawn しない疑似コマンドになる（前後の空白を除き ASCII 大文字小文字を無視して完全一致）。
-  全段が `passthrough` ならバインドなしと同じ生 TS になり、混合チェーンではその段だけが除かれる。`passthrough` はプレースホルダ置換より前に判定される。
+  全段が `passthrough` ならバインドなしと同じ生 TS になり、混合チェーンではその段だけが除かれる。`passthrough` はプレースホルダ置換より前に判定される。`input: tlv` の型では全段 `passthrough` を指定できない（TLV→TS 変換が無いため起動エラー）。
 - 各段は `setsid` で独立したプロセスグループになる。停止はグループ全体へ SIGTERM → 2 秒の猶予 → SIGKILL。
 - 段の stderr はセッションラベルと段番号付きでログに出る（`error` / `fail` / `fatal` を含む行は `warn`）。
 - コマンドが 1 つも起動できなかった場合、起動済みの段は kill され、セッションは作られない。
@@ -276,7 +284,9 @@ pin の挙動:
 
 ### `decode=0`
 
-`?decode=0` は **pipeline 全段をバイパス**し、チューナー出力を正規化しただけの TS を配信する（mirakurun の B-25 のみスキップとは異なる）。service stream の内蔵フィルタは引き続き適用される。
+`?decode=0` は **pipeline 全段をバイパス**し、`input: ts`（既定）ではチューナー出力を正規化しただけの TS を配信する（mirakurun の B-25 のみスキップとは異なる）。service stream の内蔵フィルタは引き続き適用される。
+
+`input: tlv` の型では pipeline が TLV→TS 変換そのものなので、`decode=0` は **生の TLV/MMT をそのまま配信する**。188B アラインも行われないため、mirakurun クライアントがこの型に `decode=0` を付けると TS ではなく TLV を受け取る点に注意する。
 
 decode モードはセッションの属性であり、同一チャンネルに 2 つのプロセス木は作らない。既に逆のモードで配信中の場合、その要求は参加も奪取もせず **409**。
 
@@ -478,7 +488,8 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応。例外は `PUT /api/config/channels/scan` のみ。
 - チャンネル探索の `async` と `GET` ポーリングは非対応。`GET /api/config/channels/scan` は 404。
 - 複数の `X-Mirakurun-Priority` は集約しない（最後の非空値を使う）。
-- `decode=0` は pipeline **全段**バイパス。mirakurun の「B-25 デコーダのみスキップ」とは異なる。
+- `decode=0` は pipeline **全段**バイパス。mirakurun の「B-25 デコーダのみスキップ」とは異なる。`input: tlv` の型では TS ではなく生 TLV/MMT を返す。
+- `input: tlv` は tuner stdout を byte-for-byte で pipeline へ渡し、pipeline 出力の TS を pump で正規化する。TLV を TS 正規化してから pipeline に渡す構成は不可。`dantto4k` / `mmt2ts` とその前段の `b61dec-remote` は TLV 入力前提。
 - web UI に認証はない。`allowed_cidrs` と `allowed_hosts` のみで、設定編集と再起動ができるため実質的に遠隔操作面になる。信頼できる LAN に置くこと。
 - `services.json` が無い初回起動やキャッシュ無効時、スキャンが完了するまで `/api/services/{id}/stream` は 404 になりうる（有効なキャッシュがあれば起動直後から配信できる）。
 - `services.json` は無期限キャッシュ。放送再編（サービス名/SID の変更）はフィンガープリントを変えないため自動検出されず、web UI の **Re-scan** が必要。busy だったチャンネルは、キャッシュが書かれた後の再起動では再試行されない。

@@ -126,12 +126,22 @@ pipelines:
   cas4k:
     - "arib-b25-stream-test"          # 4K/BS も同じ B25 デコーダを 1 段目に置く
     - "ts-converter <args>"           # 2 段目は TS 変換（MMT/TLV → MPEG-TS 等）
+  mmt:                                # BS4K の TLV/MMT → TS 変換
+    - "b61dec-remote <args>"          # b61dec-remote も TLV 入力を受ける
+    - "dantto4k"                      # または "mmt2ts"
 types:                                # チャンネルタイプ → pipeline バインド（ユーザー定義名）
   GR:         { pipeline: cas }
   BS:         { pipeline: cas4k }
   CABLE_CATV: { pipeline: cas }
+  BS4K:       { pipeline: mmt, input: tlv }   # input 省略時は input: ts
   # バインド無しのタイプ = 生 TS そのまま配信
 ```
+
+- `types.<type>.input` はチューナー出力の種類。`ts`（既定）または `tlv` のみ。
+  - `ts`: チューナーの MPEG-TS を 204→188 に正規化してから pipeline 1 段目へ渡す（§4）。
+  - `tlv`: BS4K チューナーの TLV/MMT を**一切正規化せず** pipeline 1 段目へそのまま渡す。pipeline の出力は TS として pump で 188B に正規化する（§4）。TLV に `0x47` 同期バイト探索をかけるとストリームが壊れるため、この区別は必須。
+  - 未知の値（`tsv` 等）や typo フィールド（`inputs:`）は `deny_unknown_fields` により起動エラー。
+  - `input: tlv` は実在する pipeline へのバインドが必須。pipeline 未指定は parse エラー、未定義 pipeline への参照・空の pipeline（コマンド 0 件、または全段 `passthrough`）はバリデーションエラー。TLV を TS に変換する段が無いまま起動すると、scan が毎回 no signal になるため fail-fast する。
 
 - CAS（デスクランブル）は特定実装に依存しない。B25 系のスクランブル解除は外部 B25 デコーダ
   （例: `arib-b25-stream-test`。引数なしで stdin の TS を stdout へ流す）を pipeline の
@@ -174,6 +184,7 @@ types:                                # チャンネルタイプ → pipeline �
 - チューナー名 / チャンネル `(type, channel)` の重複なし
 - タイプ名正規表現 `^[A-Za-z0-9][A-Za-z0-9_-]*$` を `tuners.types` / `pipelines.types` キー / `channels.type` の全てに適用
 - `types` が参照する pipeline が存在すること
+- `types.<type>.input` は `ts` / `tlv` のいずれか。`input: tlv` は実在する pipeline へのバインドが必須で、その pipeline に TLV→TS 変換を行う実段（`passthrough` 以外）が 1 つ以上あること
 - `command` が空でないこと
 - unknown field を拒否すること（`cmd:` と `command:` の typo 等を黙って無視しない）
 - `pipelines` エントリが 1 つ以上あること
@@ -181,8 +192,14 @@ types:                                # チャンネルタイプ → pipeline �
 ## 4. データパス
 
 ```
-  tuner command ─stdout─► [204→188 正規化] ─► pipeline stage1 ─► ... ─► 188B ──┐
-  (child)                                  (RSパリティ除去・先頭junk読み飛ばし)   │
+  input: ts （既定）
+  tuner command ─stdout─► [204→188 正規化] ─► pipeline stage1 ─► ... ─┐
+  (child)                (RSパリティ除去・先頭junk読み飛ばし)          │
+                                                                        ▼
+  input: tlv                                                          [TS 正規化]
+  tuner command ─stdout─► pipeline stage1 (TLV/MMT をそのまま) ─► ... ─► 188B
+  (child)                        (TLV→TS 変換は pipeline の仕事)         │
+                                                                         ▼
                                                               下層の broadcast
                                                               (post-pipeline / pre-filter 共通)
                                                                  ├──► channel stream (そのまま配信)
@@ -192,12 +209,13 @@ types:                                # チャンネルタイプ → pipeline �
                                                                         (filter しない専用購読として分岐)
 ```
 
-- **Session** = (tuner, type, channel) 単位の共有プロセス木（tuner + pipeline 直列）。tuner の stdout が pipeline 段に流入し、最終段の stdout が 188B アラインされて broadcast される。
+- **Session** = (tuner, type, channel) 単位の共有プロセス木（tuner + pipeline 直列）。tuner の stdout が pipeline 段に流入し、最終段（または pipeline 無しの tuner）の stdout が 188B アラインされて broadcast される。
 - **共通 broadcast の層は post-pipeline / pre-filter**。ここが設計の要。
   - channel stream はこの層をそのまま配信する。
   - service stream はこの層から購読者ごとに **TSFilter インスタンスを 1 個ずつ** 用意し、PAT/PMT 書き換えを購読者側で独立に行う（購読者同士で sid が違っても干渉しない）。
   - scan はこの層から **filter しない専用購読者**として分岐する。filter 下流で scan すると 1 サービスしか見えずサービステーブルを作れないため。
-- **204 → 188 正規化は pipeline 入力側**（tuner stdout 直後）で行う。204B は下位 16B の RS パリティを落とし、188B に揃えた上で pipeline に渡す。先頭 junk は最初の 0x47 まで読み飛ばす。
+- **TS 入力（`input: ts`、既定）の 204 → 188 正規化は pipeline 入力側**（tuner stdout 直後）で行う。204B は下位 16B の RS パリティを落とし、188B に揃えた上で pipeline に渡す。先頭 junk は最初の 0x47 まで読み飛ばす。
+- **TLV 入力（`input: tlv`）は tuner stdout を byte-for-byte で pipeline 1 段目へ渡す**。TS 同期バイト探索も 188B アラインも行わない（TLV 内の偶然の `0x47` を拾うとストリームが壊れる）。pipeline の出力は TS なので、pump が no-pipeline の TS 経路と同じ正規化（204→188）を適用してから broadcast する。したがって scan・内蔵 TSFilter・購読者は input mode に関係なく常に 188B TS を見る。
 - 子プロセスは setsid で専用プロセスグループに置き、SIGTERM→猶予→SIGKILL をグループ全体に送る。
 - プロセスツリーの部分的な spawn 失敗（tuner は起動したのに pipeline 段が起動しない等）は、セッションを「登録済みだが出力なし」にしないこと。起動失敗時は Session を作らずに落とし、tuner 側のプロセスも確実に kill する。
 - TS 正規化（`tsframe.rs`）は読み出し済みの先頭バイトをオフセットで進め、パケットを 1 個捨てるたびの `memmove` を避ける（バッファは全消費時、または未使用領域が 64 KiB 以上になったときに圧縮する）。188 バイトで連続する区間は 1 回のコピーでまとめて出力する。
@@ -206,6 +224,7 @@ types:                                # チャンネルタイプ → pipeline �
 
 - `decode=0` は **pipeline 全段をバイパスし、生 TS をそのまま配信**する。
   - mirakurun の `decode=0` は B-25 デコーダのみスキップだが、unituner は pipeline 内にデスクランブルも TS 変換も全部入れる設計のため、この解釈で確定（ユーザー確認済み）。
+  - ただし `input: tlv` の型では pipeline が TLV→TS 変換そのものなので、`decode=0` は **生の TLV/MMT をそのまま配信する**（188B アラインもしない）。mirakurun クライアントがこの型に `decode=0` を付けると TS ではなく TLV を受け取る点に注意（README 制限欄にも明記）。
 - `decode=0` のとき内蔵 TSFilter（service stream の SID 絞り込み）も適用するかは仕様として要定義。既定方針：`decode=0` でも service stream の TSFilter は適用する（絞り込みは pipeline ではないため）。ただし README 制限欄に「decode=0 は pipeline 全段 bypass」と明記する。
 
 ## 5. 内蔵 TSFilter（service stream の SID 絞り込み）
@@ -332,6 +351,7 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
 
 - 起動時のバックグラウンドスキャンで PAT/PMT/SDT をパースし、in-memory の ServiceTable を構築する。EPG は見ない。
 - scan は **priority −1000** の専用購読者として、post-pipeline / pre-filter の broadcast から **filter しない専用購読**で分岐する。
+  - `input: ts` でも `input: tlv` でも、scan が見るのは pipeline（TLV 型では TLV→TS 変換後）の 188B TS である。TLV 型で pipeline が無い/変換段が無い構成は起動時バリデーションで拒否される（§3.4）。
   - scan 専用に大きな購読バッファを持つ（通常購読者の 1024 chunks とは別）。
   - 中間的に通常購読者と同一の購読扱いで scan が溢れて自己切断しないようにする。
 - スキャンは全 channel に対して通常セッションとして扱わず、scan 用セッションで取得する。相手が busy なら skip + 次回 retry。
@@ -539,7 +559,8 @@ unituner/
 
 ## 15. README 制限欄に必ず書くこと
 
-- `decode=0` は pipeline 全段 bypass（mirakurun の B-25 スキップとは異なる）
+- `decode=0` は pipeline 全段 bypass（mirakurun の B-25 スキップとは異なる）。`input: tlv` の型では pipeline が TLV→TS 変換を担うため、`decode=0` は TS ではなく**生 TLV/MMT** を返す
+- `input: tlv`（BS4K 等）は pipeline 1 段目へ TLV/MMT を byte-for-byte で渡す。TLV を TS 正規化してから pipeline に渡す構成は不可（同期バイト探索でストリームが壊れる）。`dantto4k` / `mmt2ts` およびその前段の `b61dec-remote` は TLV 入力前提
 - priority の multi-header 集約は未対応（単一値前提）
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
