@@ -125,7 +125,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::config::{Config, ConfigError};
-use crate::services::{ServiceRecord, ServiceTable};
+use crate::services::{
+    read_service_cache, service_fingerprint, write_service_cache, ServiceRecord, ServiceTable,
+    SERVICE_CACHE_FILE, SERVICE_CACHE_VERSION,
+};
 use crate::session::{SessionManager, SessionTap, TunerUser, SCAN_PRIORITY};
 use crate::si::{SdtInfo, SiEvent, SiParser, TableCompleteness};
 use crate::webui::store;
@@ -1971,8 +1974,12 @@ struct PassSummary {
 }
 
 /// Scans every enabled `channels.yml` entry once and retries the skipped ones
-/// with exponential backoff until `shutdown` fires (SPEC §8).
+/// with exponential backoff until `shutdown` fires (SPEC §8, §8.2).
 ///
+/// * A valid `services.json` (matching schema version + fingerprint) makes the
+///   whole scan a no-op: the cached services are restored and no tuner is
+///   touched. There is no expiry; only a fingerprint change or a manual
+///   re-scan replaces it.
 /// * Each channel runs through [`scan_channel`] at [`SCAN_PRIORITY`], so a user
 ///   request always wins and a busy tuner is skipped rather than preempted.
 /// * The per-channel budget is [`CHANNEL_TIMEOUT`], covering acquire + SI read.
@@ -1981,17 +1988,60 @@ struct PassSummary {
 ///   ([`ChannelOutcome::Preempted`]) are retried; a no-signal channel is not.
 /// * Entries are only ever upserted, never cleared, so a failed channel keeps
 ///   whatever the previous pass (or an HTTP scan) put in the table.
+/// * The cache is written after the first pass that either found a service or
+///   had nothing left to retry. Later retry passes rewrite it only when the
+///   table actually changed. A pass interrupted by shutdown or a dropped
+///   progress receiver never writes. Once written, the cache is authoritative
+///   until the fingerprint changes or the WebUI Re-scan runs (busy channels are
+///   not retried across a restart).
 ///
 /// The task owns no processes: [`scan_channel`] releases each session before
 /// returning, and the shutdown signal is observed before every channel.
 pub async fn startup_scan(
     manager: SessionManager,
     config: Arc<Config>,
+    config_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let fingerprint = service_fingerprint(&config.channels);
+    let table = manager.services();
+
+    match read_service_cache(&config_dir) {
+        Ok(Some(cache))
+            if cache.version == SERVICE_CACHE_VERSION && cache.fingerprint == fingerprint =>
+        {
+            // Restoring here keeps the function self-contained: a caller that
+            // did not preload the cache (a test, or a future entry point) still
+            // serves the cached services.
+            table.restore(cache.services);
+            tracing::info!("startup scan skipped: service cache is valid");
+            return;
+        }
+        Ok(Some(cache)) if cache.version != SERVICE_CACHE_VERSION => {
+            tracing::warn!(
+                version = cache.version,
+                expected = SERVICE_CACHE_VERSION,
+                "startup scan: unsupported services.json version, scanning"
+            );
+        }
+        Ok(Some(_)) => {
+            tracing::info!("startup scan: services.json fingerprint changed, scanning");
+        }
+        Ok(None) => tracing::info!("startup scan: no service cache, scanning"),
+        Err(error) => {
+            tracing::warn!(%error, "startup scan: cannot read services.json, scanning")
+        }
+    }
+
     let mut pending = startup_channels(&config);
     if pending.is_empty() {
         tracing::info!("startup scan: no enabled channels");
+        // An empty cache is a valid answer: remembering that a config has no
+        // scannable channel avoids probing again on every boot.
+        retain_enabled_channels(table, &config);
+        if let Err(error) = write_service_cache(&config_dir, &fingerprint, table) {
+            tracing::warn!(%error, "failed to write services.json");
+        }
         return;
     }
     tracing::info!(
@@ -2000,11 +2050,13 @@ pub async fn startup_scan(
     );
 
     let mut pass = 0usize;
+    let mut cache_written = false;
     loop {
         if *shutdown.borrow() {
             tracing::info!(pass, "startup scan stopped");
             return;
         }
+        let before = table.snapshot();
         let (summary, retry) = scan_pass(&manager, &config, &pending, &mut shutdown).await;
         tracing::info!(
             pass,
@@ -2015,12 +2067,44 @@ pub async fn startup_scan(
             "startup scan pass finished"
         );
 
-        // A pass interrupted by shutdown must not sleep: return right away so
-        // the task never outlives the server.
+        // A pass interrupted by shutdown must not sleep (nor write the cache):
+        // return right away so the task never outlives the server.
         if *shutdown.borrow() {
             tracing::info!(pass, "startup scan stopped");
             return;
         }
+
+        // First write: only when the pass really produced something, or when
+        // there is nothing left to retry (an all-no-signal config legitimately
+        // has an empty service list). A first pass that was entirely busy keeps
+        // retrying instead of persisting an empty cache that a later boot would
+        // accept as valid.
+        let should_write = if cache_written {
+            summary.found > 0 && before != table.snapshot()
+        } else {
+            summary.found > 0 || retry.is_empty()
+        };
+        if should_write {
+            // Drop records of channels that are no longer enabled. Busy or
+            // no-signal channels are still enabled, so their records survive.
+            retain_enabled_channels(table, &config);
+            match write_service_cache(&config_dir, &fingerprint, table) {
+                Ok(()) => {
+                    cache_written = true;
+                    tracing::info!(
+                        services = table.len(),
+                        "service cache written to {}",
+                        config_dir.join(SERVICE_CACHE_FILE).display()
+                    );
+                }
+                Err(error) => {
+                    // A warning only: the table stays valid in memory and the
+                    // previous file is untouched.
+                    tracing::warn!(%error, "failed to write services.json");
+                }
+            }
+        }
+
         if retry.is_empty() {
             tracing::info!("startup scan complete");
             return;
@@ -2045,6 +2129,144 @@ pub async fn startup_scan(
             }
         }
     }
+}
+
+/// Keeps only records of enabled `channels.yml` entries.
+fn retain_enabled_channels(table: &ServiceTable, config: &Config) -> usize {
+    let keep: HashSet<(String, String)> = config
+        .channels
+        .iter()
+        .filter(|channel| !channel.disabled)
+        .map(|channel| (channel.channel_type.clone(), channel.channel.clone()))
+        .collect();
+    table.retain_bound_channels(&keep)
+}
+
+/// Re-scans the enabled `channels.yml` entries exactly once (SPEC §8.2).
+///
+/// This is the manual WebUI re-scan: it uses the in-memory configuration (no
+/// `channels.yml` is read or written), streams one progress line per channel
+/// and, after the whole pass, drops records for channels that are no longer
+/// enabled. A channel whose tuner is busy or has no signal keeps its previous
+/// records. The cache is written only after a completed pass; a client
+/// disconnect or shutdown returns before the retain step and leaves
+/// `services.json` untouched (the in-memory table may keep the upserts that
+/// already happened).
+pub async fn rescan_services(
+    manager: &SessionManager,
+    config: &Config,
+    config_dir: &Path,
+    tx: mpsc::Sender<String>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> Result<(), String> {
+    let mut lines = Lines::new(tx);
+    let channels = startup_channels(config);
+    let total = channels.len().max(1);
+    lines
+        .push(format!(
+            "service re-scan... ({} channels)\n\n",
+            channels.len()
+        ))
+        .await;
+
+    let table = manager.services();
+    let mut scanned = 0usize;
+    let mut found_total = 0usize;
+    // Channel-level refreshed sid sets, applied only after the whole pass
+    // completes: a disconnect must not run any retain step (SPEC §8.2).
+    let mut refreshed: Vec<(String, String, HashSet<u16>)> = Vec::new();
+    for (index, channel) in channels.iter().enumerate() {
+        if lines.is_closed() || cancelled(&shutdown) {
+            tracing::info!("service re-scan cancelled");
+            return Ok(());
+        }
+        let percent = (index as u64 + 1) * 100 / total as u64;
+        lines
+            .push(format!(
+                "channel: {:?} ({}/{}) [{}%] ... ",
+                channel.channel,
+                index + 1,
+                total,
+                percent
+            ))
+            .await;
+
+        let outcome = scan_channel_cancellable(
+            manager,
+            &channel.type_name,
+            &channel.channel,
+            CHANNEL_TIMEOUT,
+            shutdown.clone(),
+        )
+        .await;
+        let Some(outcome) = outcome else {
+            tracing::info!("service re-scan cancelled");
+            return Ok(());
+        };
+
+        match outcome {
+            ChannelOutcome::Busy => lines.push("skipped (tuner busy)\n".to_string()).await,
+            ChannelOutcome::Preempted => {
+                lines
+                    .push("skipped (preempted by a user request)\n".to_string())
+                    .await
+            }
+            ChannelOutcome::NoSignal => lines.push("no signal\n".to_string()).await,
+            ChannelOutcome::Failed => lines.push("error (scan task failed)\n".to_string()).await,
+            ChannelOutcome::Services(services) => {
+                let services: Vec<FoundService> = services
+                    .into_iter()
+                    .filter(|service| SCAN_SERVICE_TYPES.contains(&service.service_type))
+                    .collect();
+                lines
+                    .push(format!("-> {} services found.\n", services.len()))
+                    .await;
+                if services.is_empty() {
+                    continue;
+                }
+                scanned += 1;
+                found_total += services.len();
+                upsert_startup_services(table, channel, &services);
+                // Same refresh rule as the discovery scan: a channel that did
+                // produce SI drops the services it no longer carries.
+                // Collected here and applied after the pass, so a mid-pass
+                // disconnect keeps the previous records untouched.
+                let keep: HashSet<u16> =
+                    services.iter().map(|service| service.service_id).collect();
+                refreshed.push((channel.type_name.clone(), channel.channel.clone(), keep));
+            }
+        }
+    }
+
+    // A disconnected client or a shutdown must not touch the cache (and must
+    // not apply the channel-level retain step).
+    if lines.is_closed() || cancelled(&shutdown) {
+        tracing::info!("service re-scan cancelled before saving");
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for (channel_type, channel, keep) in refreshed {
+        removed += table.retain_channel(&channel_type, &channel, &keep);
+    }
+    removed += retain_enabled_channels(table, config);
+    let fingerprint = service_fingerprint(&config.channels);
+    let cache_note = match write_service_cache(config_dir, &fingerprint, table) {
+        Ok(()) => format!("wrote {}", config_dir.join(SERVICE_CACHE_FILE).display()),
+        Err(error) => {
+            tracing::warn!(%error, "failed to write services.json");
+            format!("warning: failed to write services.json: {error}")
+        }
+    };
+    lines
+        .push(format!(
+            "\n**RE-SCAN COMPLETE**: {} services ({} channels scanned, {found_total} found, \
+             {removed} stale records dropped; {cache_note}).\n",
+            table.len(),
+            scanned
+        ))
+        .await;
+    Ok(())
 }
 
 /// Whether a startup-scan pass retries a channel after `outcome`.
