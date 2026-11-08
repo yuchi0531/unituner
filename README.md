@@ -170,6 +170,8 @@ types:
 - 書き込みは `services.json.tmp` → `fsync` → `rename` で原子的。Unix では `0600` で作成し、既存のモードを保持する。書き込み失敗は警告のみで、メモリ上のサービス表は有効なまま。
 - `services: []` も「スキャン対象が無かった」という有効な結果として扱う。ただし**全チャンネルがチューナー起動失敗**で表が空の場合は、空キャッシュを書かない（次回起動時に再プローブする）。
 - 手動 Re-scan は有効チャンネルを 1 パスだけスキャンし、削除/disable されたチャンネルのレコードを落とす。busy・無信号・チューナー起動失敗のチャンネルは以前のレコードを保持する。`channels.yml` は変更しない。
+  - 完了行は `**RE-SCAN COMPLETE**: N services (S channels scanned, F found, D stale records dropped; A no signal, B busy, C tuner failed; wrote ...)`。`busy` は preempted を含み、`tuner failed` は `NoTuner` を含む。
+  - 全チャンネルがチューナー起動に失敗した場合は、チャンネルごとの行の後に `all N channels failed to start their tuner — check tuners.yml (command/device)` を 1 行追加する。一部だけ失敗したときは出さない。
 
 ## パイプライン
 
@@ -363,7 +365,7 @@ Found 1 channels for 24
 - `disabled: true` のエントリは再スキャン対象。
 - 失敗は種類ごとに区別して表示する（混同しない）:
   - `no signal` — チューンはできたが、期限までに使用可能な SI が無かった。
-  - `tuner failed to start: <理由>` — チューナーコマンドの spawn 失敗、または最初のデータ前に終了した。デバイス未接続・パス誤り・コマンド異常が典型。**`no signal` とは別物**。
+  - `tuner failed to start: <理由>` — チューナーコマンドの spawn 失敗、最初のデータ前の終了、または予算内に ready にならなかった（例: `timed out waiting for the tuner to start`）。spawn エラーは展開後の argv（`/nonexistent/tuner 27`）を表示する。デバイス未接続・パス誤り・コマンド異常が典型。**`no signal` とは別物**。
   - `skipped (no tuner for type <type>)` — その type をサポートする有効チューナーが無い（設定不備）。
   - `skipped (tuner busy)` / `skipped (preempted by a user request)` — 一時的な競合。
 - その type の有効チューナーが複数なら、その台数を上限に並列でスキャンする（1 台なら従来どおり直列）。
@@ -382,6 +384,7 @@ Found 1 channels for 24
 - 有効なチューナーが複数ある type では、その台数を上限に並列でスキャンする（1 台なら従来どおり直列）。busy / 奪取されたチャンネルはそのパスを塞がず、再試行キューに回る。
 - PAT・PMT・SDT-actual・NIT-actual が揃ったチャンネルは、25 秒の予算を待たずに終了する（SPEC §8.1）。
 - busy / 利用者に奪取されたチャンネルだけを 30 秒 → 60 秒 → 120 秒 → 240 秒 → 300 秒（上限）の backoff で再試行する。無信号・チューナー不在（`no tuner for type`）・起動失敗（`tuner failed to start`）は再試行しない（待っても状態が変わらず spin するだけ）。
+- 1 パスで 1 チャンネル以上を試し、そのすべてが `NoTuner` / `TunerFailed` / `Failed` だった場合は、そのパスの終わりに `every channel failed to start its tuner; check tuners.yml (command/device path)` を 1 回 warn する（一部だけの失敗や 0 チャンネルでは出さない）。
 - チューナーが 1 台も起動できなかった初回パスでは、空の `services.json` を「有効なキャッシュ」として書かない（次回起動時に再プローブする）。
 - 最初のパスで 1 件以上見つかった、または再試行対象が残らない場合に `services.json` を書く。以後の再試行パスは表が変わったときだけ更新する。全チャンネル busy の初回パスでは空キャッシュを書かない。
 - サービス表は削除しないため、失敗したチャンネルは前回の内容を保持する（ただし起動時の完了パス後、設定から消えたチャンネルのレコードは落とす）。

@@ -2021,7 +2021,7 @@ async fn a_manual_rescan_with_a_missing_tuner_writes_no_empty_cache() {
         "a missing command must be a tuner failure: {log}"
     );
     assert!(
-        !log.contains("no signal"),
+        !log.contains("no signal\n"),
         "a missing command must not be reported as no signal: {log}"
     );
     assert!(
@@ -2037,6 +2037,92 @@ async fn a_manual_rescan_with_a_missing_tuner_writes_no_empty_cache() {
         "no services.json may be written when no tuner could start"
     );
     assert!(state.manager.services().is_empty());
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_manual_rescan_with_every_tuner_broken_adds_one_aggregate_hint() {
+    // Three channels, all using a command that cannot start. The per-channel
+    // lines show the expanded argv, and one explicit line after them says the
+    // whole pass failed to start a tuner.
+    let channels = "- name: A\n  type: GR\n  channel: \"26\"\n\
+                    - name: B\n  type: GR\n  channel: \"27\"\n\
+                    - name: C\n  type: GR\n  channel: \"28\"\n";
+    let fixture = Fixture::with(channels);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        "- name: broken\n  types: [GR]\n  command: '/nonexistent/unituner-rescan-tuner {channel}'\n",
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    let log = text(&body);
+    assert_eq!(
+        log.matches("all 3 channels failed to start their tuner")
+            .count(),
+        1,
+        "exactly one aggregate hint: {log}"
+    );
+    assert!(
+        log.contains("/nonexistent/unituner-rescan-tuner 26"),
+        "the spawn error must show the expanded argv: {log}"
+    );
+    assert!(
+        !log.contains("{channel}"),
+        "the unsubstituted template must not leak: {log}"
+    );
+    assert!(
+        log.contains("0 no signal, 0 busy, 3 tuner failed"),
+        "the summary must break the outcomes down: {log}"
+    );
+    assert!(
+        !fixture.path.join("services.json").exists(),
+        "an all-start-failure pass must not persist an empty cache"
+    );
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_manual_rescan_with_one_broken_channel_has_no_aggregate_hint() {
+    // Channel 27 streams the multiplex; 26 uses a command that cannot start.
+    // Only the summary's outcome counts may mention the failure.
+    let channels = "- name: Good\n  type: GR\n  channel: \"27\"\n\
+                    - name: Broken\n  type: GR\n  channel: \"26\"\n";
+    let fixture = Fixture::with(channels);
+    let ts = fixture.path.join("mux.ts");
+    std::fs::write(&ts, cache_multiplex()).expect("write ts");
+    let command = format!(
+        "sh -c \"case {{channel}} in 26) exec /nonexistent/x;; *) cat {}; sleep 30;; esac\"",
+        ts.display()
+    );
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: mixed\n  types: [GR]\n  command: '{command}'\n"),
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    let log = text(&body);
+    assert!(
+        !log.contains("channels failed to start their tuner"),
+        "a partial failure must not claim every channel failed: {log}"
+    );
+    assert!(
+        log.contains("2 services found"),
+        "the good channel must still be scanned: {log}"
+    );
+    assert!(
+        log.contains("1 channels scanned, 2 found"),
+        "the summary keeps the scanned/found counts: {log}"
+    );
+    assert!(
+        log.contains("0 no signal, 0 busy, 1 tuner failed"),
+        "the summary must count the one failed tuner: {log}"
+    );
     state.manager.shutdown().await;
 }
 
@@ -2064,7 +2150,7 @@ async fn a_manual_rescan_reports_a_tuner_that_exits_before_output() {
         "the reason must say the process exited before output: {log}"
     );
     assert!(
-        !log.contains("no signal"),
+        !log.contains("no signal\n"),
         "an early exit must not be reported as no signal: {log}"
     );
     assert!(

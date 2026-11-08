@@ -293,10 +293,11 @@ async fn a_refresh_scan_drops_a_service_that_disappeared() {
 }
 
 #[tokio::test]
-async fn a_no_signal_channel_keeps_its_previous_services() {
+async fn a_tuner_that_never_starts_keeps_its_previous_services() {
     let fixture = Fixture::new("", CHANNEL_24);
-    // The tuner prints nothing: the scan must not treat "no SI" as "no
-    // services any more".
+    // The tuner never becomes ready (it prints nothing): that is a start
+    // failure now, and either way the scan must not treat it as "no services
+    // any more".
     fixture.tuner("GR", "sh -c \"sleep 30\"");
     let manager = fixture.manager();
     manager
@@ -311,7 +312,7 @@ async fn a_no_signal_channel_keeps_its_previous_services() {
     ]);
     query.timeout = Duration::from_millis(400);
     let progress = run(&manager, &fixture.config(), &fixture, &query).await;
-    assert!(progress.contains("no signal"), "{progress}");
+    assert!(progress.contains("tuner failed to start"), "{progress}");
 
     let services = manager.services().list();
     assert_eq!(services.len(), 1, "a failed scan must not wipe the table");

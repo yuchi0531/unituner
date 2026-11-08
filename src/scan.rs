@@ -51,10 +51,11 @@
 //!
 //! Outcomes are reported truthfully (SPEC §8): a channel whose type has no
 //! configured tuner is `skipped (no tuner for type <type>)`, a tuner command
-//! that cannot start or exits before its first data is `tuner failed to start:
-//! <short reason>`, and only a channel whose session was actually acquired and
-//! produced no usable SI is `no signal`. The startup scan retries only `Busy`
-//! and `Preempted`; `NoTuner` and `TunerFailed` would only spin.
+//! that cannot start, exits before its first data, or never becomes ready
+//! before the budget is `tuner failed to start: <short reason>`, and only a
+//! channel whose session was actually acquired and produced no usable SI is
+//! `no signal`. The startup scan retries only `Busy` and `Preempted`; `NoTuner`
+//! and `TunerFailed` would only spin.
 //!
 //! A channel the scan loses to a **user request** (any non-negative priority
 //! beats [`SCAN_PRIORITY`]) is reported as preempted, never as "no signal": the
@@ -1303,10 +1304,11 @@ pub(crate) enum ChannelOutcome {
     /// problem, not a busy tuner: it is never retried (retrying would spin
     /// forever), and the operator is told which type lacks a tuner.
     NoTuner,
-    /// The tuner command could not be started (spawn failed, or the process
-    /// exited before its first data). The channel was never read, so this is
-    /// **not** "no signal"; it carries a short diagnostic and is never retried
-    /// (a broken command would only spin).
+    /// The tuner command could not be started (spawn failed, it exited before
+    /// its first data, or it never became ready before the scan budget). The
+    /// channel was never read, so this is **not** "no signal"; it carries a
+    /// short diagnostic and is never retried (a broken command would only
+    /// spin).
     TunerFailed(String),
     /// A user request took the tuner over during the scan (SPEC §6.1: any
     /// non-negative priority beats [`SCAN_PRIORITY`]). This is **not** "no
@@ -1515,15 +1517,19 @@ async fn scan_channel_watched(
         Err(_) => {
             tracing::debug!(channel, "scan acquire timed out");
             // The tuner process was started (otherwise this would have been
-            // `Unavailable`) but produced no first data before the scan's own
-            // budget; a live-but-silent tuner is genuine no signal, not a start
-            // failure. The session layer is cancellation-safe and stops the
-            // reservation it had already taken, but that takes a moment
-            // (SIGTERM grace, then SIGKILL). Wait for it to be gone, otherwise
-            // the tuner still holds `Stopping`/`Starting` and the next channel
-            // of the scan would be refused with "busy" because of this one.
+            // `Unavailable`) but did not become ready (no first data) before
+            // the scan's own budget. That is a start failure, not "no signal":
+            // the channel was never read. The session layer is
+            // cancellation-safe and stops the reservation it had already taken,
+            // but that takes a moment (SIGTERM grace, then SIGKILL). Wait for it
+            // to be gone, otherwise the tuner still holds `Stopping`/`Starting`
+            // and the next channel of the scan would be refused with "busy"
+            // because of this one.
             wait_for_release(manager, type_name, channel).await;
-            return (ChannelOutcome::NoSignal, false);
+            return (
+                ChannelOutcome::TunerFailed("timed out waiting for the tuner to start".to_string()),
+                false,
+            );
         }
         Ok(Err(failure)) => {
             tracing::debug!(channel, ?failure, "scan could not acquire a tuner");
@@ -2129,6 +2135,14 @@ pub async fn startup_scan(
             found = summary.found,
             "startup scan pass finished"
         );
+        if summary.attempted == pending.len()
+            && summary.attempted > 0
+            && summary.hard_failures == summary.attempted
+        {
+            tracing::warn!(
+                "every channel failed to start its tuner; check tuners.yml (command/device path)"
+            );
+        }
 
         // A pass interrupted by shutdown must not sleep (nor write the cache):
         // return right away so the task never outlives the server.
@@ -2242,6 +2256,12 @@ pub async fn rescan_services(
     // all-hard-failure first pass must not persist an empty `services.json`
     // that a later boot would trust as a valid "no services" answer.
     let mut hard_failures = 0usize;
+    // Per-outcome buckets for the completion summary. "busy" folds preemption
+    // into it; "tuner failed" folds no-tuner in, because both mean the tuner
+    // never started.
+    let mut no_signal = 0usize;
+    let mut busy = 0usize;
+    let mut tuner_failed = 0usize;
     // Channel-level refreshed sid sets, applied only after the whole pass
     // completes: a disconnect must not run any retain step (SPEC §8.2).
     let mut refreshed: Vec<(String, String, HashSet<u16>)> = Vec::new();
@@ -2298,13 +2318,16 @@ pub async fn rescan_services(
                 refreshed.push((channel.type_name.clone(), channel.channel.clone(), keep));
             }
             other => {
-                if matches!(
-                    other,
+                match &other {
                     ChannelOutcome::NoTuner
-                        | ChannelOutcome::TunerFailed(_)
-                        | ChannelOutcome::Failed
-                ) {
-                    hard_failures += 1;
+                    | ChannelOutcome::TunerFailed(_)
+                    | ChannelOutcome::Failed => {
+                        hard_failures += 1;
+                        tuner_failed += 1;
+                    }
+                    ChannelOutcome::Busy | ChannelOutcome::Preempted => busy += 1,
+                    ChannelOutcome::NoSignal => no_signal += 1,
+                    ChannelOutcome::Services(_) => {}
                 }
                 if let Some(line) = outcome_line(&channel.type_name, &other) {
                     lines.push(line).await;
@@ -2318,6 +2341,19 @@ pub async fn rescan_services(
     if lines.is_closed() || cancelled(&shutdown) {
         tracing::info!("service re-scan cancelled before saving");
         return Ok(());
+    }
+
+    // One explicit hint after the per-channel lines when every channel failed
+    // to start a tuner: a per-channel "tuner failed to start" list is easy to
+    // skim past, and an empty table alone does not say why.
+    if !channels.is_empty() && hard_failures == channels.len() {
+        lines
+            .push(format!(
+                "all {} channels failed to start their tuner — check tuners.yml \
+                 (command/device)\n",
+                channels.len()
+            ))
+            .await;
     }
 
     let mut removed = 0usize;
@@ -2348,7 +2384,8 @@ pub async fn rescan_services(
     lines
         .push(format!(
             "\n**RE-SCAN COMPLETE**: {} services ({} channels scanned, {found_total} found, \
-             {removed} stale records dropped; {cache_note}).\n",
+             {removed} stale records dropped; {no_signal} no signal, {busy} busy, \
+             {tuner_failed} tuner failed; {cache_note}).\n",
             table.len(),
             scanned
         ))
@@ -3671,9 +3708,20 @@ mod tests {
 
         let started = tokio::time::Instant::now();
         let silent = scan_channel(&manager, "GR", "27", Duration::from_secs(1)).await;
-        assert!(
-            matches!(silent, ChannelOutcome::NoSignal),
-            "a silent channel is no signal: {silent:?}"
+        match &silent {
+            ChannelOutcome::TunerFailed(reason) => {
+                assert_eq!(
+                    reason, "timed out waiting for the tuner to start",
+                    "a tuner that never becomes ready is a start failure"
+                );
+            }
+            other => {
+                panic!("a channel that never becomes ready must be a tuner failure, got {other:?}")
+            }
+        }
+        assert_eq!(
+            outcome_line("GR", &silent).as_deref(),
+            Some("tuner failed to start: timed out waiting for the tuner to start\n")
         );
         assert!(
             started.elapsed() < Duration::from_secs(5),

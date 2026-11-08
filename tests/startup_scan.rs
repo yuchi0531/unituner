@@ -286,6 +286,71 @@ fn tuners(gr: &str, dead: &str) -> String {
     )
 }
 
+/// Captures the warning messages emitted through the scoped tracing subscriber.
+///
+/// The startup scan runs on the test's current-thread runtime, so a
+/// thread-local default subscriber sees its events without touching the global
+/// dispatcher.
+#[derive(Clone, Default)]
+struct CapturedWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl CapturedWarnings {
+    fn subscriber(&self) -> CaptureSubscriber {
+        CaptureSubscriber(self.0.clone())
+    }
+
+    fn messages(&self) -> Vec<String> {
+        self.0.lock().expect("lock").clone()
+    }
+}
+
+struct CaptureSubscriber(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() == &tracing::Level::WARN
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        if let Some(message) = visitor.message {
+            self.0.lock().expect("lock").push(message);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+#[derive(Default)]
+struct MessageVisitor {
+    message: Option<String>,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        }
+    }
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -428,6 +493,35 @@ async fn startup_scan_does_not_cache_an_all_start_failure_pass() {
         "an all-start-failure pass must not write services.json"
     );
     assert!(manager.services().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_warns_once_when_every_channel_fails_to_start_a_tuner() {
+    let capture = CapturedWarnings::default();
+    let _guard = tracing::subscriber::set_default(capture.subscriber());
+    let channels = "- name: A\n  type: GR\n  channel: \"26\"\n\
+                    - name: B\n  type: GR\n  channel: \"27\"\n\
+                    - name: C\n  type: GR\n  channel: \"28\"\n";
+    let fixture = Fixture::new(
+        "- name: broken\n  types: [GR]\n  command: '/nonexistent/x {channel}'\n",
+        channels,
+    );
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+
+    let messages = capture.messages();
+    let aggregate =
+        "every channel failed to start its tuner; check tuners.yml (command/device path)";
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.contains(aggregate))
+            .count(),
+        1,
+        "exactly one aggregate warning: {messages:?}"
+    );
+    assert!(!fixture.path.join("services.json").exists());
     manager.shutdown().await;
 }
 

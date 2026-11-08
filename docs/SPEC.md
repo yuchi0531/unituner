@@ -323,11 +323,12 @@ mirakc-BS4K の `channels[].routes` 互換。`routes` を持つチャンネル�
   | `Busy` | `skipped (tuner busy)` | 全チューナーが使用中（または decode mode 衝突） | **する**（30→60→120→240→300 秒の backoff） |
   | `Preempted` | `skipped (preempted by a user request)` | 利用者の要求（priority ≥ 0）がチューナーを奪った | **する**（busy と同じ backoff） |
   | `NoTuner` | `skipped (no tuner for type <type>)` | その type をサポートする有効チューナーが無い（設定不備） | **しない**（待っても状態は変わらず spin するだけ） |
-  | `TunerFailed` | `tuner failed to start: <短い理由>` | チューナーコマンドの spawn 失敗、または最初のデータ前に終了 | **しない**（壊れたコマンドを繰り返すだけ） |
+  | `TunerFailed` | `tuner failed to start: <短い理由>` | チューナーコマンドの spawn 失敗、最初のデータ前に終了、または予算内に ready にならなかった（acquire タイムアウト） | **しない**（壊れたコマンドを繰り返すだけ） |
   | `NoSignal` | `no signal` | セッションを取得でき、期限までに使用可能な SI が無かった | しない |
   | `Failed` | `error (scan task failed)` | スキャンタスクが結果を返さず終了（panic / abort） | しない |
 
-  短い理由は 1 行・最大約 200 文字に丸める。spawn エラー（例: `No such file or directory`）や `stream ended before any data`（最初のデータ前に EOF）が入る。stderr 全体は進捗に出さない（ログ側で従来どおり stage ごとに記録される）。
+  短い理由は 1 行・最大約 200 文字に丸める。spawn エラーは**展開後の argv**（例: `/nonexistent/tuner 27`）と OS エラー（例: `No such file or directory`）を含む。`{channel}` のテンプレートは出さない。`stream ended before any data`（最初のデータ前に EOF）や `timed out waiting for the tuner to start`（ready 待ちのタイムアウト）も入る。stderr 全体は進捗に出さない（ログ側で従来どおり stage ごとに記録される）。
+- 1 パスで 1 チャンネル以上を試し、その**すべて**が `NoTuner` / `TunerFailed` / `Failed` だった場合、起動時スキャンは追加で 1 回 `every channel failed to start its tuner; check tuners.yml (command/device path)` を warn する。手動 Re-scan は進捗の最後（完了サマリの前）に `all N channels failed to start their tuner — check tuners.yml (command/device)` を 1 行追加する。一部だけ失敗した場合やチャンネルが 0 件の場合は出さない。
 - `tuner failed to start` は「チューナーコマンド／デバイスが使えなかった」、`no signal` は「チューンはできたが使用可能な SI が無かった」を表す。前者を後者として扱うと、デバイス未接続でも全チャンネルが一瞬で「無信号」に見えてしまう。
 - テーブルが ready に至るまでは `/api/services/{id}/stream` が 404 を返してよい（README に記載）。
 - ARIB サービス名/SDT デコード：`siketyan/arib-rs`（MIT、STD-B24 text / STD-B10 TS SI tables）を第一候補とし、実 TS で早期検証する。動かなければ手書き SI パーサにフォールバックする。
@@ -407,7 +408,7 @@ Found 1 channels for 13
   - 共有 `scan_lock`（`PUT /api/config/channels/scan` と同一）を取得する。実行中なら **409** `{"code":409,"reason":"Already Scanning"}`。
   - 有効な `channels.yml` の全エントリを **ちょうど 1 パス** スキャンし、進捗を `text/plain` でストリーミングする（無限 backoff はしない）。
   - パス完了後に、**有効な**チャンネルに属するレコードだけを残す（削除・disable されたチャンネルのレコードを落とす）。busy / 無信号 / チューナー起動失敗のチャンネルは有効なままなので、以前のレコードを保持する。スキャンに成功したチャンネルでは、そのチャンネルから消えたサービスも（通常の探索と同じ `retain_channel` で）落とす。
-  - その後 `services.json` を書き、`**RE-SCAN COMPLETE**` と件数を出力する。ただし **1 件もサービスが無く、全チャンネルが `NoTuner` / `TunerFailed` / `Failed`** の場合は空のキャッシュを書かない（`did not write ... (no tuner could be started)` と表示する）。既存レコードがある場合は通常どおり書き、有効チャンネルのレコードは落とさない。
+  - その後 `services.json` を書き、`**RE-SCAN COMPLETE**` と件数を出力する。サマリは `**RE-SCAN COMPLETE**: <table 件数> services (<scanned> channels scanned, <found> found, <removed> stale records dropped; <no signal> no signal, <busy> busy, <tuner failed> tuner failed; <cache note>)` の 1 行で、`no signal` / `busy`（preempted を含む）/ `tuner failed`（`NoTuner` を含む）の内訳を必ず出す。**1 件もサービスが無く、全チャンネルが `NoTuner` / `TunerFailed` / `Failed`** の場合は空のキャッシュを書かない（`did not write ... (no tuner could be started)` と表示する）。既存レコードがある場合は通常どおり書き、有効チャンネルのレコードは落とさない。
   - `channels.yml` は一切書かない（チャンネル探索 API とは別物）。
   - クライアントが途中で切断した場合、キャッシュは書かず、チャンネル単位の retain も適用しない（メモリ上の表には途中までの upsert が残りうる）。終了時の retain と保存は行わない。
 
