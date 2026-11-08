@@ -474,9 +474,10 @@ fn tlv_bytes() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn startup_scan_finds_services_behind_a_tlv_pipeline() {
-    // The tuner emits TLV: the TS normalizer would discard this whole stream.
-    // The pipeline records its stdin and turns TLV into the synthetic TS.
+async fn startup_scan_finds_services_behind_a_tlv_like_pipeline() {
+    // The tuner emits TLV-like bytes: a TS normalizer would discard the whole
+    // stream. The pipeline records its stdin and converts it into the synthetic
+    // TS, which unituner then scans.
     let fixture = Fixture::new(&tuners("true", "true"), "");
     let tlv = tlv_bytes();
     let tlv_path = fixture.write_ts("tlv.bin", &tlv);
@@ -493,7 +494,7 @@ async fn startup_scan_finds_services_behind_a_tlv_pipeline() {
     )
     .expect("write channels.yml");
     let pipelines = format!(
-        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt, input: tlv }}\n",
+        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt }}\n",
         capture.display(),
         ts.display()
     );
@@ -523,10 +524,18 @@ async fn startup_scan_finds_services_behind_a_tlv_pipeline() {
     );
 
     // Stage 0 received the tuner bytes byte-for-byte: no TS sync detection
-    // (which would have thrown TLV away) ran before the converter.
+    // (which would have thrown the TLV-like bytes away) ran before the converter.
     let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
     assert_eq!(recorded, tlv);
 
+    // The release runs after the scan task returns; give the stop path a
+    // bounded moment under parallel test load (process teardown is async).
+    for _ in 0..100 {
+        if manager.sessions_snapshot().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(manager.sessions_snapshot().is_empty());
     manager.shutdown().await;
 }

@@ -1148,6 +1148,8 @@ async fn put_pipelines_writes_the_spec_shape_and_reads_it_back() {
         2
     );
     assert_eq!(value["types"]["BS"]["pipeline"], "cas");
+    // The input mode was removed; the UI document has only the pipeline name.
+    assert!(value["types"]["BS"].get("input").is_none(), "{value}");
 }
 
 #[tokio::test]
@@ -1205,6 +1207,32 @@ async fn put_pipelines_rejects_an_unknown_binding_field() {
         serde_json::json!({
             "pipelines": { "pass": ["cat"] },
             "types": { "GR": { "pipelne": "pass" } }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
+    assert!(
+        text(&body).contains("invalid pipelines document"),
+        "{}",
+        text(&body)
+    );
+    assert_eq!(fixture.read("pipelines.yml"), before);
+}
+
+#[tokio::test]
+async fn put_pipelines_rejects_the_removed_input_field() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let before = fixture.read("pipelines.yml");
+
+    let (status, body) = put(
+        &state,
+        Webui::default(),
+        "/webui/api/pipelines",
+        serde_json::json!({
+            "pipelines": { "pass": ["cat"] },
+            "types": { "GR": { "pipeline": "pass", "input": "tlv" } }
         }),
     )
     .await;

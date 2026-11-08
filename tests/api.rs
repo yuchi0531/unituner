@@ -636,13 +636,13 @@ async fn the_channel_stream_returns_the_post_pipeline_bytes() {
 }
 
 #[tokio::test]
-async fn a_tlv_type_streams_converted_ts_and_decode_zero_returns_raw_tlv() {
+async fn a_tlv_like_stream_is_converted_by_the_pipeline_and_decode_zero_returns_raw_bytes() {
     let tlv = tlv_bytes();
     let ts = scan_multiplex();
     let fixture = Fixture::new(
         &tuners("true"),
         "- name: BS4K\n  type: BS4K\n  channel: \"BS01\"\n",
-        "pipelines:\n  mmt:\n    - \"passthrough\"\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n",
+        "pipelines:\n  mmt:\n    - \"passthrough\"\ntypes:\n  BS4K: { pipeline: mmt }\n",
     );
     let tlv_path = fixture.write_ts("tlv.bin", &tlv);
     let ts_path = fixture.write_ts("multiplex.ts", &ts);
@@ -656,7 +656,7 @@ async fn a_tlv_type_streams_converted_ts_and_decode_zero_returns_raw_tlv() {
     )
     .expect("rewrite tuners.yml");
     let pipelines = format!(
-        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt, input: tlv }}\n",
+        "pipelines:\n  mmt:\n    - \"sh -c 'cat > {}; cat {}'\"\ntypes:\n  BS4K: {{ pipeline: mmt }}\n",
         capture.display(),
         ts_path.display()
     );
@@ -689,7 +689,7 @@ async fn a_tlv_type_streams_converted_ts_and_decode_zero_returns_raw_tlv() {
     assert_eq!(services[0]["name"], "NHK General");
     assert_eq!(services[0]["channel"]["type"], "BS4K");
     let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
-    assert_eq!(recorded, tlv, "the converter must have seen raw TLV");
+    assert_eq!(recorded, tlv, "the converter must have seen the raw bytes");
 
     // The channel stream is the converted, 188-aligned TS.
     let response = send(
@@ -704,8 +704,8 @@ async fn a_tlv_type_streams_converted_ts_and_decode_zero_returns_raw_tlv() {
     assert_eq!(first.len() % TS_PACKET_SIZE, 0, "{}", first.len());
     assert_eq!(first, ts);
 
-    // `decode=0` bypasses the pipeline and therefore delivers raw TLV for this
-    // type, not 188-byte TS (SPEC §4.1).
+    // `decode=0` bypasses the pipeline and normalizes nothing, so this type
+    // delivers raw TLV-like bytes, not 188-byte TS (SPEC §4.1).
     let response = send(
         &state,
         PEER,
@@ -1461,11 +1461,16 @@ async fn decode_zero_bypasses_the_whole_pipeline() {
     let ts = [packet_bytes(0x44), packet_bytes(0x55), packet_bytes(0x66)].concat();
     // The pipeline appends a marker *packet*, so "pipeline ran" and "pipeline
     // bypassed" are distinguishable even though both stream 188-byte packets.
-    // The marker must be a whole packet: a subscriber's byte stream is only ever
-    // whole TS packets, so the pump discards an incomplete trailing packet.
-    let pipelines = "pipelines:\n  pass:\n    - \"sh -c 'cat; printf %0188d 0 | tr 0 P'\"\ntypes:\n  GR: { pipeline: pass }\n";
-    let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), pipelines);
+    // It must be a well-formed packet: the pump normalizes the pipeline output.
+    let marker = packet_bytes(0x77);
+    let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), "{}");
     let path = fixture.write_ts("stream.ts", &ts);
+    let marker_path = fixture.write_ts("marker.ts", &marker);
+    let pipelines = format!(
+        "pipelines:\n  pass:\n    - \"sh -c 'cat; cat {}'\"\ntypes:\n  GR: {{ pipeline: pass }}\n",
+        marker_path.display()
+    );
+    std::fs::write(fixture.path.join("pipelines.yml"), pipelines).expect("write pipelines.yml");
     // A finite tuner command: the pipeline marker then arrives at EOF, which
     // lets both bodies be read to completion.
     std::fs::write(
@@ -1482,13 +1487,12 @@ async fn decode_zero_bypasses_the_whole_pipeline() {
     )
     .await;
     // The pipeline stage appends its marker packet, so the body is the fixture
-    // plus one 188-byte packet of `P`.
+    // plus one 188-byte packet.
     let with_pipeline = read_all(response.into_body()).await;
-    let marker = vec![b'P'; TS_PACKET_SIZE];
     assert_eq!(with_pipeline, [ts.clone(), marker].concat());
 
     // `decode=0` must never spawn the pipeline stages: the bytes come straight
-    // from the (normalized) tuner output.
+    // from the tuner, without normalization.
     let response = send(
         &state,
         PEER,
