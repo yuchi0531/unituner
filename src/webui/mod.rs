@@ -556,13 +556,22 @@ enum BindingDoc {
 #[serde(deny_unknown_fields)]
 struct BindingObject {
     pipeline: String,
+    #[serde(default)]
+    input: crate::config::PipelineInput,
 }
 
 impl BindingDoc {
     fn pipeline(&self) -> &str {
         match self {
             Self::Name(name) => name,
-            Self::Object(BindingObject { pipeline }) => pipeline,
+            Self::Object(BindingObject { pipeline, .. }) => pipeline,
+        }
+    }
+
+    fn input(&self) -> crate::config::PipelineInput {
+        match self {
+            Self::Name(_) => crate::config::PipelineInput::Ts,
+            Self::Object(binding) => binding.input,
         }
     }
 }
@@ -570,8 +579,9 @@ impl BindingDoc {
 impl Serialize for BindingDoc {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut document = serializer.serialize_struct("PipelineBinding", 1)?;
+        let mut document = serializer.serialize_struct("PipelineBinding", 2)?;
         document.serialize_field("pipeline", self.pipeline())?;
+        document.serialize_field("input", &self.input())?;
         document.end()
     }
 }
@@ -622,7 +632,10 @@ fn pipelines_json(document: &PipelinesDoc) -> Value {
         .map(|(type_name, binding)| {
             (
                 type_name.as_str(),
-                json!({ "pipeline": binding.pipeline() }),
+                json!({
+                    "pipeline": binding.pipeline(),
+                    "input": binding.input(),
+                }),
             )
         })
         .collect();

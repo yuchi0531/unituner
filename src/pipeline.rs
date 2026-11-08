@@ -118,7 +118,8 @@ impl PipelineSpec {
     ///
     /// A type without a binding (or one whose binding names a missing pipeline,
     /// which startup validation rejects) yields an empty spec, so the tuner
-    /// stream is delivered as-is (SPEC §3.4).
+    /// stream is delivered as-is (SPEC §3.4). The input framing is separate:
+    /// see [`PipelinesConfig::input_for_type`](crate::config::PipelinesConfig::input_for_type).
     pub fn for_type(config: &Config, type_name: &str) -> Self {
         let Some(binding) = config.pipelines.types.get(type_name) else {
             return Self::default();
@@ -129,7 +130,7 @@ impl PipelineSpec {
                 tracing::warn!(
                     type_name,
                     pipeline = %binding.pipeline,
-                    "pipeline binding references a missing pipeline; delivering raw TS"
+                    "pipeline binding references a missing pipeline; delivering the tuner stream unchanged"
                 );
                 Self::default()
             }
@@ -742,7 +743,7 @@ pub async fn spawn_pipeline(
 /// Only the exact token is special: surrounding whitespace is ignored and the
 /// match is ASCII case-insensitive. `passthrough-x`, `/usr/bin/passthrough`
 /// and `passthrough something` are ordinary command lines.
-fn is_passthrough(command: &str) -> bool {
+pub(crate) fn is_passthrough(command: &str) -> bool {
     command.trim().eq_ignore_ascii_case("passthrough")
 }
 
@@ -1135,12 +1136,14 @@ mod tests {
                         "GR".to_string(),
                         PipelineBinding {
                             pipeline: "soft".to_string(),
+                            input: crate::config::PipelineInput::Ts,
                         },
                     ),
                     (
                         "BS".to_string(),
                         PipelineBinding {
                             pipeline: "missing".to_string(),
+                            input: crate::config::PipelineInput::Ts,
                         },
                     ),
                 ]),
