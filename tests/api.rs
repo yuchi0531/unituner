@@ -2269,7 +2269,8 @@ async fn a_scan_range_exactly_at_the_cap_is_allowed() {
     let state = fixture.state();
 
     // 512 candidates is the cap. No tuner supports the `XX` type, so each
-    // channel is skipped as "tuner busy" without spawning anything.
+    // channel is skipped as "no tuner for type" without spawning anything.
+    // Retrying this as "busy" would hide the configuration problem and spin.
     let (status, _, body) = send_body(
         &state,
         PEER,
@@ -2283,8 +2284,109 @@ async fn a_scan_range_exactly_at_the_cap_is_allowed() {
     let text = String::from_utf8(body).expect("utf-8 progress");
     assert!(text.contains("dry run"), "{text}");
     assert!(
-        text.matches("skipped (tuner busy)").count() == 512,
+        text.matches("skipped (no tuner for type XX)").count() == 512,
         "{text}"
+    );
+    assert!(!text.contains("tuner busy"), "{text}");
+}
+
+#[tokio::test]
+async fn a_scan_waits_for_a_delayed_tuner_and_finds_its_services() {
+    // The tuner only produces its first byte after 3 s. The scan must wait for
+    // it (the whole bug was channels being written off "no signal" instantly).
+    let (fixture, ts) = scan_fixture();
+    let path = fixture.write_ts("delayed.ts", &ts);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&format!(
+            "sh -c \"sleep 3; cat {}; sleep 30\"",
+            path.display()
+        )),
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}"),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(
+        text.contains("2 services found"),
+        "the delayed SI was missed: {text}"
+    );
+    assert!(
+        !text.contains("tuner failed to start"),
+        "the delayed tuner must not be reported as a failure: {text}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2500),
+        "the scan did not wait for the delayed tuner: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the scan waited longer than needed: {elapsed:?}"
+    );
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    assert_eq!(status, StatusCode::OK);
+    let services = json(&body);
+    assert_eq!(
+        services.as_array().expect("services").len(),
+        2,
+        "{services}"
+    );
+    assert!(
+        fixture.channels_yml().contains("NHK General"),
+        "{}",
+        fixture.channels_yml()
+    );
+}
+
+#[tokio::test]
+async fn a_scan_whose_tuner_command_cannot_start_reports_tuner_failed() {
+    // Spawn failure: the command does not exist. This must be named as a tuner
+    // failure, not be mislabelled "no signal", and it must finish at once
+    // instead of waiting out the channel budget.
+    let fixture = Fixture::new(
+        "- name: broken\n  types: [GR]\n  command: '/nonexistent/unituner-scan-tuner'\n",
+        "[]\n",
+        PIPELINE_CAT,
+    );
+    let state = fixture.state();
+
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(
+            Method::PUT,
+            &format!("/api/config/channels/scan?{SCAN_RANGE}&dryRun=true"),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).expect("utf-8 progress");
+    assert!(
+        text.contains("tuner failed to start"),
+        "a missing command must be a tuner failure: {text}"
+    );
+    assert!(
+        !text.contains("no signal"),
+        "a missing command must not be reported as no signal: {text}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a spawn failure must not wait out the budget: {elapsed:?}"
     );
 }
 

@@ -328,6 +328,19 @@ impl Fixture {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Writes the synthetic PAT + PMT + SDT + NIT multiplex to the path named by
+/// `UNITUNER_LIVE_FIXTURE`, for the manual live-server check.
+///
+/// It is a no-op in normal test runs (the variable is unset), so it does not
+/// touch `/tmp` or any shared state.
+#[test]
+fn export_live_fixture_for_manual_checks() {
+    if let Some(path) = std::env::var_os("UNITUNER_LIVE_FIXTURE") {
+        std::fs::write(path, core_multiplex(SERVICES_27, true, true))
+            .expect("write the live fixture TS");
+    }
+}
+
 #[tokio::test]
 async fn startup_scan_populates_the_table_for_a_working_channel() {
     // 27 streams a real multiplex; the DEAD channel's tuner exits at once.
@@ -400,6 +413,21 @@ async fn startup_scan_leaves_the_table_empty_when_the_tuner_fails() {
 
     assert!(manager.services().list().is_empty());
     assert!(manager.sessions_snapshot().is_empty());
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_scan_does_not_cache_an_all_start_failure_pass() {
+    // A broken command must not be remembered as "this config has no services":
+    // an empty services.json would suppress the next boot's retry.
+    let fixture = Fixture::new(&tuners("/nonexistent/x", "true"), GOOD_CHANNEL);
+    let manager = fixture.manager();
+    run_startup(&fixture, manager.clone()).await;
+    assert!(
+        !fixture.path.join("services.json").exists(),
+        "an all-start-failure pass must not write services.json"
+    );
+    assert!(manager.services().is_empty());
     manager.shutdown().await;
 }
 

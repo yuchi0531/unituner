@@ -1948,6 +1948,137 @@ async fn the_manual_rescan_streams_and_rewrites_the_cache() {
 }
 
 #[tokio::test]
+async fn a_manual_rescan_waits_for_a_delayed_tuner_and_rewrites_the_cache() {
+    // The tuner only produces its first byte after 3 s: the re-scan must wait
+    // for it instead of instantly calling the channel "no signal", and the
+    // result must reach both the live table and `services.json`.
+    let fixture = cache_fixture(GOOD_CHANNEL, "");
+    let ts = fixture.path.join("mux.ts");
+    let command = format!("sh -c \"sleep 3; cat {}; sleep 30\"", ts.display());
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        format!("- name: good\n  types: [GR]\n  command: '{command}'\n"),
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    let log = text(&body);
+    assert!(
+        log.contains("2 services found"),
+        "the delayed SI was missed: {log}"
+    );
+    assert!(log.contains("**RE-SCAN COMPLETE**"), "{log}");
+    assert!(
+        elapsed >= Duration::from_millis(2500),
+        "the re-scan did not wait for the delayed tuner: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    assert_eq!(state.manager.services().list().len(), 2);
+
+    let first = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("cache");
+    assert_eq!(first.services.len(), 2);
+
+    // A second re-scan rewrites the cache with a new generated_at. Sleep past
+    // the millisecond resolution so the timestamps differ.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&body).contains("**RE-SCAN COMPLETE**"));
+    let second = read_service_cache(&fixture.path)
+        .expect("read")
+        .expect("cache");
+    assert_ne!(
+        second.generated_at, first.generated_at,
+        "a successful re-scan must refresh generated_at"
+    );
+    assert_eq!(second.services.len(), 2);
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_manual_rescan_with_a_missing_tuner_writes_no_empty_cache() {
+    let fixture = Fixture::with(GOOD_CHANNEL);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        "- name: good\n  types: [GR]\n  command: '/nonexistent/unituner-rescan-tuner'\n",
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    let log = text(&body);
+    assert!(
+        log.contains("tuner failed to start"),
+        "a missing command must be a tuner failure: {log}"
+    );
+    assert!(
+        !log.contains("no signal"),
+        "a missing command must not be reported as no signal: {log}"
+    );
+    assert!(
+        log.contains("did not write"),
+        "an all-start-failure pass must not persist an empty cache: {log}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a spawn failure must not wait out the budget: {elapsed:?}"
+    );
+    assert!(
+        !fixture.path.join("services.json").exists(),
+        "no services.json may be written when no tuner could start"
+    );
+    assert!(state.manager.services().is_empty());
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_manual_rescan_reports_a_tuner_that_exits_before_output() {
+    let fixture = Fixture::with(GOOD_CHANNEL);
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        "- name: good\n  types: [GR]\n  command: 'sh -c \"sleep 1; exit 0\"'\n",
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    let started = std::time::Instant::now();
+    let (status, _, body) = send_body(&state, Webui::default(), scan_request()).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    let log = text(&body);
+    assert!(
+        log.contains("tuner failed to start"),
+        "an early exit must be a tuner failure: {log}"
+    );
+    assert!(
+        log.contains("before any data"),
+        "the reason must say the process exited before output: {log}"
+    );
+    assert!(
+        !log.contains("no signal"),
+        "an early exit must not be reported as no signal: {log}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(700) && elapsed < Duration::from_secs(5),
+        "the exit must be noticed without waiting out the budget: {elapsed:?}"
+    );
+    assert!(
+        !fixture.path.join("services.json").exists(),
+        "no services.json may be written when no tuner could start"
+    );
+    state.manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_concurrent_manual_rescan_is_409() {
     let fixture = cache_fixture(GOOD_CHANNEL, "");
     let state = fixture.state();
