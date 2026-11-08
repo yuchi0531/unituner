@@ -206,7 +206,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::ChildStdout;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, Notify};
 
-use crate::config::{ChannelConfig, Config, PipelineInput, TunerConfig};
+use crate::config::{ChannelConfig, Config, TunerConfig};
 use crate::pipeline::{
     spawn_pipeline, spawn_tuner_command, ChildEnv, CommandVars, PipelineCtx, PipelineHandle,
     PipelineSpec, TunerProcess,
@@ -3120,7 +3120,7 @@ async fn start_process_tree(
         .with_extra_args(session.extra_args.clone())
         .with_child_env(ChildEnv::from_server(&inner.config.server));
     // SPEC §4.1: `decode=0` bypasses every pipeline stage, so only the tuner
-    // command runs and its (normalized) output is broadcast directly.
+    // command runs and its bytes are broadcast raw, without normalization.
     let bypass_pipeline = session.pipeline_mode == PipelineMode::Raw;
 
     let mut tuner = spawn_tuner_command(&tuner_config.command, &vars)
@@ -3132,37 +3132,21 @@ async fn start_process_tree(
             .ok_or_else(|| "tuner stdout unavailable".to_string())?,
     );
 
-    // SPEC §3.4: types without a pipeline binding deliver the raw TS. A `tlv`
-    // type carries its input framing in the binding, independently of the
-    // pipeline (and of `decode=0`, which only bypasses the pipeline).
-    let input = inner
-        .config
-        .pipelines
-        .input_for_type(&session.key.type_name);
-    tracing::debug!(session = %label, %input, "session input mode");
+    // SPEC §3.4: types without a pipeline binding deliver the raw tuner bytes
+    // to the pump, which normalizes them. The input framing is no longer
+    // declared: whatever the tuner emits (188/204/TLV) goes to stage 0 raw,
+    // and the pipeline must convert it to TS.
     let spec = if bypass_pipeline {
         PipelineSpec::new(Vec::new())
     } else {
         PipelineSpec::for_type(&inner.config, &session.key.type_name)
     };
+    tracing::debug!(
+        session = %label,
+        normalize = "after-pipeline",
+        "session data path"
+    );
     let chunk_size = inner.config.server.chunk_size_bytes.max(1);
-
-    // A TLV stream can only become the TS the rest of unituner understands
-    // through the pipeline. Validation rejects this, but a programmatic config
-    // may still reach here; fail the spawn instead of broadcasting raw TLV that
-    // the SI parser cannot read.
-    if input == PipelineInput::Tlv && !bypass_pipeline && spec.is_empty() {
-        tuner.stop().await;
-        tracing::warn!(
-            session = %label,
-            type_name = %session.key.type_name,
-            "input: tlv type has no pipeline; refusing to start without a TLV-to-TS converter"
-        );
-        return Err(format!(
-            "pipeline spawn failed: input: tlv for type {:?} requires a pipeline",
-            session.key.type_name
-        ));
-    }
 
     let mut pipeline = if spec.is_empty() {
         None
@@ -3178,30 +3162,22 @@ async fn start_process_tree(
     };
 
     // Data path (SPEC §4):
-    //  * `ts`: 204 → 188 normalization sits between the tuner and stage 1.
-    //  * `tlv`: the tuner bytes go to stage 1 byte-for-byte; the pipeline's
-    //    TS output is normalized by the pump.
-    // Without a pipeline the pump normalizes a TS tuner stream; a `tlv`
-    // session has no pipeline only under `decode=0`, where raw TLV is
-    // delivered unchanged (SPEC §4.1).
+    //  * with a pipeline: the tuner bytes go to stage 0 byte-for-byte (whatever
+    //    framing the tuner emits) and the pipeline's TS output is normalized by
+    //    the pump (204 → 188, resync, leading garbage).
+    //  * without a pipeline: the pump normalizes the tuner stream itself.
+    //  * `decode=0`: full pipeline bypass, so the tuner bytes are broadcast raw
+    //    with no normalization (SPEC §4.1; may be TLV).
     let pipes = take_pipes(&mut pipeline, &mut tuner_stdout);
     let (source, normalize, raw) = match pipes {
         Ok((Some(stdin), stdout)) => {
             let tuner_stdout = tuner_stdout
                 .take()
                 .ok_or_else(|| "tuner stdout unavailable".to_string())?;
-            if input == PipelineInput::Tlv {
-                spawn_raw_bridge(tuner_stdout, stdin, label.to_string());
-                (stdout, true, false)
-            } else {
-                spawn_normalizer(tuner_stdout, stdin, label.to_string());
-                (stdout, false, false)
-            }
+            spawn_raw_bridge(tuner_stdout, stdin, label.to_string());
+            (stdout, true, false)
         }
-        Ok((None, stdout)) => match input {
-            PipelineInput::Ts => (stdout, true, false),
-            PipelineInput::Tlv => (stdout, false, true),
-        },
+        Ok((None, stdout)) => (stdout, !bypass_pipeline, bypass_pipeline),
         Err(error) => {
             // A partially built chain must not outlive the failed spawn.
             tuner.stop().await;
@@ -3285,50 +3261,12 @@ fn take_pipes(
     }
 }
 
-/// Reads the tuner stdout, normalizes 204 → 188 and writes it to the first
-/// pipeline stage (SPEC §4).
-fn spawn_normalizer(
-    mut tuner_stdout: ChildStdout,
-    mut pipeline_stdin: tokio::process::ChildStdin,
-    label: String,
-) {
-    tokio::spawn(async move {
-        let mut normalizer = TsNormalizer::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match tuner_stdout.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(read) => {
-                    let out = normalizer.push(&buf[..read]);
-                    if !out.is_empty() && pipeline_stdin.write_all(&out).await.is_err() {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(session = %label, %error, "tuner read failed");
-                    break;
-                }
-            }
-        }
-        let tail = normalizer.finish();
-        if !tail.is_empty() {
-            let _ = pipeline_stdin.write_all(&tail).await;
-        }
-        let _ = pipeline_stdin.shutdown().await;
-        tracing::debug!(
-            session = %label,
-            packets = normalizer.packets_out,
-            discarded = normalizer.bytes_discarded,
-            "tuner stream ended; pipeline stdin closed"
-        );
-    });
-}
-
 /// Copies the tuner stdout to the first pipeline stage byte-for-byte.
 ///
-/// This is the `input: tlv` path: TLV/MMT must reach the converter pipeline
-/// untouched, so no TS sync detection or 188-byte framing may look at it. The
-/// pipeline output is TS and is normalized by the pump.
+/// The pipeline receives exactly what the tuner emits (188/204/TLV), because
+/// converting TLV/MMT to TS is the pipeline's job. No TS sync detection or
+/// 188-byte framing may look at the raw bytes; the pump normalizes the
+/// pipeline's TS output (SPEC §4).
 fn spawn_raw_bridge(
     mut tuner_stdout: ChildStdout,
     mut pipeline_stdin: tokio::process::ChildStdin,
@@ -3356,7 +3294,7 @@ fn spawn_raw_bridge(
         tracing::debug!(
             session = %label,
             bytes,
-            "raw TLV tuner stream ended; pipeline stdin closed"
+            "raw tuner stream ended; pipeline stdin closed"
         );
     });
 }
@@ -3398,10 +3336,10 @@ fn spawn_pump(
                 Ok(0) => break,
                 Ok(read) => {
                     if raw {
-                        // `decode=0` on an `input: tlv` type: the tuner's TLV
-                        // bytes are broadcast exactly as received. Packet
-                        // alignment would truncate them to multiples of 188,
-                        // which is meaningless for TLV (SPEC §4.1).
+                        // `decode=0`: the tuner bytes are broadcast exactly as
+                        // received (possibly TLV). Packet alignment would
+                        // truncate them to multiples of 188, which is
+                        // meaningless for TLV (SPEC §4.1).
                         emit_piece(
                             &session,
                             &sender,
@@ -5283,7 +5221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tlv_type_passes_raw_bytes_to_the_pipeline_and_normalizes_its_ts_output() {
+    async fn a_tlv_like_stream_reaches_the_converter_pipeline_and_its_ts_output_is_broadcast() {
         let dir = TempDir::new().expect("tempdir");
         let tlv = tlv_bytes();
         assert!(
@@ -5296,7 +5234,7 @@ mod tests {
         let ts_path = fixture(&dir, "valid.ts", &[packet(0x11), packet(0x22)]);
         let capture = dir.path().join("pipeline-stdin.bin");
         let pipelines = format!(
-            "{}types:\n  BS4K: {{ pipeline: mmt, input: tlv }}\n",
+            "{}types:\n  BS4K: {{ pipeline: mmt }}\n",
             capture_pipeline(&capture, &ts_path)
         );
         let tuners = tuner_yaml("bs4k", &["BS4K"], &format!("cat {}", tlv_path.display()));
@@ -5321,7 +5259,7 @@ mod tests {
         let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
         assert_eq!(
             recorded, tlv,
-            "TLV must not be normalized before the pipeline"
+            "TLV-like bytes must reach the pipeline unmodified"
         );
         // (b) The pipeline's TS output is aligned and starts on a sync byte.
         assert_eq!(received, ts);
@@ -5332,13 +5270,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_zero_on_a_tlv_type_delivers_raw_tlv_unchanged() {
+    async fn decode_zero_delivers_raw_bytes_without_normalization() {
         let dir = TempDir::new().expect("tempdir");
         let tlv = tlv_bytes();
         let tlv_path = dir.path().join("tlv.bin");
         std::fs::write(&tlv_path, &tlv).expect("write tlv fixture");
-        let pipelines =
-            "pipelines:\n  mmt:\n    - \"cat\"\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n";
+        let pipelines = "pipelines:\n  mmt:\n    - \"cat\"\ntypes:\n  BS4K: { pipeline: mmt }\n";
         let tuners = tuner_yaml("bs4k", &["BS4K"], &format!("cat {}", tlv_path.display()));
         let manager = manager(
             &dir,
@@ -5350,8 +5287,8 @@ mod tests {
             8,
         );
 
-        // SPEC §4.1: `decode=0` bypasses the pipeline. For `input: tlv` that
-        // means the raw TLV bytes, not a 188-aligned reinterpretation.
+        // SPEC §4.1: `decode=0` bypasses the pipeline and normalizes nothing,
+        // so a TLV source delivers raw TLV (accepted exception to TS-only).
         let mut subscription = manager
             .acquire_full("BS4K", "BS01", user("raw", 0), None, SessionTap::Raw, true)
             .await
@@ -5365,7 +5302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_ts_type_is_normalized_to_188_before_the_pipeline() {
+    async fn a_pipeline_receives_raw_204_framed_bytes_and_the_pump_normalizes_its_output() {
         let dir = TempDir::new().expect("tempdir");
         let packets = [packet(0x11), packet(0x22)];
         let framed = to_204(&packets);
@@ -5395,50 +5332,13 @@ mod tests {
 
         let received =
             read_at_least(&mut subscription.rx, 2 * PACKET, Duration::from_secs(5)).await;
-        // Stage 0 received 188-byte packets, not the 204-byte tuner framing.
+        // Stage 0 received the raw 204-byte framing, not 188-byte packets.
         let recorded = std::fs::read(&capture).expect("pipeline stdin was recorded");
-        assert_eq!(recorded, packets.concat());
+        assert_eq!(recorded, framed);
+        // The pump normalized the pipeline's 188-byte TS output.
         assert_eq!(received, packets.concat());
-
-        manager.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn a_tlv_type_without_a_pipeline_fails_the_spawn() {
-        let dir = TempDir::new().expect("tempdir");
-        let tlv_path = dir.path().join("tlv.bin");
-        std::fs::write(&tlv_path, tlv_bytes()).expect("write tlv fixture");
-        let tuners = tuner_yaml("bs4k", &["BS4K"], &streaming_command(&tlv_path));
-        let pipelines =
-            "pipelines:\n  mmt:\n    - \"cat\"\ntypes:\n  BS4K: { pipeline: mmt, input: tlv }\n";
-        manager(
-            &dir,
-            &tuners,
-            &channels_yaml(&[("BS4K", "BS01")]),
-            pipelines,
-            5,
-            188,
-            8,
-        );
-        // Bypass validation to model a programmatic config: the binding still
-        // says `input: tlv`, but the pipeline has no stage at all.
-        let config = Config::load(dir.path()).expect("config loads");
-        let mut config = config;
-        config
-            .pipelines
-            .pipelines
-            .insert("mmt".to_string(), Vec::new());
-        let manager = SessionManager::new(Arc::new(config), ServiceTable::new());
-
-        let error = manager
-            .acquire("BS4K", "BS01", user("a", 0), None, true)
-            .await
-            .expect_err("a TLV type cannot start without a converter");
-        assert_eq!(error, AcquireError::Unavailable);
-        assert!(
-            manager.sessions_snapshot().is_empty(),
-            "the failed spawn must not leave a session behind"
-        );
+        assert_eq!(received[0], 0x47);
+        assert_eq!(received.len() % PACKET, 0);
 
         manager.shutdown().await;
     }
