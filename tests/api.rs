@@ -855,9 +855,10 @@ async fn head_of_an_unknown_service_is_404() {
 // channels.yml is the allowlist for every tuner-backed stream
 // ---------------------------------------------------------------------------
 
-/// `channels(&[…])` plus one `disabled: true` entry.
+/// `channels(&[…])` plus one `disabled: true` entry in GR and one in BS.
 const CHANNELS_WITH_DISABLED: &str = "- name: NHK\n  type: GR\n  channel: \"27\"\n\
-     - name: Off\n  type: GR\n  channel: \"99\"\n  disabled: true\n";
+     - name: Off\n  type: GR\n  channel: \"99\"\n  disabled: true\n\
+     - name: Off BS\n  type: BS\n  channel: \"BS01\"\n  disabled: true\n";
 
 // ---------------------------------------------------------------------------
 // routes (SPEC §6.4)
@@ -1151,9 +1152,67 @@ async fn a_disabled_channel_stream_is_404_on_get_and_head() {
         "a disabled channel must not spawn a tuner process"
     );
 
-    // The metadata endpoints still list it: only streaming is gated.
-    let (status, _, _) = send_body(&state, PEER, request(Method::GET, "/api/channels/GR/99")).await;
+    // The metadata endpoints apply the same rule: only streaming used to be
+    // gated, now the disabled entry is absent from the detail route too.
+    let (status, _, body) =
+        send_body(&state, PEER, request(Method::GET, "/api/channels/GR/99")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json(&body)["code"], 404);
+    assert_eq!(json(&body)["reason"], "Channel Not Found");
+}
+
+#[tokio::test]
+async fn channel_lists_and_detail_hide_disabled_entries() {
+    let (fixture, _marker) = marker_fixture_with(CHANNELS_WITH_DISABLED);
+    let state = fixture.state();
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/channels")).await;
     assert_eq!(status, StatusCode::OK);
+    let list = json(&body);
+    let channels = list.as_array().expect("array");
+    assert_eq!(
+        channels.len(),
+        1,
+        "only the enabled channel is listed: {list}"
+    );
+    assert_eq!(channels[0]["type"], "GR");
+    assert_eq!(channels[0]["channel"], "27");
+    // The response shape never gains a `disabled` field: the entry is absent.
+    assert!(channels[0].get("disabled").is_none(), "{list}");
+    let text = String::from_utf8_lossy(&body);
+    for hidden in ["99", "BS01", "Off", "disabled"] {
+        assert!(
+            !text.contains(hidden),
+            "disabled entry leaked {hidden:?} into /api/channels: {text}"
+        );
+    }
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/channels/GR")).await;
+    assert_eq!(status, StatusCode::OK);
+    let gr = json(&body);
+    assert_eq!(gr.as_array().expect("array").len(), 1, "{gr}");
+    assert_eq!(gr[0]["channel"], "27");
+    assert!(!String::from_utf8_lossy(&body).contains("99"));
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/channels/BS")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body), serde_json::json!([]));
+
+    for (uri, expected) in [
+        ("/api/channels/GR/27", StatusCode::OK),
+        ("/api/channels/GR/99", StatusCode::NOT_FOUND),
+        ("/api/channels/BS/BS01", StatusCode::NOT_FOUND),
+        ("/api/channels/GR/98", StatusCode::NOT_FOUND),
+    ] {
+        let (status, _, body) = send_body(&state, PEER, request(Method::GET, uri)).await;
+        assert_eq!(status, expected, "{uri}");
+        if expected == StatusCode::OK {
+            assert_eq!(json(&body)["channel"], "27", "{uri}");
+        } else {
+            assert_eq!(json(&body)["code"], 404, "{uri}");
+            assert_eq!(json(&body)["reason"], "Channel Not Found", "{uri}");
+        }
+    }
 }
 
 #[tokio::test]

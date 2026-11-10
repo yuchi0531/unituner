@@ -6,9 +6,9 @@
 //! |---|---|
 //! | `GET /api/version` | `{"current":…,"latest":…}`, both the unituner version |
 //! | `GET /api/status` | minimal mirakurun-shaped status (no EPG) |
-//! | `GET /api/channels` | every configured channel with its services embedded |
+//! | `GET /api/channels` | every enabled configured channel, services embedded |
 //! | `GET /api/channels/{type}` | the same, filtered by channel type |
-//! | `GET /api/channels/{type}/{channel}` | one channel |
+//! | `GET /api/channels/{type}/{channel}` | one enabled channel |
 //! | `GET /api/channels/{type}/{channel}/stream` | post-pipeline TS, unfiltered |
 //! | `GET /api/channels/{type}/{channel}/services/{id}/stream` | one service |
 //! | `GET /api/services` / `{id}` | the service table |
@@ -35,8 +35,11 @@
 //! unknown pair and a `disabled: true` entry are both a **404** `Channel Not
 //! Found`: a disabled channel is treated as *not present* rather than
 //! forbidden, because the URL is not a stream endpoint at all (and that keeps
-//! the response shape identical to a typo). `/api/services/{id}/stream` checks
-//! the channel the service table resolves to the same way.
+//! the response shape identical to a typo). The channel list/detail routes use
+//! the same rule: a disabled entry is omitted from `/api/channels[/{type}]` and
+//! is a 404 from `/api/channels/{type}/{channel}`.
+//! `/api/services/{id}/stream` checks the channel the service table resolves to
+//! the same way.
 //!
 //! The validation order is fixed for `GET` and `HEAD`:
 //!
@@ -312,9 +315,10 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 // Channels
 // ---------------------------------------------------------------------------
 
-/// Every channel from `channels.yml` (SPEC §9). `disabled: true` is accepted
-/// as configuration but does not hide the entry: mirakurun's channel list is
-/// the configured list, and SPEC §9 gives no filtering rule.
+/// Every **enabled** channel from `channels.yml` (SPEC §9). `disabled: true`
+/// entries stay in the configuration (and in the webui round-trip) but are
+/// omitted here: a disabled channel is not a resource the API serves, and the
+/// detail/stream routes answer 404 for it.
 async fn channels(State(state): State<AppState>) -> Json<Value> {
     // One table snapshot for the whole response: the previous shape called
     // `ServiceTable::list()` once per configured channel, i.e. N full
@@ -325,6 +329,7 @@ async fn channels(State(state): State<AppState>) -> Json<Value> {
             .config
             .channels
             .iter()
+            .filter(|channel| is_enabled(channel))
             .map(|channel| channel_json(&records, channel))
             .collect(),
     ))
@@ -342,7 +347,7 @@ async fn channels_by_type(
         .config
         .channels
         .iter()
-        .filter(|channel| channel.channel_type == channel_type)
+        .filter(|channel| is_enabled(channel) && channel.channel_type == channel_type)
         .map(|channel| channel_json(&records, channel))
         .collect();
     Json(Value::Array(list)).into_response()
@@ -355,9 +360,9 @@ async fn channel_detail(
     if let Err(reason) = validate_path(&channel_type, &channel) {
         return error_response(StatusCode::BAD_REQUEST, reason);
     }
-    match find_channel(&state.config, &channel_type, &channel) {
+    match require_channel(&state.config, &channel_type, &channel) {
         // Only this channel's records are cloned/sorted, not the whole table.
-        Some(entry) => Json(channel_json(
+        Ok(entry) => Json(channel_json(
             &state
                 .manager
                 .services()
@@ -365,7 +370,7 @@ async fn channel_detail(
             entry,
         ))
         .into_response(),
-        None => error_response(StatusCode::NOT_FOUND, "Channel Not Found"),
+        Err(response) => response,
     }
 }
 
@@ -397,6 +402,13 @@ fn channel_json(records: &[ServiceRecord], channel: &ChannelConfig) -> Value {
         "name": channel.name,
         "services": embedded,
     })
+}
+
+/// A `channels.yml` entry is API-visible and tuneable only when enabled. Single
+/// authority for the list, detail and stream routes: a disabled entry is
+/// omitted from the lists and treated as absent (404) everywhere else.
+fn is_enabled(channel: &ChannelConfig) -> bool {
+    !channel.disabled
 }
 
 /// The configured entry for `(channel_type, channel)`.
@@ -637,8 +649,7 @@ fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord], config: &Config
                     .channel
                     .as_ref()
                     .is_some_and(|(channel_type, channel)| {
-                        find_channel(config, channel_type, channel)
-                            .is_some_and(|entry| !entry.disabled)
+                        find_channel(config, channel_type, channel).is_some_and(is_enabled)
                     })
         })
         .collect();
@@ -1039,7 +1050,7 @@ fn require_channel<'a>(
     channel: &str,
 ) -> Result<&'a ChannelConfig, Response> {
     match find_channel(config, channel_type, channel) {
-        Some(entry) if !entry.disabled => Ok(entry),
+        Some(entry) if is_enabled(entry) => Ok(entry),
         _ => Err(error_response(StatusCode::NOT_FOUND, "Channel Not Found")),
     }
 }

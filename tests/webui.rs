@@ -812,6 +812,18 @@ async fn put_channels_writes_the_yaml_and_keeps_a_backup() {
     assert_eq!(fixture.read("channels.yml.bak"), before);
     assert!(!fixture.exists("channels.yml.tmp"));
 
+    // The webui document is the configuration, not the API list: the disabled
+    // entry survives the GET round-trip even though /api/channels hides it.
+    let (status, _, body) = get(&state, "/webui/api/channels").await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    let channels = value["channels"].as_array().expect("channels");
+    let disabled = channels
+        .iter()
+        .find(|channel| channel["channel"] == "16")
+        .expect("TOKYO MX is still in the webui document");
+    assert_eq!(disabled["disabled"], true);
+
     // The result still loads through the startup path.
     Config::load(&fixture.path).expect("saved config is valid");
 }

@@ -130,7 +130,7 @@ child_env: {}
 | `type` | なし（必須） | `^[A-Za-z0-9][A-Za-z0-9_-]*$`（`GR`, `BS`, `CABLE_CATV` など任意名） |
 | `channel` | なし（必須） | ASCII 英数字と `. _ + - : @ ,` のみ。`/` は URL パス 1 セグメントに収めるため拒否 |
 | `extra-args` | `""` | 任意。`{extra_args}` に入る追加引数。`extra_args` 綴りも可。引用符・バックスラッシュ・改行は不可（standalone な argv 断片） |
-| `disabled` | `false` | 一覧 API には出るが、起動時スキャンの対象外 |
+| `disabled` | `false` | `true` のチャンネルは一覧・詳細 API に出ない（`channels.yml` には残る）。起動時スキャンの対象外 |
 | `routes` | `[]` | 任意。各要素は `tuner`（必須、`tuners.yml` の name で既存必須）と任意の `channel` / `extra-args`。同一チャンネル内でチューナー重複不可。`route.channel` は `channel` と同じ文字種検証を通る |
 
 同じ `channel` 値でも `type` が違えば別エントリとして扱う。同じ `(type, channel)` の重複は起動エラー（fail-fast。mirakc-BS4K の warn + first wins は採用しない）。
@@ -234,9 +234,9 @@ types:
 |---|---|---|
 | GET | `/api/version` | `{"current":"<version>","latest":"<同じ>"}`（更新チェックなし） |
 | GET | `/api/status` | 最小の mirakurun 風 status。EPG の走査情報は空、`streamInfos` は `[]` 固定 |
-| GET | `/api/channels` | 設定済みチャンネル一覧（`disabled: true` も含む）。各要素に `services` を簡易埋め込み |
-| GET | `/api/channels/{type}` | type で絞り込み。不正な type 名は 400 |
-| GET | `/api/channels/{type}/{channel}` | チャンネル詳細。未設定は 404 |
+| GET | `/api/channels` | 設定済みの**有効な**チャンネル一覧（`disabled: true` を除く）。各要素に `services` を簡易埋め込み |
+| GET | `/api/channels/{type}` | type で絞り込み（`disabled: true` を除く）。不正な type 名は 400 |
+| GET | `/api/channels/{type}/{channel}` | チャンネル詳細。未設定・無効は 404 |
 | GET / HEAD | `/api/channels/{type}/{channel}/stream` | pipeline 通過後の TS（チャンネル全体） |
 | GET / HEAD | `/api/channels/{type}/{channel}/services/{id}/stream` | そのチャンネル上の 1 サービス（内蔵フィルタ適用） |
 | GET | `/api/services` | サービス一覧。`id` は `networkId * 100000 + serviceId` |

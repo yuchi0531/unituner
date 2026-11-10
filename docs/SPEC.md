@@ -465,9 +465,9 @@ Found 1 channels for 13
 |---|---|
 | `GET /api/version` | `{"current":"<unituner ver>","latest":"<同じ>"}`、`Server: unituner/<ver>` |
 | `GET /api/status` | ミニマム JSON（konomiTV 依存しないが mirakurun 互換向けに持ち、version は unituner） |
-| `GET /api/channels` | チャンネル一覧 |
-| `GET /api/channels/{type}` | type 絞り込み |
-| `GET /api/channels/{type}/{channel}` | チャンネル詳細（services は簡易 embed） |
+| `GET /api/channels` | **有効な**チャンネル一覧（`disabled: true` を除く） |
+| `GET /api/channels/{type}` | type 絞り込み（同じく `disabled: true` を除く） |
+| `GET /api/channels/{type}/{channel}` | チャンネル詳細（services は簡易 embed）。`disabled: true` は 404 |
 | `GET /api/channels/{type}/{channel}/stream` | **pipeline 通過後の TS をそのまま返す**（channel stream） |
 | `GET /api/channels/{type}/{channel}/services/{id}/stream` | 内蔵 TSFilter 適用 |
 | `GET /api/services` | サービス一覧（id, serviceId, networkId, tsid, name, type, logoId:0, hasLogoData:false, remoteControlKeyId, channel{type,channel}） |
@@ -484,6 +484,7 @@ Found 1 channels for 13
 - `decode=0` は 4.1 通り。
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` は 6.3 通り。
 - `/api/channels` は 1 リクエストにつきサービス表のスナップショット（`ServiceTable::list()`）を 1 回だけ取り、各チャンネルの services はそこから該当分をフィルタして埋める（チャンネル数ぶんの全件 clone + sort をしない）。`/api/channels/{type}/{channel}` は `list_by_channel` で該当チャンネル分だけを取得する。
+- チャンネル一覧 / 詳細は `disabled: true` のエントリを返さない（mirakc と同じ）。無効なチャンネルは配信できない資源なので、stream 系の 404 と同じ扱いにする。`channels.yml` にはエントリを残し、起動時スキャンは従来どおり対象外、webui の GET/PUT round-trip も `disabled` を保持する。応答に `disabled` フィールドは追加しない（そもそも返さないため）。
 - `/api/iptv/playlist` は mirakurun の `playlist.ts` 互換。先頭は `#EXTM3U` のみで、`url-tvg` は付けない（EPG 非実装）。`/api/iptv/xmltv` と `/api/iptv/epg` は 404 のまま。
   - 掲載対象は service type `0x01` (1) と `0xAD` (173) のみ。ラジオ (0x02)・データ (0xC0) などは出さない。ロゴ非実装のため `tvg-logo` も出さない。
   - エントリは `#KODIPROP:mimetype=video/mp2t`、`#EXTINF:-1 tvg-id="<ServiceItemId>" group-title="<channel type>",<service name>`、`http://<Host>/api/services/<ServiceItemId>/stream`。名前の `\n` / `\r` は空白に置換し、それ以外のエスケープはしない（mirakurun と同じ）。
