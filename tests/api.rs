@@ -549,6 +549,66 @@ async fn services_report_the_spec_fields() {
 }
 
 #[tokio::test]
+async fn services_list_and_detail_only_expose_enabled_channels() {
+    // The service table may still hold records on disabled/removed channels
+    // (the scan keeps all records), and a record may not be bound yet. The API
+    // must expose only what a client can actually play (SPEC §9).
+    let (fixture, _) = marker_fixture_with(CHANNELS_WITH_DISABLED);
+    let services = ServiceTable::new();
+    for (sid, name, channel) in [
+        (0x0401u16, "Enabled", Some(("GR", "27"))),
+        (0x0402, "Disabled", Some(("GR", "99"))),
+        (0x0403, "Removed", Some(("GR", "98"))),
+        (0x0404, "Unbound", None),
+    ] {
+        let mut record = ServiceRecord::new(NETWORK_ID, TSID, sid, 0x01, name);
+        record.channel =
+            channel.map(|(channel_type, channel)| (channel_type.to_string(), channel.to_string()));
+        services.upsert(record);
+    }
+    let state = fixture.state_with(services);
+
+    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    assert_eq!(status, StatusCode::OK);
+    let list = json(&body);
+    let list = list.as_array().expect("array");
+    assert_eq!(
+        list.len(),
+        1,
+        "only the enabled channel is listed: {list:?}"
+    );
+    assert_eq!(list[0]["name"], "Enabled");
+    assert_eq!(list[0]["id"], NETWORK_ID as u64 * 100_000 + 0x0401u64);
+    let text = String::from_utf8_lossy(&body);
+    for hidden in ["Disabled", "Removed", "Unbound"] {
+        assert!(!text.contains(hidden), "{hidden} leaked into {text}");
+    }
+
+    let enabled_id = NETWORK_ID as u64 * 100_000 + 0x0401;
+    let (status, _, body) = send_body(
+        &state,
+        PEER,
+        request(Method::GET, &format!("/api/services/{enabled_id}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["name"], "Enabled");
+
+    for sid in [0x0402u16, 0x0403, 0x0404] {
+        let id = NETWORK_ID as u64 * 100_000 + u64::from(sid);
+        let (status, _, body) = send_body(
+            &state,
+            PEER,
+            request(Method::GET, &format!("/api/services/{id}")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "sid {sid}");
+        assert_eq!(json(&body)["code"], 404);
+        assert_eq!(json(&body)["reason"], "Service Not Found");
+    }
+}
+
+#[tokio::test]
 async fn unknown_routes_and_scan_polling_are_404() {
     let fixture = Fixture::new(&tuners("true"), &channels(&[]), PIPELINE_CAT);
     let state = fixture.state();
@@ -1563,6 +1623,95 @@ async fn decode_zero_bypasses_the_whole_pipeline() {
     assert_eq!(raw, ts);
 }
 
+#[tokio::test]
+async fn decode_accepts_mirakc_spellings_for_both_modes() {
+    let ts = [packet_bytes(0x44), packet_bytes(0x55)].concat();
+    // The pipeline appends a marker packet, so the two modes are distinguishable.
+    let marker = packet_bytes(0x77);
+    let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), "{}");
+    let path = fixture.write_ts("stream.ts", &ts);
+    let marker_path = fixture.write_ts("marker.ts", &marker);
+    let pipelines = format!(
+        "pipelines:\n  pass:\n    - \"sh -c 'cat; cat {}'\"\ntypes:\n  GR: {{ pipeline: pass }}\n",
+        marker_path.display()
+    );
+    std::fs::write(fixture.path.join("pipelines.yml"), pipelines).expect("write pipelines.yml");
+    // A finite tuner command, so each response can be read to completion.
+    std::fs::write(
+        fixture.path.join("tuners.yml"),
+        tuners(&format!("cat {}", path.display())),
+    )
+    .expect("rewrite tuners.yml");
+    let state = fixture.state();
+
+    // `false` is the mirakc spelling of "do not decode": the same raw tuner
+    // bytes as `0`, with the value trimmed and matched case-insensitively.
+    let piped = [ts.clone(), marker].concat();
+    for uri in [
+        "/api/channels/GR/27/stream?decode=0",
+        "/api/channels/GR/27/stream?decode=false",
+        "/api/channels/GR/27/stream?decode=FALSE",
+        "/api/channels/GR/27/stream?decode=%20false%20",
+    ] {
+        let response = send(&state, PEER, request(Method::GET, uri)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = read_all(response.into_body()).await;
+        assert_eq!(bytes, ts, "{uri} must bypass the pipeline");
+    }
+
+    // `true`, `1` and an absent parameter all apply the pipeline.
+    for uri in [
+        "/api/channels/GR/27/stream",
+        "/api/channels/GR/27/stream?decode=1",
+        "/api/channels/GR/27/stream?decode=true",
+        "/api/channels/GR/27/stream?decode=TRUE",
+    ] {
+        let response = send(&state, PEER, request(Method::GET, uri)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = read_all(response.into_body()).await;
+        assert_eq!(bytes, piped, "{uri} must apply the pipeline");
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_decode_value_is_400_on_every_stream_route_without_tuning() {
+    let (fixture, marker) = marker_fixture();
+    let services = ServiceTable::new();
+    let mut record = ServiceRecord::new(NETWORK_ID, TSID, TARGET_SID, 0x01, "NHK General");
+    record.channel = Some(("GR".to_string(), "27".to_string()));
+    services.upsert(record);
+    let state = fixture.state_with(services);
+
+    let routes = [
+        "/api/channels/GR/27/stream".to_string(),
+        format!("/api/channels/GR/27/services/{TARGET_SID}/stream"),
+        format!("/api/services/{TARGET_SID}/stream"),
+    ];
+    // An unknown token and an empty `decode=` are both 400, on GET and HEAD
+    // alike; HEAD must validate before it would acquire anything.
+    for route in &routes {
+        for value in ["2", "abc", ""] {
+            let uri = format!("{route}?decode={value}");
+            for method in [Method::GET, Method::HEAD] {
+                let (status, _, body) =
+                    send_body(&state, PEER, request(method.clone(), &uri)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+                if method == Method::GET {
+                    assert_eq!(json(&body)["code"], 400, "{uri}");
+                    assert_eq!(json(&body)["reason"], "Invalid decode value", "{uri}");
+                    assert_eq!(json(&body)["errors"], serde_json::json!([]), "{uri}");
+                }
+            }
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !marker.exists(),
+        "an invalid decode value must not spawn a tuner process"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Service stream
 // ---------------------------------------------------------------------------
@@ -2199,8 +2348,16 @@ async fn a_scan_appends_entries_and_keeps_other_types() {
     assert_eq!(config.channels.len(), 2);
 
     // SPEC §13: the scan result is visible through `/api/services`, and the
-    // found services are bound to the scanned channel.
-    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    // found services are bound to the scanned channel. There is no hot reload
+    // (the scan itself prints "RESTART REQUIRED"), so this exercises the API
+    // with the config a restart would load from the rewritten channels.yml.
+    let restarted = AppState::new(
+        std::sync::Arc::new(fixture.config()),
+        state.manager.services().clone(),
+        fixture.path.clone(),
+    );
+    let (status, _, body) =
+        send_body(&restarted, PEER, request(Method::GET, "/api/services")).await;
     assert_eq!(status, StatusCode::OK);
     let found = json(&body);
     let found = found.as_array().expect("array");
@@ -2500,7 +2657,14 @@ async fn a_scan_waits_for_a_delayed_tuner_and_finds_its_services() {
         "the scan waited longer than needed: {elapsed:?}"
     );
 
-    let (status, _, body) = send_body(&state, PEER, request(Method::GET, "/api/services")).await;
+    // A restart applies the rewritten channels.yml (there is no hot reload).
+    let restarted = AppState::new(
+        std::sync::Arc::new(fixture.config()),
+        state.manager.services().clone(),
+        fixture.path.clone(),
+    );
+    let (status, _, body) =
+        send_body(&restarted, PEER, request(Method::GET, "/api/services")).await;
     assert_eq!(status, StatusCode::OK);
     let services = json(&body);
     assert_eq!(

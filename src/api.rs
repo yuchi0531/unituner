@@ -24,10 +24,10 @@
 //!
 //! Every stream route acquires a [`Subscription`] from
 //! [`SessionManager`](crate::session::SessionManager) and turns its receiver
-//! into an HTTP body. `decode=0` asks the session layer to bypass the whole
-//! pipeline (SPEC §4.1); a service stream wraps the subscription in a
-//! per-subscriber [`ServiceFilter`] (SPEC §4, §5) so subscribers never
-//! interfere.
+//! into an HTTP body. `decode=0` / `decode=false` asks the session layer to
+//! bypass the whole pipeline (SPEC §4.1); a service stream wraps the
+//! subscription in a per-subscriber [`ServiceFilter`] (SPEC §4, §5) so
+//! subscribers never interfere.
 //!
 //! Every tuner-backed stream route resolves `(type, channel)` against
 //! `channels.yml` before touching a tuner, so the configured list is the
@@ -43,6 +43,7 @@
 //!
 //! The validation order is fixed for `GET` and `HEAD`:
 //!
+//! 0. `decode` query ([`parse_decode`]): 400 for an unknown value;
 //! 1. path syntax ([`validate_path`]): 400;
 //! 2. channel allowlist (`channels.yml`, enabled): 404;
 //! 3. service resolution: 404;
@@ -53,11 +54,12 @@
 //! `/api/services/{id}/stream` has no `(type, channel)` in its path, so it must
 //! resolve the service first to learn one; step 3 runs before step 2 there (an
 //! unknown service and a service bound to an unknown/disabled channel are both
-//! a 404 anyway).
+//! a 404 anyway). The service routes use the same [`service_is_visible`] rule
+//! as the service list/detail, so a listed service is always streamable.
 //!
 //! `HEAD` is served by explicit handlers that return the stream headers and an
 //! empty body without acquiring a session, so a probe never tunes a device. A
-//! `HEAD` runs steps 1–5 (via the same `validate_*` functions as its `GET`), so
+//! `HEAD` runs steps 0–5 (via the same `validate_*` functions as its `GET`), so
 //! both answer the same 400/404. Steps 6 need a session and are not simulated:
 //! `HEAD` reports only statically decidable errors, so a request that `GET`
 //! would refuse with 503 (all tuners busy) or 409 (decode-mode conflict) can
@@ -423,13 +425,31 @@ fn find_channel<'a>(
         .find(|entry| entry.channel_type == channel_type && entry.channel == channel)
 }
 
+/// Whether a service record is exposed by the API and can be streamed.
+///
+/// A record is visible only when it is bound to a channel that is still in
+/// `channels.yml` and enabled (SPEC §9). `channel = None` (not yet bound by a
+/// scan) is excluded too: there is no way to tune to it. Single authority for
+/// the service list, detail, playlist and stream routes, so a client never
+/// lists a service it cannot play.
+fn service_is_visible(config: &Config, record: &ServiceRecord) -> bool {
+    record
+        .channel
+        .as_ref()
+        .is_some_and(|(channel_type, channel)| {
+            find_channel(config, channel_type, channel).is_some_and(is_enabled)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Services
 // ---------------------------------------------------------------------------
 
 /// The service table as mirakurun clients consume it.
 ///
-/// The same `(nid, sid)` can be received on two physical channels, which would
+/// Only services on configured, enabled channels are listed (SPEC §9), the
+/// same [`service_is_visible`] rule the detail route applies. The same
+/// `(nid, sid)` can be received on two physical channels, which would
 /// otherwise repeat one `id` in the list. Clients key on `id`, so each id is
 /// emitted once: the first record in the stable table order (network, tsid,
 /// service id, then channel) wins and later duplicates are skipped. That is
@@ -441,6 +461,7 @@ async fn services_list(State(state): State<AppState>) -> Json<Value> {
         services
             .list()
             .iter()
+            .filter(|record| service_is_visible(&state.config, record))
             .filter(|record| seen.insert(record.item_id()))
             .map(service_json)
             .collect(),
@@ -451,10 +472,29 @@ async fn service_detail(
     State(state): State<AppState>,
     UrlPath(service): UrlPath<String>,
 ) -> Response {
-    match state.manager.services().resolve(&service) {
-        Ok(record) => Json(service_json(&record)).into_response(),
+    let services = state.manager.services();
+    let record = match services.resolve(&service) {
+        Ok(record) => record,
         Err(error) => {
             tracing::debug!(%error, id = %service, "service not found");
+            return error_response(StatusCode::NOT_FOUND, "Service Not Found");
+        }
+    };
+    // Same visibility rule as the list. When the winning record is on a
+    // hidden channel, a visible sibling for the same item id can still be
+    // the one the list shows, so follow it rather than 404 a listed service.
+    let visible = if service_is_visible(&state.config, &record) {
+        Some(record)
+    } else {
+        services
+            .get_all(record.item_id())
+            .into_iter()
+            .find(|record| service_is_visible(&state.config, record))
+    };
+    match visible {
+        Some(record) => Json(service_json(&record)).into_response(),
+        None => {
+            tracing::debug!(id = %service, "service not found");
             error_response(StatusCode::NOT_FOUND, "Service Not Found")
         }
     }
@@ -637,21 +677,14 @@ fn fallback_authority(addr: &str) -> String {
 }
 
 fn iptv_playlist_body(api_root: &str, records: &[ServiceRecord], config: &Config) -> String {
-    // Only tuneable services are listed: service types `0x01`/`0xAD`, bound to
-    // a channel, and that channel is configured and enabled — the same check
-    // `validate_service_stream`/`require_channel` apply to stream URLs, so the
-    // playlist never emits a dead link.
+    // Only tuneable services are listed: service types `0x01`/`0xAD` on a
+    // visible channel — the same [`service_is_visible`] check the service
+    // list/detail and stream routes apply, so the playlist never emits a dead
+    // link.
     let eligible: Vec<&ServiceRecord> = records
         .iter()
-        .filter(|record| {
-            matches!(record.service_type, 1 | 173)
-                && record
-                    .channel
-                    .as_ref()
-                    .is_some_and(|(channel_type, channel)| {
-                        find_channel(config, channel_type, channel).is_some_and(is_enabled)
-                    })
-        })
+        .filter(|record| matches!(record.service_type, 1 | 173))
+        .filter(|record| service_is_visible(config, record))
         .collect();
 
     // Dedup by item id with the same winner as `ServiceTable::get`: the first
@@ -835,11 +868,14 @@ async fn channel_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let bypass = match parse_decode(&params) {
+        Ok(bypass) => bypass,
+        Err(response) => return response,
+    };
     let request = match validate_channel_stream(&state, &channel_type, &channel, &headers, peer) {
         Ok(request) => request,
         Err(response) => return response,
     };
-    let decode = is_decode_zero(&params);
     let subscription = state
         .manager
         .acquire_full(
@@ -848,7 +884,7 @@ async fn channel_stream(
             request.user(),
             request.pin.clone(),
             SessionTap::Raw,
-            decode,
+            bypass,
         )
         .await;
     match subscription {
@@ -864,6 +900,10 @@ async fn channel_service_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let bypass = match parse_decode(&params) {
+        Ok(bypass) => bypass,
+        Err(response) => return response,
+    };
     let (record, request) = match validate_channel_service_stream(
         &state,
         &channel_type,
@@ -875,7 +915,7 @@ async fn channel_service_stream(
         Ok(validated) => validated,
         Err(response) => return response,
     };
-    stream_service(&state, &record, &channel_type, &channel, request, &params).await
+    stream_service(&state, &record, &channel_type, &channel, request, bypass).await
 }
 
 async fn service_stream(
@@ -885,12 +925,16 @@ async fn service_stream(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    let bypass = match parse_decode(&params) {
+        Ok(bypass) => bypass,
+        Err(response) => return response,
+    };
     let (record, channel_type, channel, request) =
         match validate_service_stream(&state, &service, &headers, peer) {
             Ok(validated) => validated,
             Err(response) => return response,
         };
-    stream_service(&state, &record, &channel_type, &channel, request, &params).await
+    stream_service(&state, &record, &channel_type, &channel, request, bypass).await
 }
 
 /// Shared acquisition of the two service-stream routes.
@@ -900,9 +944,8 @@ async fn stream_service(
     channel_type: &str,
     channel: &str,
     request: StreamRequest,
-    params: &HashMap<String, String>,
+    bypass: bool,
 ) -> Response {
-    let decode = is_decode_zero(params);
     let subscription = state
         .manager
         .acquire_full(
@@ -913,7 +956,7 @@ async fn stream_service(
             SessionTap::Filtered {
                 service_id: Some(record.service_id),
             },
-            decode,
+            bypass,
         )
         .await;
     match subscription {
@@ -932,9 +975,13 @@ async fn stream_service(
 async fn stream_head(
     State(state): State<AppState>,
     UrlPath((channel_type, channel)): UrlPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = parse_decode(&params) {
+        return response;
+    }
     match validate_channel_stream(&state, &channel_type, &channel, &headers, peer) {
         Ok(_) => empty_stream_head(peer),
         Err(response) => response,
@@ -946,9 +993,13 @@ async fn stream_head(
 async fn service_head(
     State(state): State<AppState>,
     UrlPath(service): UrlPath<String>,
+    Query(params): Query<HashMap<String, String>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = parse_decode(&params) {
+        return response;
+    }
     match validate_service_stream(&state, &service, &headers, peer) {
         Ok(_) => empty_stream_head(peer),
         Err(response) => response,
@@ -962,9 +1013,13 @@ async fn service_head(
 async fn channel_service_head(
     State(state): State<AppState>,
     UrlPath((channel_type, channel, service)): UrlPath<(String, String, String)>,
+    Query(params): Query<HashMap<String, String>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = parse_decode(&params) {
+        return response;
+    }
     match validate_channel_service_stream(&state, &channel_type, &channel, &service, &headers, peer)
     {
         Ok(_) => empty_stream_head(peer),
@@ -1032,9 +1087,12 @@ fn validate_service_stream(
     };
     validate_path(&channel_type, &channel)
         .map_err(|reason| error_response(StatusCode::BAD_REQUEST, reason))?;
-    // A service whose channel is no longer in `channels.yml` (or is disabled)
-    // is not tuneable, so it is as absent as an unknown service.
-    require_channel(&state.config, &channel_type, &channel)?;
+    // A service on a channel that is no longer in `channels.yml` (or is
+    // disabled) is not visible, so it is as absent as an unknown service. Same
+    // [`service_is_visible`] rule as the list and detail routes.
+    if !service_is_visible(&state.config, &record) {
+        return Err(error_response(StatusCode::NOT_FOUND, "Service Not Found"));
+    }
     let request = finish_stream_request(state, headers, peer, &channel_type)?;
     Ok((record, channel_type, channel, request))
 }
@@ -1141,11 +1199,28 @@ fn subscription_body(subscription: Subscription, filter: Option<ServiceFilter>) 
     }
 }
 
-/// `decode=0` bypasses the whole pipeline (SPEC §4.1).
-fn is_decode_zero(params: &HashMap<String, String>) -> bool {
-    params
-        .get("decode")
-        .is_some_and(|value| value.trim() == "0")
+/// Parses the `decode` query parameter into the session's `bypass_pipeline`
+/// flag, with mirakc/mirakurun semantics (SPEC §4.1).
+///
+/// Absent, `1` and `true` apply the pipeline (`false`); `0` and `false` bypass
+/// it (`true`). The value is trimmed and compared ASCII case-insensitively.
+/// Anything else — an unknown token (`2`, `abc`) or an empty `decode=` — is a
+/// 400.
+#[allow(clippy::result_large_err)]
+fn parse_decode(params: &HashMap<String, String>) -> Result<bool, Response> {
+    match params.get("decode").map(|value| value.trim()) {
+        None => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("0") || value.eq_ignore_ascii_case("false") => {
+            Ok(true)
+        }
+        Some(value) if value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true") => {
+            Ok(false)
+        }
+        Some(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid decode value",
+        )),
+    }
 }
 
 /// Maps an [`AcquireError`] to the SPEC §6 response.
