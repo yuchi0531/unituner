@@ -10,6 +10,7 @@
 - 言語: **Rust**（axum / tokio）。single binary crate。
 - 配置: `~/projects/unituner`（GitHub リポジトリは作らない）。
 - 役割: recpt1 系チューナー（外部コマンド）の共有・排他制御と、mirakurun 互換 API の最小サブセット配信。
+- **設計原則: 標準仕様にのみ対応する。** 本体が実装するのは MPEG-2 TS（188 バイト。204 はパリティを落として受ける）、ARIB STD-B10 の SI、ARIB STD-B24 の文字、mirakurun 互換 API のサブセットだけ。特殊ケース（192 バイトフレーミング、TLV/MMT、ベンダー固有のスクランブル/リマックス等）は pipeline の外部コマンド・設定・別ツールで吸収する。ベンダー名・機種名で分岐するコードを本体に足さない（[POLICY.md](POLICY.md)）。
 - 扱わないもの: MMT/TLV の内部処理、EPG、ロゴ (CDT)、B-CAS/B25/C-CAS の内蔵デコード、録画/タイムシフト、HDHR/xmltv、websocket、永続化 DB、hot reload。
   - TLV は必ず pipeline 内の外部コマンドで TS 変換されてから内蔵コードに来る前提。内蔵処理は MPEG-TS のみ。
 - TS 変換・デスクランブルは全てユーザー定義 pipeline の外部コマンドに委譲する（デスクランブルは外部 B25 デコーダ、例: `arib-b25-stream-test`）。パイプライン通過後の TS だけをサービス検出・フィルタ・配信に使う。
@@ -207,7 +208,7 @@ types:                                # チャンネルタイプ → pipeline �
   tuner command ─stdout─► [204→188 正規化] ─► 下層の broadcast（同上）
   (child)
 
-  decode=0（pipeline 全段 bypass）
+  decode=0 / false（pipeline 全段 bypass）
   tuner command ─stdout─► 下層の broadcast（正規化なし・生バイトそのまま）
   (child)
 ```
@@ -223,12 +224,22 @@ types:                                # チャンネルタイプ → pipeline �
 - プロセスツリーの部分的な spawn 失敗（tuner は起動したのに pipeline 段が起動しない等）は、セッションを「登録済みだが出力なし」にしないこと。起動失敗時は Session を作らずに落とし、tuner 側のプロセスも確実に kill する。
 - TS 正規化（`tsframe.rs`）は読み出し済みの先頭バイトをオフセットで進め、パケットを 1 個捨てるたびの `memmove` を避ける（バッファは全消費時、または未使用領域が 64 KiB 以上になったときに圧縮する）。188 バイトで連続する区間は 1 回のコピーでまとめて出力する。
 
-### 4.1 `decode=0`
+### 4.1 `decode` クエリ
 
-- `decode=0` は **pipeline 全段をバイパスし、正規化も行わずにチューナーの生バイトをそのまま配信**する。
+`decode` は mirakc/mirakurun 互換のデコード指定として解釈する。3 つの stream ルートすべて（`/api/channels/{type}/{channel}/stream`、`/api/channels/{type}/{channel}/services/{id}/stream`、`/api/services/{id}/stream`）の GET と HEAD で同じ規則を適用する。
+
+| 値 | 動作 |
+|---|---|
+| 無し / `1` / `true` | pipeline を適用（通常配信） |
+| `0` / `false` | pipeline 全段をバイパス（チューナーの生バイト） |
+| それ以外（`2`、`abc`、空の `decode=` など） | **400** `{"code":400,"reason":"Invalid decode value","errors":[]}` |
+
+- 値は前後の空白を除去し、ASCII 大文字小文字を無視して比較する（`FALSE` や ` false ` も `false` と同義）。
+- `0` / `false` は **pipeline 全段をバイパスし、正規化も行わずにチューナーの生バイトをそのまま配信**する。
   - mirakurun の `decode=0` は B-25 デコーダのみスキップだが、unituner は pipeline 内にデスクランブルも TS 変換も全部入れる設計のため、この解釈で確定（ユーザー確認済み）。
-  - pipeline が TLV→TS 変換そのものを担う構成（BS4K 等）では、`decode=0` は **生の TLV/MMT をそのまま配信する**（188B アラインもしない）。これは「unituner は TS のみを扱う」原則の**許容済み例外**である。mirakurun クライアントがこの型に `decode=0` を付けると TS ではなく TLV を受け取る点に注意（README 制限欄にも明記）。
-- `decode=0` のとき内蔵 TSFilter（service stream の SID 絞り込み）も適用するかは仕様として要定義。既定方針：`decode=0` でも service stream の TSFilter は適用する（絞り込みは pipeline ではないため）。ただし README 制限欄に「decode=0 は pipeline 全段 bypass」と明記する。
+  - pipeline が TLV→TS 変換そのものを担う構成（BS4K 等）では、`0` / `false` は **生の TLV/MMT をそのまま配信する**（188B アラインもしない）。これは「unituner は TS のみを扱う」原則の**許容済み例外**である。mirakurun クライアントがこの型に付けると TS ではなく TLV を受け取る点に注意（README 制限欄にも明記）。
+- 不正値の 400 は HEAD でも同じで、セッションを取得せずに返す（チューナーを起動しない）。
+- `0` / `false` のときも service stream の内蔵 TSFilter は適用する（絞り込みは pipeline ではないため）。README 制限欄に「pipeline 全段 bypass」と明記する。
 
 ## 5. 内蔵 TSFilter（service stream の SID 絞り込み）
 
@@ -470,8 +481,8 @@ Found 1 channels for 13
 | `GET /api/channels/{type}/{channel}` | チャンネル詳細（services は簡易 embed）。`disabled: true` は 404 |
 | `GET /api/channels/{type}/{channel}/stream` | **pipeline 通過後の TS をそのまま返す**（channel stream） |
 | `GET /api/channels/{type}/{channel}/services/{id}/stream` | 内蔵 TSFilter 適用 |
-| `GET /api/services` | サービス一覧（id, serviceId, networkId, tsid, name, type, logoId:0, hasLogoData:false, remoteControlKeyId, channel{type,channel}） |
-| `GET /api/services/{id}` | サービス詳細 |
+| `GET /api/services` | サービス一覧（id, serviceId, networkId, tsid, name, type, logoId:0, hasLogoData:false, remoteControlKeyId, channel{type,channel}）。**有効なチャンネル上のサービスだけ** |
+| `GET /api/services/{id}` | サービス詳細。有効なチャンネル上のサービスだけ（それ以外は 404 `Service Not Found`） |
 | `GET /api/services/{id}/stream` | 内蔵 TSFilter 適用（`{id}` は ServiceItemId または sid） |
 | `GET /api/tuners` | index, name, types, isAvailable, isFree, isUsing, isFault:false, users:[{date,id,priority,provider}] |
 | `GET /api/tuners/{index}` | 同上（単体） |
@@ -481,7 +492,8 @@ Found 1 channels for 13
 | `GET /api/config/channels/scan` | **404**（`async` 非対応のため） |
 
 - Stream 系は HEAD も可。`X-Mirakurun-Tuner-User-ID` ヘッダを付与する。
-- `decode=0` は 4.1 通り。
+- `decode` クエリは 4.1 通り（無し / `1` / `true` は pipeline、`0` / `false` は全段 bypass、それ以外は 400）。
+- `/api/services` の一覧・詳細・サービス stream は同じ可視性判定を使う。サービス表のレコードのうち、`(channel.type, channel.channel)` が `channels.yml` に存在して **有効**（`disabled: true` でない）なものだけを一覧・詳細に出す。`disabled: true`、`channels.yml` から削除済み、未バインド (`channel: None`) のレコードは一覧に出さず、詳細は 404 `Service Not Found`（stream も 404）。サービスキャッシュ (`services.json`) は全レコードを保持し、scan/retain の挙動は変えない。
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` は 6.3 通り。
 - `/api/channels` は 1 リクエストにつきサービス表のスナップショット（`ServiceTable::list()`）を 1 回だけ取り、各チャンネルの services はそこから該当分をフィルタして埋める（チャンネル数ぶんの全件 clone + sort をしない）。`/api/channels/{type}/{channel}` は `list_by_channel` で該当チャンネル分だけを取得する。
 - チャンネル一覧 / 詳細は `disabled: true` のエントリを返さない（mirakc と同じ）。無効なチャンネルは配信できない資源なので、stream 系の 404 と同じ扱いにする。`channels.yml` にはエントリを残し、起動時スキャンは従来どおり対象外、webui の GET/PUT round-trip も `disabled` を保持する。応答に `disabled` フィールドは追加しない（そもそも返さないため）。
@@ -548,7 +560,7 @@ unituner/
 
 ## 13. 検証（end-to-end）
 
-- `cargo test`（unit + 統合。配信バイト == 入力バイト、503、奪取、優先度同値は FCFS、scan→`/api/services` 反映、decode=0 バイパス、内蔵 TSFilter の PID 絞り込みと PAT 単一 program 化）
+- `cargo test`（unit + 統合。配信バイト == 入力バイト、503、奪取、優先度同値は FCFS、scan→`/api/services` 反映、decode=0/false バイパス、内蔵 TSFilter の PID 絞り込みと PAT 単一 program 化）
 - `/api/services/{id}/stream` が対象サービスのみの TS（他サービスの ES PID が落ちる）を返すことを fixture で検証
 - 同時要求（同一 `(type,channel)` の共有、別 channel への 503 / 奪取）、queued retry の挙動、pinning（未知 tuner → 400）
 - config 保存 → YAML 書き換え + .bak 作成、不正値 → 書き戻し拒否、再起動ボタン → 自己再exec で新 config が反映
@@ -569,7 +581,7 @@ unituner/
 
 ## 15. README 制限欄に必ず書くこと
 
-- `decode=0` は pipeline 全段 bypass かつ正規化なし（mirakurun の B-25 スキップとは異なる）。TLV 源（BS4K 等）では pipeline が TLV→TS 変換を担うため、`decode=0` は TS ではなく**生 TLV/MMT** を返す（TS-only 原則の許容済み例外）
+- `decode=0` / `decode=false` は pipeline 全段 bypass かつ正規化なし（mirakurun の B-25 スキップとは異なる）。TLV 源（BS4K 等）では pipeline が TLV→TS 変換を担うため、`0` / `false` は TS ではなく**生 TLV/MMT** を返す（TS-only 原則の許容済み例外）。`decode` のその他の値（`1` / `true` / 無し以外）は 400
 - pipeline はチューナー出力（188 / 204 / TLV/MMT のいずれでも）を byte-for-byte で受け、**必ず MPEG-TS を出力**する。TLV/MMT → TS 変換は pipeline の責務で、unituner は pipeline 後の TS だけを正規化して扱う。`dantto4k` / `mmt2ts` およびその前段の `b61dec-remote` は TLV 入力前提
 - priority の multi-header 集約は未対応（単一値前提）
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）

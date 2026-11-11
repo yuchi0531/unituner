@@ -2,6 +2,8 @@
 
 チューナー共有と抽象化に特化した mirakurun 互換サーバ。外部コマンドのチューナーを排他制御し、mirakurun 互換 API のサブセットで MPEG-TS を配信する。EPG・録画・ロゴ・MMT/TLV の内部処理は扱わない。
 
+本体が対応するのは標準仕様（MPEG-2 TS / ARIB STD-B10 の SI / ARIB STD-B24 の文字 / mirakurun 互換 API）だけである。192 バイトフレーミング、TLV/MMT、ベンダー固有のスクランブルやリマックスなどの特殊ケースは、pipeline の外部コマンド・設定・別ツールで吸収する。分岐を本体に増やさないことが、高速・堅牢・移植性の前提になっている（詳細は [docs/POLICY.md](docs/POLICY.md)）。
+
 実装仕様は [docs/SPEC.md](docs/SPEC.md)（日本語）、設計方針は [docs/POLICY.md](docs/POLICY.md)、実機手順は [docs/TESTING.md](docs/TESTING.md)。
 
 ## 特徴
@@ -239,8 +241,8 @@ types:
 | GET | `/api/channels/{type}/{channel}` | チャンネル詳細。未設定・無効は 404 |
 | GET / HEAD | `/api/channels/{type}/{channel}/stream` | pipeline 通過後の TS（チャンネル全体） |
 | GET / HEAD | `/api/channels/{type}/{channel}/services/{id}/stream` | そのチャンネル上の 1 サービス（内蔵フィルタ適用） |
-| GET | `/api/services` | サービス一覧。`id` は `networkId * 100000 + serviceId` |
-| GET | `/api/services/{id}` | サービス詳細。`{id}` は item id か sid |
+| GET | `/api/services` | サービス一覧。`id` は `networkId * 100000 + serviceId`。**有効なチャンネルに紐づくサービスだけ**を返す |
+| GET | `/api/services/{id}` | サービス詳細。`{id}` は item id か sid。無効・削除済み・未バインドのチャンネルのサービスは 404 |
 | GET / HEAD | `/api/services/{id}/stream` | 1 サービス（内蔵フィルタ適用） |
 | GET | `/api/tuners` | チューナー状態と利用者一覧 |
 | GET | `/api/tuners/{index}` | 単体。数値でない・範囲外は 404 |
@@ -286,11 +288,21 @@ pin の挙動:
 - 奪取は **kill-first**。victim をレジストリから外してプロセスグループを停止し、デバイスが解放されてから代替を spawn する。spawn に失敗した場合は 503 になり、そのチャンネルは次回要求まで停止する。
 - コメント付きの応答はしない。奪取・pipeline 異常終了・チューナー終了はいずれも、ヘッダ送信後の **EOF** として見える。
 
-### `decode=0`
+### `decode`
 
-`?decode=0` は **pipeline 全段をバイパスし、正規化も行わずにチューナーの生バイトをそのまま配信**する（mirakurun の B-25 のみスキップとは異なる）。service stream の内蔵フィルタは引き続き適用される。
+3 つの stream ルート（`/api/channels/.../stream`、`/api/channels/.../services/{id}/stream`、`/api/services/{id}/stream`）の GET / HEAD は `decode` クエリを mirakc/mirakurun 互換に解釈する。
 
-TLV 源（BS4K 等）では TLV→TS 変換も pipeline が担うため、`decode=0` は **生の TLV/MMT をそのまま配信する**。188B アラインも行われないため、mirakurun クライアントがこの型に `decode=0` を付けると TS ではなく TLV を受け取る点に注意する。これは「unituner は TS のみを扱う」原則の**許容済み例外**である。
+| 値 | 動作 |
+|---|---|
+| 無し / `1` / `true` | pipeline を適用（通常配信） |
+| `0` / `false` | pipeline 全段をバイパス |
+| それ以外（`2`、`abc`、空の `decode=` など） | 400 `{"code":400,"reason":"Invalid decode value","errors":[]}` |
+
+値は前後の空白を除き、ASCII 大文字小文字を無視して比較する。不正値は HEAD でも 400 で、チューナーを起動しない。
+
+`0` / `false` は **pipeline 全段をバイパスし、正規化も行わずにチューナーの生バイトをそのまま配信**する（mirakurun の B-25 のみスキップとは異なる）。service stream の内蔵フィルタは引き続き適用される。
+
+TLV 源（BS4K 等）では TLV→TS 変換も pipeline が担うため、`0` / `false` は **生の TLV/MMT をそのまま配信する**。188B アラインも行われないため、mirakurun クライアントがこの型に付けると TS ではなく TLV を受け取る点に注意する。これは「unituner は TS のみを扱う」原則の**許容済み例外**である。
 
 decode モードはセッションの属性であり、同一チャンネルに 2 つのプロセス木は作らない。既に逆のモードで配信中の場合、その要求は参加も奪取もせず **409**。
 
@@ -492,7 +504,8 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応。例外は `PUT /api/config/channels/scan` のみ。
 - チャンネル探索の `async` と `GET` ポーリングは非対応。`GET /api/config/channels/scan` は 404。
 - 複数の `X-Mirakurun-Priority` は集約しない（最後の非空値を使う）。
-- `decode=0` は pipeline **全段**バイパスで、正規化も行わない。mirakurun の「B-25 デコーダのみスキップ」とは異なる。TLV 源の型では TS ではなく生 TLV/MMT を返す（TS-only 原則の許容済み例外）。
+- `decode=0` / `decode=false` は pipeline **全段**バイパスで、正規化も行わない。mirakurun の「B-25 デコーダのみスキップ」とは異なる。TLV 源の型では TS ではなく生 TLV/MMT を返す（TS-only 原則の許容済み例外）。`decode` のそれ以外の値（`1` / `true` / 無し以外）は 400。
+- `/api/services` の一覧・詳細は、`channels.yml` に存在して有効なチャンネルに紐づくサービスだけを返す。無効・削除済み・未バインド（`channel: None`）のチャンネルのサービスは一覧に出さず、詳細は 404 になる。`services.json` は全レコードを保持し、scan/retain の挙動は変えない（`channels.yml` の変更を反映するには再起動する）。
 - pipeline は tuner stdout を byte-for-byte で受け、必ず TS を出力する。TLV/MMT → TS 変換は pipeline の責務で、unituner は pipeline 後の TS だけを pump で正規化する。TLV を TS 正規化してから pipeline に渡す構成は不可。`dantto4k` / `mmt2ts` とその前段の `b61dec-remote` は TLV 入力前提。
 - web UI に認証はない。`allowed_cidrs` と `allowed_hosts` のみで、設定編集と再起動ができるため実質的に遠隔操作面になる。信頼できる LAN に置くこと。
 - `services.json` が無い初回起動やキャッシュ無効時、スキャンが完了するまで `/api/services/{id}/stream` は 404 になりうる（有効なキャッシュがあれば起動直後から配信できる）。
