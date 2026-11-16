@@ -148,6 +148,16 @@ pub struct ServerConfig {
     pub subscriber_buffer_chunks: usize,
     #[serde(default = "default_chunk_size_bytes")]
     pub chunk_size_bytes: usize,
+    /// Whether service streams forward EIT (PID `0x0012`) unmodified
+    /// (SPEC §5).
+    ///
+    /// `false` (default) keeps the historical behaviour: EIT is dropped from
+    /// service streams because PID `0x0012` is not in the filter's allowed set.
+    /// `true` passes every EIT packet, for all services (including EIT-other),
+    /// before and after the PMT; the filter never parses or scopes EIT. It only
+    /// affects service streams; channel streams stay raw passthrough.
+    #[serde(default)]
+    pub service_stream_keep_eit: bool,
     /// Maximum subscribers attached to one session; a further request is
     /// refused with HTTP 429 (SPEC §7).
     #[serde(default = "default_max_subscribers_per_session")]
@@ -233,6 +243,7 @@ impl Default for ServerConfig {
             idle_timeout_secs: default_idle_timeout_secs(),
             subscriber_buffer_chunks: default_subscriber_buffer_chunks(),
             chunk_size_bytes: default_chunk_size_bytes(),
+            service_stream_keep_eit: false,
             max_subscribers_per_session: default_max_subscribers_per_session(),
             max_subscribers_per_ip: default_max_subscribers_per_ip(),
             max_sessions: default_max_sessions(),
@@ -1333,6 +1344,34 @@ types:
             config.server.max_subscriber_buffer_bytes,
             DEFAULT_MAX_SUBSCRIBER_BUFFER_BYTES
         );
+    }
+
+    #[test]
+    fn service_stream_keep_eit_defaults_to_false_and_accepts_true() {
+        let fixture = Fixture::new("{}", TUNERS, CHANNELS, PIPELINES);
+        assert!(
+            !fixture
+                .load()
+                .expect("defaults")
+                .server
+                .service_stream_keep_eit
+        );
+
+        let server = format!("{SERVER}\nservice_stream_keep_eit: true\n");
+        let config = Fixture::new(&server, TUNERS, CHANNELS, PIPELINES)
+            .load()
+            .expect("true is accepted");
+        assert!(config.server.service_stream_keep_eit);
+
+        // A misspelt key is still rejected by `deny_unknown_fields`.
+        let server = format!("{SERVER}\nservice_stream_kee_eit: true\n");
+        match Fixture::new(&server, TUNERS, CHANNELS, PIPELINES).load() {
+            Err(ConfigError::Parse { path, source }) => {
+                assert!(path.ends_with("server.yml"));
+                assert!(source.to_string().contains("unknown field"));
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
     }
 
     #[test]

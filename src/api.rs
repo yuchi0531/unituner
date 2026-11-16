@@ -105,7 +105,7 @@ use crate::services::{ServiceRecord, ServiceTable};
 use crate::session::{
     AcquireError, SessionManager, SessionTap, Subscription, TunerStatus, TunerUser,
 };
-use crate::tsfilter::ServiceFilter;
+use crate::tsfilter::{ServiceFilter, ServiceFilterOptions};
 
 /// `unituner/<version>`, sent as the `Server` header on every response (SPEC §2).
 const SERVER_ID: &str = concat!("unituner/", env!("CARGO_PKG_VERSION"));
@@ -962,7 +962,12 @@ async fn stream_service(
     match subscription {
         Ok(subscription) => stream_response(
             subscription,
-            Some(ServiceFilter::new(record.service_id)),
+            Some(ServiceFilter::with_options(
+                record.service_id,
+                ServiceFilterOptions {
+                    keep_eit: state.config.server.service_stream_keep_eit,
+                },
+            )),
             &request.user_id,
         ),
         Err(error) => acquire_failure(&error),

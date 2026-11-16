@@ -10,6 +10,8 @@
 //!
 //! * PID `0x0000` (PAT), rewritten to a single programme (see below).
 //! * PID `0x0001` (CAT), `0x0010` (NIT) and `0x0011` (SDT/BAT), byte-identical.
+//! * PID `0x0012` (EIT) only when [`ServiceFilterOptions::keep_eit`] is set,
+//!   byte-identical and unscoped (all services' EIT, including EIT-other).
 //! * The target programme's PMT, whose PID is learned from the PAT.
 //! * That PMT's `PCR_PID` and every elementary-stream PID it lists. The PID
 //!   set is rebuilt whenever the PMT's `version_number` or its contents change.
@@ -90,6 +92,9 @@ const CAT_PID: u16 = 0x0001;
 const NIT_PID: u16 = 0x0010;
 /// Service Description Table / Bouquet Association Table PID.
 const SDT_PID: u16 = 0x0011;
+/// Event Information Table PID. Dropped unless
+/// [`ServiceFilterOptions::keep_eit`] is set.
+const EIT_PID: u16 = 0x0012;
 
 /// PIDs forwarded regardless of the PAT/PMT contents.
 const FIXED_PIDS: [u16; 4] = [PAT_PID, CAT_PID, NIT_PID, SDT_PID];
@@ -284,6 +289,20 @@ impl PatState {
     }
 }
 
+/// Options for [`ServiceFilter`].
+///
+/// The default matches the historical behaviour: EIT is dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServiceFilterOptions {
+    /// Whether EIT packets on PID `0x0012` pass through unmodified.
+    ///
+    /// When `true`, every EIT packet passes before and after the PMT, for all
+    /// services including EIT-other: the filter does not parse or scope EIT.
+    /// When `false` (default), PID `0x0012` is not in the allowed set, so EIT
+    /// packets are dropped like any other unknown PID.
+    pub keep_eit: bool,
+}
+
 /// Per-subscriber service filter (SPEC §5).
 ///
 /// Feed the post-pipeline packets with [`push`](Self::push); only the packets
@@ -291,6 +310,8 @@ impl PatState {
 #[derive(Debug)]
 pub struct ServiceFilter {
     service_id: u16,
+    /// Whether PID `0x0012` (EIT) is forwarded unmodified.
+    keep_eit: bool,
     /// Target programme's PMT PID, learned from the PAT.
     pmt_pid: Option<u16>,
     /// Target programme's `PCR_PID`, learned from the PMT.
@@ -347,9 +368,18 @@ pub struct ServiceFilter {
 
 impl ServiceFilter {
     /// Creates a filter for the service whose ISDB service id is `service_id`.
+    ///
+    /// Equivalent to [`with_options`](Self::with_options) and the default
+    /// [`ServiceFilterOptions`], i.e. EIT is dropped.
     pub fn new(service_id: u16) -> Self {
-        Self {
+        Self::with_options(service_id, ServiceFilterOptions::default())
+    }
+
+    /// Creates a filter with explicit options.
+    pub fn with_options(service_id: u16, options: ServiceFilterOptions) -> Self {
+        let mut filter = Self {
             service_id,
+            keep_eit: options.keep_eit,
             pmt_pid: None,
             pcr_pid: None,
             es_pids: Vec::new(),
@@ -358,13 +388,7 @@ impl ServiceFilter {
             pat: PatState::default(),
             pmt_assembler: SectionAssembler::new(),
             buf: Vec::new(),
-            allowed_bitmap: {
-                let mut bm = [0u64; 128];
-                for &pid in &FIXED_PIDS {
-                    bm[(pid >> 6) as usize] |= 1u64 << (pid & 63);
-                }
-                bm
-            },
+            allowed_bitmap: [0u64; 128],
             packets_in: 0,
             packets_out: 0,
             packets_dropped_unknown_pid: 0,
@@ -378,7 +402,9 @@ impl ServiceFilter {
             dropped_pat_sections: 0,
             ignored_next_version_pat_sections: 0,
             ignored_next_version_pmt_sections: 0,
-        }
+        };
+        filter.rebuild_allowed();
+        filter
     }
 
     /// The service id this filter was created for.
@@ -436,6 +462,9 @@ impl ServiceFilter {
         };
         for &pid in &FIXED_PIDS {
             set(&mut self.allowed_bitmap, pid);
+        }
+        if self.keep_eit {
+            set(&mut self.allowed_bitmap, EIT_PID);
         }
         if let Some(pid) = self.pmt_pid {
             set(&mut self.allowed_bitmap, pid);
@@ -873,6 +902,137 @@ mod tests {
         // The in-force spelling (0xC1) still rewrites.
         section[5] = 0xC1;
         assert!(rewrite_pat_for_service(&section, 0x0400).is_some());
+    }
+
+    /// One 188-byte packet carrying `payload`, with `pid` and continuity
+    /// counter `cc`.
+    fn packet(pid: u16, payload_unit_start: bool, cc: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= TS_PACKET_SIZE - 4);
+        let mut packet = vec![0xFFu8; TS_PACKET_SIZE];
+        packet[0] = SYNC_BYTE;
+        packet[1] = ((payload_unit_start as u8) << 6) | (pid >> 8) as u8;
+        packet[2] = pid as u8;
+        packet[3] = 0x10 | (cc & 0x0F);
+        packet[4..4 + payload.len()].copy_from_slice(payload);
+        packet
+    }
+
+    /// A short section packetised into as many packets as it needs.
+    fn section_packets(pid: u16, section: &[u8]) -> Vec<u8> {
+        let mut packets = Vec::new();
+        let mut remaining = section;
+        let mut cc = 0u8;
+        let mut first = true;
+        while first || !remaining.is_empty() {
+            let capacity = TS_PACKET_SIZE - 4 - usize::from(first);
+            let take = capacity.min(remaining.len());
+            let mut payload = Vec::with_capacity(take + 1);
+            if first {
+                payload.push(0x00);
+            }
+            payload.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            packets.extend_from_slice(&packet(pid, first, cc, &payload));
+            cc = cc.wrapping_add(1) & 0x0F;
+            first = false;
+        }
+        packets
+    }
+
+    /// PMT section for `program_number` with one PCR PID and the given ES PIDs.
+    fn pmt_section(program_number: u16, pcr_pid: u16, es_pids: &[u16]) -> Vec<u8> {
+        let mut rest = Vec::new();
+        rest.extend_from_slice(&(0xE000 | pcr_pid).to_be_bytes());
+        rest.extend_from_slice(&[0xF0, 0x00]);
+        for &pid in es_pids {
+            rest.extend_from_slice(&[0x1B, (0xE0 | (pid >> 8)) as u8, pid as u8, 0xF0, 0x00]);
+        }
+        let section_length = 5 + rest.len() + 4;
+        let mut section = vec![
+            0x02,
+            0xB0 | ((section_length >> 8) as u8 & 0x0F),
+            section_length as u8,
+            (program_number >> 8) as u8,
+            program_number as u8,
+            0xC1,
+            0x00,
+            0x00,
+        ];
+        section.extend_from_slice(&rest);
+        let crc = crc32_mpeg2(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
+        section
+    }
+
+    /// An EIT packet on PID `0x0012` with a recognisable, byte-stable payload.
+    fn eit_packet(cc: u8) -> Vec<u8> {
+        let mut payload = vec![0xAAu8; TS_PACKET_SIZE - 4];
+        payload[0] = 0x00; // pointer field
+        payload[1] = 0x4E; // table id: EIT actual TS, present/following
+        packet(EIT_PID, true, cc, &payload)
+    }
+
+    #[test]
+    fn eit_is_dropped_by_default() {
+        // The default options must preserve the historical behaviour: even
+        // after the target PMT is known, PID 0x0012 is an unknown PID.
+        let mut filter = ServiceFilter::new(0x0400);
+        let mut stream = section_packets(PAT_PID, &pat_section(&[(0x0400, 0x0100)]));
+        stream.extend_from_slice(&section_packets(
+            0x0100,
+            &pmt_section(0x0400, 0x0101, &[0x0121]),
+        ));
+        let eit = eit_packet(0);
+        stream.extend_from_slice(&eit);
+
+        let out = filter.push(&stream);
+        assert!(
+            !out.chunks_exact(TS_PACKET_SIZE)
+                .any(
+                    |packet| ((u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2])) == EIT_PID
+                ),
+            "EIT must not leak by default"
+        );
+        assert_eq!(filter.packets_dropped_unknown_pid, 1);
+        assert_eq!(filter.packets_out, 2, "rewritten PAT plus the PMT");
+    }
+
+    #[test]
+    fn eit_passes_unchanged_before_the_first_pat_when_keep_eit() {
+        // The bitmap must already contain 0x0012, so EIT passes from the very
+        // first packet, before any PAT or PMT is known.
+        let eit = eit_packet(0);
+        let mut filter =
+            ServiceFilter::with_options(0x0400, ServiceFilterOptions { keep_eit: true });
+        let out = filter.push(&eit);
+        assert_eq!(out, eit, "EIT bytes must be forwarded unmodified");
+        assert_eq!(filter.packets_out, 1);
+        assert_eq!(filter.packets_dropped_pre_pmt, 0);
+
+        // It also passes after the PAT/PMT, still byte-identical.
+        let mut stream = section_packets(PAT_PID, &pat_section(&[(0x0400, 0x0100)]));
+        stream.extend_from_slice(&section_packets(
+            0x0100,
+            &pmt_section(0x0400, 0x0101, &[0x0121]),
+        ));
+        let later = eit_packet(1);
+        stream.extend_from_slice(&later);
+        let out = filter.push(&stream);
+        assert!(
+            out.chunks_exact(TS_PACKET_SIZE)
+                .any(|packet| packet == &later[..]),
+            "EIT after the PMT must be forwarded byte-identically"
+        );
+        assert_eq!(filter.packets_dropped_unknown_pid, 0);
+    }
+
+    #[test]
+    fn eit_is_dropped_before_the_first_pmt_by_default() {
+        let eit = eit_packet(0);
+        let mut filter = ServiceFilter::new(0x0400);
+        let out = filter.push(&eit);
+        assert!(out.is_empty());
+        assert_eq!(filter.packets_dropped_pre_pmt, 1);
     }
 
     #[test]

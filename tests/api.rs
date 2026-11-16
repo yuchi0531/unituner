@@ -20,7 +20,7 @@ use unituner::config::Config;
 use unituner::scan::startup_scan;
 use unituner::services::{ServiceRecord, ServiceTable};
 use unituner::si::crc32_mpeg2;
-use unituner::tsfilter::ServiceFilter;
+use unituner::tsfilter::{ServiceFilter, ServiceFilterOptions};
 use unituner::tsframe::TS_PACKET_SIZE;
 
 const TUNER_USER_ID: &str = "x-mirakurun-tuner-user-id";
@@ -143,6 +143,22 @@ fn es_packet(pid: u16, marker: u8) -> Vec<u8> {
     payload[1] = 0x00;
     payload[2] = 0x01;
     packet(pid, false, 0, &payload)
+}
+
+/// An EIT packet on PID `0x0012` with a byte-stable payload.
+fn eit_packet(cc: u8) -> Vec<u8> {
+    let mut payload = vec![0xAAu8; TS_PACKET_SIZE - 4];
+    payload[0] = 0x00; // pointer field
+    payload[1] = 0x4E; // EIT actual TS, present/following
+    packet(0x0012, true, cc, &payload)
+}
+
+/// Every PID-`0x0012` packet in a run, in order.
+fn eit_packets(stream: &[u8]) -> Vec<&[u8]> {
+    stream
+        .chunks_exact(TS_PACKET_SIZE)
+        .filter(|packet| ((u16::from(packet[1] & 0x1F) << 8) | u16::from(packet[2])) == 0x0012)
+        .collect()
 }
 
 /// A three-programme multiplex used for the service-stream tests.
@@ -1716,9 +1732,27 @@ async fn an_invalid_decode_value_is_400_on_every_stream_route_without_tuning() {
 // Service stream
 // ---------------------------------------------------------------------------
 
+/// The three-programme multiplex plus EIT packets before the PAT and after the
+/// PMT, so a keep-EIT service stream forwards them.
+fn service_multiplex_with_eit() -> Vec<u8> {
+    let mut stream = eit_packet(0);
+    stream.extend_from_slice(&service_multiplex());
+    stream.extend_from_slice(&eit_packet(1));
+    stream
+}
+
 fn service_fixture() -> (Fixture, Vec<u8>, ServiceTable) {
-    let fixture = Fixture::new(&tuners("true"), &channels(&[("NHK", "27")]), PIPELINE_CAT);
-    let ts = service_multiplex();
+    service_fixture_with_server(SERVER)
+}
+
+fn service_fixture_with_server(server: &str) -> (Fixture, Vec<u8>, ServiceTable) {
+    let fixture = Fixture::new_with_server(
+        server,
+        &tuners("true"),
+        &channels(&[("NHK", "27")]),
+        PIPELINE_CAT,
+    );
+    let ts = service_multiplex_with_eit();
     let path = fixture.write_ts("multiplex.ts", &ts);
     std::fs::write(
         fixture.path.join("tuners.yml"),
@@ -1759,6 +1793,60 @@ async fn the_service_stream_is_the_tsfilter_output() {
         assert_eq!(header_str(response.headers(), "content-type"), "video/MP2T");
         let bytes = read_first_chunk(response.into_body()).await;
         assert_eq!(bytes, expected, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn service_stream_keep_eit_controls_eit_passthrough() {
+    const SERVER_KEEP_EIT: &str = r#"
+addr: ":0"
+allowed_cidrs:
+  - 127.0.0.0/8
+idle_timeout_secs: 1
+service_stream_keep_eit: true
+"#;
+    for (server, keep_eit) in [(SERVER, false), (SERVER_KEEP_EIT, true)] {
+        let (fixture, ts, services) = service_fixture_with_server(server);
+        let state = fixture.state_with(services);
+
+        let response = send(
+            &state,
+            PEER,
+            request(Method::GET, &format!("/api/services/{TARGET_SID}/stream")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "keep_eit={keep_eit}");
+        let bytes = read_first_chunk(response.into_body()).await;
+        let expected =
+            ServiceFilter::with_options(TARGET_SID, ServiceFilterOptions { keep_eit }).push(&ts);
+        assert_eq!(bytes, expected, "keep_eit={keep_eit}");
+        if keep_eit {
+            assert_eq!(
+                eit_packets(&bytes),
+                eit_packets(&ts),
+                "EIT packets must be byte-identical when kept"
+            );
+            assert!(!eit_packets(&bytes).is_empty());
+        } else {
+            assert!(
+                eit_packets(&bytes).is_empty(),
+                "EIT must be dropped by default"
+            );
+        }
+
+        // Channel streams are raw passthrough in both configurations. A fresh
+        // fixture/state avoids joining the service session above.
+        let (channel_fixture, channel_ts, channel_services) = service_fixture_with_server(server);
+        let channel_state = channel_fixture.state_with(channel_services);
+        let response = send(
+            &channel_state,
+            PEER,
+            request(Method::GET, "/api/channels/GR/27/stream"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "keep_eit={keep_eit}");
+        let channel_bytes = read_first_chunk(response.into_body()).await;
+        assert_eq!(channel_bytes, channel_ts, "keep_eit={keep_eit}");
     }
 }
 

@@ -10,7 +10,7 @@
 
 - **チューナー共有**: 同一 `(type, channel)` への要求は 1 本のプロセス木（チューナー + pipeline）に相乗りする。優先度に関係なく参加できる。
 - **mirakurun 互換 API サブセット**: `/api/version` から `/api/tuners` まで。`/api/programs` は常に `[]`。
-- **内蔵サービスフィルタ**: service stream は購読者ごとに独立したフィルタで PAT を 1 プログラムへ書き換え、対象 PMT/ES PID だけを通す。
+- **内蔵サービスフィルタ**: service stream は購読者ごとに独立したフィルタで PAT を 1 プログラムへ書き換え、対象 PMT/ES PID だけを通す。EIT (PID `0x0012`) は既定で落とし、`server.yml` の `service_stream_keep_eit: true` で加工せず通す。
 - **`X-Mirakurun-Priority` による奪取**: `128` は無条件、それ以外は victim の最大 priority より真に大きいときのみ。
 - **`X-Mirakc-Tuner` / `X-Mirakurun-Tuner` によるチューナー固定**: 指定チューナー以外へフォールバックしない。
 - **pipeline による外部コマンド委譲**: 任意段数のコマンドを stdin→stdout で直列接続。シェルは介さない。
@@ -47,6 +47,7 @@ allowed_hosts: []                 # web UI が追加で受け付ける Host 名�
 idle_timeout_secs: 5
 subscriber_buffer_chunks: 1024
 chunk_size_bytes: 65536
+service_stream_keep_eit: false   # true で service stream の EIT (PID 0x0012) を加工せず通す
 max_subscribers_per_session: 32
 max_subscribers_per_ip: 16
 max_sessions: 16
@@ -69,6 +70,7 @@ child_env: {}
 | `idle_timeout_secs` | `5` | 検証なし（0 も受理）。最後の購読者が抜けてからこの秒数後にプロセス木を止める |
 | `subscriber_buffer_chunks` | `1024` | 1 以上。購読者ごとの bounded queue 容量（chunks） |
 | `chunk_size_bytes` | `65536` | 1 以上。実際の chunk は 188 の倍数に切り下げる（65536 → 65424） |
+| `service_stream_keep_eit` | `false` | service stream の内蔵フィルタが EIT (PID `0x0012`) を通すか。`false` は EIT を破棄（従来の挙動）、`true` は PAT/PMT より前から全サービスの EIT（EIT-other 含む）を加工せず通す。unituner は EIT を解析もスコープもしない。channel stream には影響しない |
 | `max_subscribers_per_session` | `32` | 1 以上。1 セッションに同時接続できる購読者数。超えた要求は 429 |
 | `max_subscribers_per_ip` | `16` | 1 以上。1 クライアント IP が全セッション合計で持てる購読者数。超えた要求は 429 |
 | `max_sessions` | `16` | 1 以上。同時に存在できるセッション数（登録中の `Starting` / `Stopping` も含む）。超えた要求は 429。チューナー数が 16 を超える構成ではこの値も上げる |
@@ -501,6 +503,7 @@ PX-S1UD（ISDB-T、単一チューナー）+ recisdb + arib-b25-stream-test の�
 
 - EPG（xmltv）・録画・タイムシフト・ロゴ（CDT）・MMT/TLV の内部処理・websocket・HDHR は実装していない。IPTV はプレイリスト（`/api/iptv/playlist`）のみで、`/api/iptv/xmltv` / `/api/iptv/epg` は 404。TLV は pipeline 内の外部コマンドで MPEG-TS に変換してから渡す前提。
 - `/api/programs` は常に `[]`、`/api/programs/{id}` は 404。
+- service stream の EIT は既定で落とす。クライアントが EIT を直接読む場合は `server.yml` の `service_stream_keep_eit: true` にする。unituner は EIT を解析・スコープしないため、このとき全サービスの EIT（EIT-other 含む）が加工されずに流れる。channel stream には影響しない。
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応。例外は `PUT /api/config/channels/scan` のみ。
 - チャンネル探索の `async` と `GET` ポーリングは非対応。`GET /api/config/channels/scan` は 404。
 - 複数の `X-Mirakurun-Priority` は集約しない（最後の非空値を使う）。

@@ -40,6 +40,7 @@ allowed_hosts: []                    # 任意。webui が追加で受け付け�
 idle_timeout_secs: 5                 # 既定 5。最後の購読者が抜けてからプロセス群を kill
 subscriber_buffer_chunks: 1024       # 既定 1024。購読者ごとの bounded queue 容量（chunks）
 chunk_size_bytes: 65536              # 既定 65536。購読者へ渡す chunk サイズ（64KB）
+service_stream_keep_eit: false       # 既定 false。true で service stream の EIT (PID 0x0012) を加工せず通す
 max_subscribers_per_session: 32      # 既定 32。1 セッションの購読者上限。超過は 429
 max_subscribers_per_ip: 16           # 既定 16。1 クライアント IP の全セッション合計上限。超過は 429
 max_sessions: 16                     # 既定 16。同時セッション数（Starting/Stopping 含む）。超過は 429
@@ -76,6 +77,10 @@ child_env: {}                        # 子プロセスの追加環境変数（PA
   - **probe と readiness gate は別物**。probe は route をフォールバックするか（起動 probe 窓）だけを決め、readiness gate はストリーム開始（最初のデータ）を待つ上限を決める。
 - `tuner_readiness_timeout_secs` は、最初のデータが来るまで待つ **readiness gate**（秒、既定 30、1..=600）。tune が 6–11 秒かかり、デスクランブラが最初の出力まで 9–15 秒かかる実機に合わせた既定値。0 や 600 超は起動エラー。
 - `scan_channel_timeout_secs` は 1 チャンネルの **scan 予算**（秒、既定 60、1..=600）。起動時スキャン・手動 Re-scan・探索 API のすべてで使う。acquire と SI 読みの合計であり、`tuner_readiness_timeout_secs` より**厳密に大きく**なければ起動エラー（そうでないと scan 自身の期限が acquire を先に切ってしまう）。acquire は `readiness + 5 秒` に制限し、残りを SI に使う。
+- `service_stream_keep_eit` は service stream の内蔵 TSFilter（§5）が EIT (PID `0x0012`) を通すかどうか（既定 `false`）。
+  - `false` では PID `0x0012` を許可集合に入れないため、EIT は他の未知 PID と同様に落ちる（従来の挙動）。
+  - `true` では全 EIT パケットを PAT/PMT より前でも**加工せずそのまま**通す。他のサービスの EIT（EIT-other）も含み、unituner は EIT を解析もスコープもしない。
+  - 対象は service stream（`/api/services/{id}/stream` と `/api/channels/{t}/{c}/services/{id}/stream`）だけ。channel stream（`/api/channels/{t}/{c}/stream`）は常に pipeline 後の TS をそのまま返すため影響しない。
 - `child_path` / `child_home` / `child_tmpdir` は子プロセスの `PATH` / `HOME` / `TMPDIR`（いずれも空不可）。NUL・改行を含む値は起動エラー。
   - `child_cwd` だけは空を許し、その場合はサーバの作業ディレクトリを継承する。存在しない非空の `child_cwd` は**起動エラーにしない**: 起動時に 1 回 warn し、各 spawn では `current_dir` を付けずに warn する（既定の `/var/lib/unituner` が未作成の既存配備を壊さないため）。
 - `child_env` は子プロセスへ追加する環境変数（既定 `{}`）。`PATH` / `HOME` / `TMPDIR` と同じ名前を書いた場合は `child_env` が**優先**する。名前は空でなく NUL・改行を含まないこと、値は NUL を含まないこと。
@@ -249,6 +254,7 @@ types:                                # チャンネルタイプ → pipeline �
   - ISDB の PAT の `program_number == service_id(sid)` 照合
   - PAT を対象プログラム 1 件のみに書き換え **+ CRC32 (MPEG-2) 再計算**
   - 対象 PMT（PCR_PID 含む）+ 対象 ES PIDs + 固定 PID (`0x0000` / `0x0001` / `0x0010` / `0x0011`) のみ通過
+  - EIT (`0x0012`) は**任意**。`server.yml` の `service_stream_keep_eit: true` のときだけ許可集合に入れ、PAT/PMT より前から全サービスの EIT を加工せず通す（既定 `false` では破棄）
   - NULL (`0x1FFF`) と TEI 付きパケットは破棄
 - 実装メモ:
   - PID の通過判定は 8192 bit のビットマップ（`allowed_bitmap: [u64; 128]`）で行い、PAT/PMT が PID 集合を変えたときだけ再構築する（パケットごとの線形探索をしない）。
@@ -492,6 +498,7 @@ Found 1 channels for 13
 | `GET /api/config/channels/scan` | **404**（`async` 非対応のため） |
 
 - Stream 系は HEAD も可。`X-Mirakurun-Tuner-User-ID` ヘッダを付与する。
+- service stream（`/api/services/{id}/stream` と `/api/channels/{t}/{c}/services/{id}/stream`）は内蔵 TSFilter を通す。EIT (PID `0x0012`) は `server.yml` の `service_stream_keep_eit` が `true` のときだけ加工せず通る（既定 `false`）。channel stream は raw passthrough のままで、この設定の影響を受けない。
 - `decode` クエリは 4.1 通り（無し / `1` / `true` は pipeline、`0` / `false` は全段 bypass、それ以外は 400）。
 - `/api/services` の一覧・詳細・サービス stream は同じ可視性判定を使う。サービス表のレコードのうち、`(channel.type, channel.channel)` が `channels.yml` に存在して **有効**（`disabled: true` でない）なものだけを一覧・詳細に出す。`disabled: true`、`channels.yml` から削除済み、未バインド (`channel: None`) のレコードは一覧に出さず、詳細は 404 `Service Not Found`（stream も 404）。サービスキャッシュ (`services.json`) は全レコードを保持し、scan/retain の挙動は変えない。
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` は 6.3 通り。
@@ -586,6 +593,7 @@ unituner/
 - priority の multi-header 集約は未対応（単一値前提）
 - `X-Mirakc-Tuner` / `X-Mirakurun-Tuner` が service stream にも効く（mirakc-BS4K からの拡張）
 - `/api/config/{tuners,channels}` の GET/PUT（設定 CRUD）は非対応（`PUT /api/config/channels/scan` のみ例外）
+- service stream の EIT は既定で落とす。クライアントが EIT を直接読む場合は `server.yml` の `service_stream_keep_eit: true` にする。unituner は EIT を解析・スコープしないため、このとき全サービスの EIT（EIT-other 含む）が加工されずに流れる
 - IPTV はプレイリスト（`/api/iptv/playlist`）のみ実装済み。EPG は非実装なので `url-tvg` を付けず、`/api/iptv/xmltv` / `/api/iptv/epg` は 404。ロゴも非実装なので `tvg-logo` を出さない
 - webui は認証なし（allowed_cidrs + allowed_hosts のみ。LAN 内のみに配備すること）
 - `Host` が無い/空のリクエストは webui / `/api/*` とも受理する（BonDriver_Mirakurun 等のネイティブクライアント用）。存在するが許可外の `Host` は 403。ブラウザは authority 無しで送れないため DNS リバインディング対策は弱まらない

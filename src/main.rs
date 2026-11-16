@@ -62,6 +62,7 @@ fn main() -> ExitCode {
         idle_timeout_secs = config.server.idle_timeout_secs,
         subscriber_buffer_chunks = config.server.subscriber_buffer_chunks,
         chunk_size_bytes = config.server.chunk_size_bytes,
+        service_stream_keep_eit = config.server.service_stream_keep_eit,
         "configuration loaded"
     );
 
