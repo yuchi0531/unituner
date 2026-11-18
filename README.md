@@ -116,7 +116,7 @@ child_env: {}
 ### `channels.yml`
 
 ```yaml
-- name: NHK総合
+- name: "27"                 # ★物理チャンネル番号を推奨（放送局名でも可）
   type: GR
   channel: "27"
   extra-args: ""            # 任意・既定 ""。チューナーコマンドの {extra_args} に入る
@@ -130,7 +130,7 @@ child_env: {}
 
 | フィールド | 既定値 | 検証 |
 |---|---|---|
-| `name` | なし（必須） | 空不可・重複不可 |
+| `name` | なし（必須） | 空不可・重複不可。**物理チャンネル番号を推奨**（例: GR `"27"`、BS `"BS13_1"`、CATV `"C17"`） |
 | `type` | なし（必須） | `^[A-Za-z0-9][A-Za-z0-9_-]*$`（`GR`, `BS`, `CABLE_CATV` など任意名） |
 | `channel` | なし（必須） | ASCII 英数字と `. _ + - : @ ,` のみ。`/` は URL パス 1 セグメントに収めるため拒否 |
 | `extra-args` | `""` | 任意。`{extra_args}` に入る追加引数。`extra_args` 綴りも可。引用符・バックスラッシュ・改行は不可（standalone な argv 断片） |
@@ -138,6 +138,8 @@ child_env: {}
 | `routes` | `[]` | 任意。各要素は `tuner`（必須、`tuners.yml` の name で既存必須）と任意の `channel` / `extra-args`。同一チャンネル内でチューナー重複不可。`route.channel` は `channel` と同じ文字種検証を通る |
 
 同じ `channel` 値でも `type` が違えば別エントリとして扱う。同じ `(type, channel)` の重複は起動エラー（fail-fast。mirakc-BS4K の warn + first wins は採用しない）。
+
+**`name` は物理チャンネル番号を推奨する。** `name` は unituner にとって設定の識別子（一覧・詳細 API と web UI の表示、重複判定）でしかなく、放送局名やサービス名は SDT から scan が別に取得する。物理チャンネル番号はチューニングに使う `channel` と対応し、放送局の改称・中継・サブチャンネルで変わらないため、長期間の運用で設定がぶれない。`name` は（`type` をまたいで）全体で一意でなければならないので、同じ番号が別 `type` に存在する場合は `C27` のように `type` を前置する。探索 API が生成する `name` は SDT のサービス名由来であり、物理番号に揃えたい場合は生成後に手で編集する。
 
 #### ルート（`routes`）
 

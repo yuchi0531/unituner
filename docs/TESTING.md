@@ -191,26 +191,28 @@ types:
 ### 2.4 `channels.yml`
 
 ```yaml
-- name: "NHK総合"
+- name: "27"            # 物理チャンネル番号を推奨（NHK総合）
   type: GR
   channel: "27"
   disabled: false
 
-- name: "NHK Eテレ"
+- name: "26"            # 物理チャンネル番号を推奨（NHK Eテレ）
   type: GR
   channel: "26"
   disabled: false
 
-- name: "日本テレビ"
+- name: "25"            # 物理チャンネル番号を推奨（日本テレビ）
   type: GR
   channel: "25"
   disabled: false
 
-- name: "テレビ朝日"
+- name: "24"            # 物理チャンネル番号を推奨（テレビ朝日）
   type: GR
   channel: "24"
   disabled: false
 ```
+
+`name` は**物理チャンネル番号を推奨**する。`name` は設定の識別子でしかなく（一覧・詳細 API と web UI の表示、重複判定）、放送局名やサービス名は SDT から scan が取得する。物理番号は `channel` と対応し、改称・中継・サブチャンネルで変わらないので、長期運用で設定がぶれない。放送局名を書いても動作は変わらない（推奨であり必須ではない）。`name` は `type` をまたいで全体で一意なので、同じ番号が別 `type` にある場合は `C27` のように `type` を前置する。探索 API が生成する `name` は SDT のサービス名由来であり、物理番号に揃えたい場合は生成後に手で編集する。
 
 ### 2.5 なぜ `T{channel}` と書くのか
 
